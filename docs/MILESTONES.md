@@ -8,7 +8,7 @@ Status legend: ⬜ not started · 🟡 in progress · ✅ done
 | 1 | Tauri overlay shell | ✅ |
 | 2 | WASAPI system audio capture | ✅ |
 | 3 | Audio chunking + VAD | ✅ |
-| 4 | Local ASR (whisper.cpp) | ⬜ |
+| 4 | Local ASR (whisper.cpp) | ✅ |
 | 5 | Translation engine (Qwen) | ⬜ |
 | 6 | Subtitle state manager | ⬜ |
 | 7 | Product settings | ⬜ |
@@ -84,13 +84,27 @@ SPEECH_THRESHOLD=0.005 ≈ −46 dBFS, 300 ms pre-roll, 500 ms silence timeout,
 `audio/resample.rs` (rubato SincFixedIn) and forwards to VAD via `mpsc`
 channel. `pipeline/mod.rs` declared; `lib.rs` includes `mod pipeline`.
 
-## M4 — ASR (whisper.cpp)  ⬜
+## M4 — ASR (whisper.cpp)  ✅
 
 `whisper-server` sidecar (ADR-0001). Model `ggml-medium.bin`, later
 `large-v3-turbo`. Load once. Return text + detected lang (ko/en/zh) + timestamps.
 Keep prior context/prompt for continuity.
 **Acceptance:** ko/en/zh transcribed · lang auto-detect · source subtitle emitted
 without translation.
+
+**Implemented:** `asr/mod.rs` (`AudioChunk` type) + `asr/whisper_server.rs`
+(HTTP client with multipart WAV upload, verbose_json response parsing,
+`normalize_lang` mapping, `encode_wav_16bit`, `subtitle_update` emission).
+`commands.rs` launches `whisper-server` via `std::process::Command` on
+`start_captioning` (env-configurable: `WHISPER_SERVER_BIN`, `WHISPER_MODEL`,
+`WHISPER_ASR_PORT`; defaults: PATH lookup, `models/ggml-medium.bin`, 9001).
+`state.rs` adds `asr_status` + `WhisperProc` managed state. ASR worker polls
+for server readiness (30 s), then streams chunks from VAD → WAV → POST →
+`subtitle_update`. `ureq` v2 used for synchronous HTTP (no tokio conflict).
+
+**To activate:** place `whisper-server.exe` on PATH (or set `WHISPER_SERVER_BIN`)
+and put a model at `models/ggml-medium.bin` (or set `WHISPER_MODEL`) relative
+to the working directory when running `npm run tauri dev`.
 
 ## M5 — Translation (Qwen)  ⬜
 

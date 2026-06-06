@@ -1,7 +1,6 @@
 //! WASAPI loopback capture (Windows only, shared mode, ADR-0002).
-//! Spawns a detached thread that reads from the default render endpoint in
-//! loopback mode, computes RMS, and emits `engine_status` every ~200 ms.
-//! Also resamples to 16 kHz mono and forwards chunks to the VAD worker (M3).
+//! Spawns a capture thread, a VAD worker, and an ASR worker.
+//! All three share a stop flag and communicate through bounded channels.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,20 +11,35 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use wasapi::{Direction, ShareMode, get_default_device};
 
+use crate::asr;
 use crate::audio::resample::Resampler16k;
+use crate::pipeline;
 use crate::state::AppState;
 use crate::types::EngineStatus;
 
-/// Spawn the WASAPI loopback capture thread and the VAD worker (detached).
-/// Both threads exit cleanly when `stop` is set to `true`.
+/// Port whisper-server listens on.  Configurable via env `WHISPER_ASR_PORT`.
+const DEFAULT_ASR_PORT: u16 = 9001;
+
+/// Spawn the full audio pipeline: WASAPI capture → VAD → ASR.
+/// All workers exit cleanly when `stop` is set to `true`.
 pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    crate::pipeline::vad::start_vad_worker(rx, Arc::clone(&stop));
+    let asr_port = std::env::var("WHISPER_ASR_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ASR_PORT);
+
+    // VAD → ASR channel
+    let (asr_tx, asr_rx) = mpsc::channel::<asr::AudioChunk>();
+    // Capture → VAD channel
+    let (vad_tx, vad_rx) = mpsc::channel::<Vec<f32>>();
+
+    asr::whisper_server::start_asr_worker(asr_rx, app.clone(), asr_port, Arc::clone(&stop));
+    pipeline::vad::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop));
 
     std::thread::Builder::new()
         .name("wasapi-loopback".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(&app, &stop, tx) {
+            if let Err(e) = capture_loop(&app, &stop, vad_tx) {
                 log::error!("WASAPI capture error: {e}");
             }
             log::info!("WASAPI capture thread exited");
@@ -36,14 +50,10 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
 fn capture_loop(
     app: &AppHandle,
     stop: &Arc<AtomicBool>,
-    tx: mpsc::Sender<Vec<f32>>,
+    vad_tx: mpsc::Sender<Vec<f32>>,
 ) -> Result<(), String> {
-    // Initialize COM for this thread (MTA, safe on a new non-UI thread).
     wasapi::initialize_mta().map_err(|e| e.to_string())?;
 
-    // Loopback capture: use the *Render* endpoint but ask WASAPI to capture
-    // what it's playing (AUDCLNT_STREAMFLAGS_LOOPBACK, set by the crate when
-    // device direction = Render and initialize direction = Capture).
     let device = get_default_device(&Direction::Render).map_err(|e| e.to_string())?;
     let mut audio_client = device.get_iaudioclient().map_err(|e| e.to_string())?;
     let format = audio_client.get_mixformat().map_err(|e| e.to_string())?;
@@ -62,9 +72,6 @@ fn capture_loop(
 
     let (default_period, _) = audio_client.get_periods().map_err(|e| e.to_string())?;
 
-    // Render device + Capture direction → crate sets AUDCLNT_STREAMFLAGS_LOOPBACK.
-    // convert=true enables AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM so the mix
-    // format is always accepted without manual format negotiation.
     audio_client
         .initialize_client(
             &format,
@@ -90,14 +97,11 @@ fn capture_loop(
     let mut last_emit = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        // Wait up to 100 ms; Err means timeout (no data), which is fine —
-        // we just loop back and check the stop flag again.
         match h_event.wait_for_event(100) {
             Ok(()) => {}
             Err(_) => continue,
         }
 
-        // Drain every pending WASAPI packet.
         loop {
             match capture_client.get_next_nbr_frames().map_err(|e| e.to_string())? {
                 Some(0) | None => break,
@@ -109,7 +113,6 @@ fn capture_loop(
             }
         }
 
-        // Convert raw bytes → interleaved f32.
         while byte_queue.len() >= block_align {
             let frame_bytes: Vec<u8> = byte_queue.drain(..block_align).collect();
             f32_buf.extend_from_slice(&bytes_to_f32(&frame_bytes, bits_per_sample));
@@ -124,17 +127,12 @@ fn capture_loop(
             let rms = super::meter::rms(&mono);
             last_emit = Instant::now();
 
-            log::info!(
-                "RMS {:.5} ({:.1} dBFS)",
-                rms,
-                super::meter::rms_to_dbfs(rms)
-            );
+            log::info!("RMS {:.5} ({:.1} dBFS)", rms, super::meter::rms_to_dbfs(rms));
             push_rms(app, rms);
 
-            // Resample to 16 kHz mono and send to the VAD pipeline.
             match resampler.process(&f32_buf) {
                 Ok(samples_16k) if !samples_16k.is_empty() => {
-                    let _ = tx.send(samples_16k);
+                    let _ = vad_tx.send(samples_16k);
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("resample error: {e}"),
@@ -149,7 +147,6 @@ fn capture_loop(
     Ok(())
 }
 
-/// Write the latest RMS into AppState and re-emit `engine_status`.
 fn push_rms(app: &AppHandle, rms: f32) {
     if let Some(st) = app.try_state::<Mutex<AppState>>() {
         if let Ok(mut s) = st.lock() {
@@ -160,7 +157,6 @@ fn push_rms(app: &AppHandle, rms: f32) {
     }
 }
 
-/// Convert a raw LE byte frame to f32 samples.
 fn bytes_to_f32(bytes: &[u8], bits_per_sample: u16) -> Vec<f32> {
     match bits_per_sample {
         32 => bytes
@@ -177,7 +173,6 @@ fn bytes_to_f32(bytes: &[u8], bits_per_sample: u16) -> Vec<f32> {
         24 => bytes
             .chunks_exact(3)
             .map(|b| {
-                // Sign-extend 24-bit LE integer to 32-bit.
                 let raw = u32::from_le_bytes([b[0], b[1], b[2], 0]) as i32;
                 let signed = (raw << 8) >> 8;
                 signed as f32 / 8_388_608.0
@@ -190,7 +185,6 @@ fn bytes_to_f32(bytes: &[u8], bits_per_sample: u16) -> Vec<f32> {
     }
 }
 
-/// Average interleaved multi-channel samples to a single mono channel.
 fn interleaved_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels == 1 {
         return samples.to_vec();

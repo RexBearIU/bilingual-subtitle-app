@@ -1,3 +1,4 @@
+mod asr;
 mod audio;
 mod commands;
 mod pipeline;
@@ -59,6 +60,7 @@ fn toggle_always_on_top(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
+        .manage(Mutex::new(state::WhisperProc(None)))
         .invoke_handler(tauri::generate_handler![
             commands::start_captioning,
             commands::stop_captioning,

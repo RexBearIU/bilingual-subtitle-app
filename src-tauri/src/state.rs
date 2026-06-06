@@ -13,8 +13,10 @@ pub struct AppState {
     pub captioning: bool,
     /// Latest RMS from the capture thread (updated ~every 200 ms).
     pub rms: f32,
-    /// Signal to stop the running capture thread (None when not capturing).
+    /// Signal to stop the running capture/VAD/ASR threads (None when idle).
     pub audio_stop: Option<Arc<AtomicBool>>,
+    /// ASR engine status: "unloaded" | "loading" | "ready" | "error"
+    pub asr_status: String,
 }
 
 impl Default for AppState {
@@ -27,6 +29,11 @@ impl Default for AppState {
             captioning: false,
             rms: 0.0,
             audio_stop: None,
+            asr_status: "unloaded".into(),
         }
     }
 }
+
+/// Wrapper around the whisper-server child process.
+/// Stored as separate managed state so `AppState` stays `Debug`-derivable.
+pub struct WhisperProc(pub Option<std::process::Child>);

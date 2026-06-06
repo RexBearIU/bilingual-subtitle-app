@@ -70,8 +70,7 @@ impl EngineStatus {
     pub fn from_state(s: &AppState) -> Self {
         EngineStatus {
             capture: if s.captioning { "running" } else { "stopped" }.into(),
-            // Engines are wired in M4/M5; unloaded until then.
-            asr: "unloaded".into(),
+            asr: s.asr_status.clone(),
             translation: "unloaded".into(),
             mode: s.mode,
             font_size: s.font_size,
