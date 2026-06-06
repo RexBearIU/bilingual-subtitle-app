@@ -57,6 +57,12 @@
   function statusDot(s: string | undefined) {
     return s === "ready" || s === "running" ? "ok" : s === "error" ? "err" : "idle";
   }
+
+  let rmsDb = $derived(
+    status?.rms != null && status.rms > 1e-9
+      ? (20 * Math.log10(status.rms)).toFixed(1)
+      : null
+  );
 </script>
 
 <div class="bar">
@@ -96,6 +102,9 @@
     <span class="dot {statusDot(status?.capture)}"></span>cap
     <span class="dot {statusDot(status?.asr)}"></span>asr
     <span class="dot {statusDot(status?.translation)}"></span>mt
+    {#if rmsDb !== null}
+      <span class="rms" title="Audio RMS level">{rmsDb} dB</span>
+    {/if}
   </div>
 </div>
 
@@ -137,4 +146,12 @@
   .dot.ok { background: #3ad07a; }
   .dot.err { background: #e0563a; }
   .dot.idle { background: #5a636e; }
+  .rms {
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: #7bcfa0;
+    margin-left: 4px;
+    min-width: 52px;
+    text-align: right;
+  }
 </style>

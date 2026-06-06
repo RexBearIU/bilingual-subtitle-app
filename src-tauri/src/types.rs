@@ -77,7 +77,8 @@ impl EngineStatus {
             font_size: s.font_size,
             click_through: s.click_through,
             always_on_top: s.always_on_top,
-            rms: None,
+            // Emit rms only while capturing so the UI doesn't show a stale value.
+            rms: if s.captioning { Some(s.rms) } else { None },
             message: None,
         }
     }

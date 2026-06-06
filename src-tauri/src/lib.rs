@@ -1,3 +1,4 @@
+mod audio;
 mod commands;
 mod state;
 mod types;

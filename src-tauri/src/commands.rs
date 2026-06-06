@@ -1,40 +1,51 @@
 //! Tauri command handlers (frontend → Rust). See `docs/IPC-CONTRACT.md`.
-//!
-//! For Milestone 1 the capture/ASR/translation pipeline does not exist yet, so
-//! `start_captioning` / `stop_captioning` only flip state and report status. Real
-//! subtitles arrive once M2–M5 land; until then the overlay is exercised through
-//! the dev-only `dev_inject_subtitle` command, which emits a **real**
-//! `subtitle_update` over the **real** event path (see ADR-0005).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{AppHandle, Emitter, State, WebviewWindow};
 
+use crate::audio;
 use crate::state::AppState;
 use crate::types::{EngineStatus, SubtitleMode, SubtitleUpdate};
 
 type Db<'a> = State<'a, Mutex<AppState>>;
 
-/// Emit the current engine/UI status so all windows stay in sync.
 fn emit_status(app: &AppHandle, s: &AppState) {
     let _ = app.emit("engine_status", EngineStatus::from_state(s));
 }
 
 #[tauri::command]
 pub fn start_captioning(state: Db, app: AppHandle) -> Result<(), String> {
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    s.captioning = true;
-    log::info!("start_captioning requested (pipeline lands in M2+)");
-    emit_status(&app, &s);
+    // Build the stop flag and flip state while holding the lock.
+    let stop = {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        if s.captioning {
+            return Ok(()); // already running
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        s.audio_stop = Some(stop.clone());
+        s.captioning = true;
+        s.rms = 0.0;
+        emit_status(&app, &s);
+        stop
+    }; // lock released before spawning
+
+    audio::capture::start_loopback_capture(app, stop);
+    log::info!("start_captioning: WASAPI loopback requested");
     Ok(())
 }
 
 #[tauri::command]
 pub fn stop_captioning(state: Db, app: AppHandle) -> Result<(), String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
+    if let Some(stop) = s.audio_stop.take() {
+        stop.store(true, Ordering::Relaxed);
+    }
     s.captioning = false;
-    log::info!("stop_captioning requested");
+    s.rms = 0.0;
     emit_status(&app, &s);
+    log::info!("stop_captioning");
     Ok(())
 }
 
@@ -42,7 +53,7 @@ pub fn stop_captioning(state: Db, app: AppHandle) -> Result<(), String> {
 pub fn set_subtitle_mode(mode: SubtitleMode, state: Db, app: AppHandle) -> Result<(), String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.mode = mode;
-    log::info!("subtitle mode set to {:?}", mode);
+    log::info!("subtitle mode → {:?}", mode);
     emit_status(&app, &s);
     Ok(())
 }
@@ -59,13 +70,13 @@ pub fn set_click_through(
         .map_err(|e| e.to_string())?;
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.click_through = enabled;
-    log::info!("click-through set to {}", enabled);
+    log::info!("click-through → {}", enabled);
     emit_status(&app, &s);
     Ok(())
 }
 
-/// Re-assert (or clear) topmost. Calling this with `true` re-stacks the overlay
-/// to the top of the OS "always-on-top" band, above other topmost windows.
+/// Re-assert (or clear) topmost. Calling with `true` re-stacks the overlay
+/// above other always-on-top windows.
 #[tauri::command]
 pub fn set_always_on_top(
     enabled: bool,
@@ -78,7 +89,7 @@ pub fn set_always_on_top(
         .map_err(|e| e.to_string())?;
     let mut s = state.lock().map_err(|e| e.to_string())?;
     s.always_on_top = enabled;
-    log::info!("always-on-top set to {}", enabled);
+    log::info!("always-on-top → {}", enabled);
     emit_status(&app, &s);
     Ok(())
 }
@@ -99,7 +110,6 @@ pub fn get_status(state: Db) -> Result<EngineStatus, String> {
 }
 
 /// Dev-only: emit a real `subtitle_update` from a manually supplied payload.
-/// Replaces the notion of a "mock" — identical event path, manual data source.
 #[tauri::command]
 pub fn dev_inject_subtitle(payload: SubtitleUpdate, app: AppHandle) -> Result<(), String> {
     app.emit("subtitle_update", payload)

@@ -6,7 +6,7 @@ Status legend: ⬜ not started · 🟡 in progress · ✅ done
 |---|-----------|--------|
 | 0 | Repo scaffold, docs, toolchain | ✅ |
 | 1 | Tauri overlay shell | ✅ |
-| 2 | WASAPI system audio capture | ⬜ (next) |
+| 2 | WASAPI system audio capture | ✅ |
 | 3 | Audio chunking + VAD | ⬜ |
 | 4 | Local ASR (whisper.cpp) | ⬜ |
 | 5 | Translation engine (Qwen) | ⬜ |
@@ -61,11 +61,15 @@ Backend commands (`src-tauri/src/commands.rs`): `start_captioning`,
 **Acceptance:** opens as transparent overlay · displays injected (real-path)
 subtitles · zh-ko/zh-en switch works · stays above browser/video.
 
-## M2 — WASAPI capture  ⬜
+## M2 — WASAPI capture  ✅
 
 Modules: `audio/{mod,capture,resample,ring_buffer,meter}.rs`.
 **Acceptance:** YouTube playback → non-zero captured audio · RMS shown in
 debug/UI · no mic · no WSL.
+
+**Verified:** WASAPI loopback stream at 192 kHz / 2 ch / 32 bps f32.
+Start→stop lifecycle clean. RMS emitted to frontend via `engine_status`.
+Tauri hot-rebuild round-trip 6.6 s.
 
 ## M3 — Chunking + VAD  ⬜
 

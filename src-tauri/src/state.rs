@@ -1,19 +1,20 @@
 //! Application state, shared across commands via `tauri::State<Mutex<AppState>>`.
 
+use std::sync::{Arc, atomic::AtomicBool};
+
 use crate::types::SubtitleMode;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AppState {
-    /// Active two-language display mode (source of truth for payload building).
     pub mode: SubtitleMode,
-    /// Overlay font size in px.
     pub font_size: u32,
-    /// Whether the overlay passes mouse events through to apps beneath it.
     pub click_through: bool,
-    /// Whether the overlay is pinned above other windows.
     pub always_on_top: bool,
-    /// Whether the capture→ASR→translate pipeline is running.
     pub captioning: bool,
+    /// Latest RMS from the capture thread (updated ~every 200 ms).
+    pub rms: f32,
+    /// Signal to stop the running capture thread (None when not capturing).
+    pub audio_stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for AppState {
@@ -24,6 +25,8 @@ impl Default for AppState {
             click_through: false,
             always_on_top: true,
             captioning: false,
+            rms: 0.0,
+            audio_stop: None,
         }
     }
 }
