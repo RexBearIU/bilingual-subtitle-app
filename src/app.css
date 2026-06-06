@@ -1,0 +1,21 @@
+:root {
+  color-scheme: dark;
+  font-family: "Noto Sans", "Microsoft JhengHei", "Malgun Gothic", system-ui,
+    -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+}
+
+body {
+  overflow: hidden;
+  user-select: none;
+  /* The window itself is transparent; only opaque elements (subtitle box,
+     control bar) are visible and hit-testable. */
+}
