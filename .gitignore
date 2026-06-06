@@ -14,6 +14,7 @@ dist-ssr
 
 # Heavy local assets (downloaded once, never committed) — see docs/SETUP.md
 /models/
+/binaries/
 /src-tauri/binaries/
 
 # Editor directories and files
