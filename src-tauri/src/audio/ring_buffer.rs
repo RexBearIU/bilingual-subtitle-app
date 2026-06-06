@@ -1,5 +1,4 @@
-//! Bounded ring buffer of f32 audio samples — wired into the VAD pipeline in M3.
-#![allow(dead_code)]
+//! Bounded ring buffer of f32 audio samples — used by the VAD pre-roll (M3).
 
 /// Bounded ring buffer of f32 audio samples.
 /// When capacity is exceeded the oldest samples are overwritten.
@@ -32,10 +31,12 @@ impl RingBuffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.filled
     }
 
+    #[allow(dead_code)]
     pub fn capacity(&self) -> usize {
         self.cap
     }

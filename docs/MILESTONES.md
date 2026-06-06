@@ -7,7 +7,7 @@ Status legend: ⬜ not started · 🟡 in progress · ✅ done
 | 0 | Repo scaffold, docs, toolchain | ✅ |
 | 1 | Tauri overlay shell | ✅ |
 | 2 | WASAPI system audio capture | ✅ |
-| 3 | Audio chunking + VAD | ⬜ |
+| 3 | Audio chunking + VAD | ✅ |
 | 4 | Local ASR (whisper.cpp) | ⬜ |
 | 5 | Translation engine (Qwen) | ⬜ |
 | 6 | Subtitle state manager | ⬜ |
@@ -71,12 +71,18 @@ debug/UI · no mic · no WSL.
 Start→stop lifecycle clean. RMS emitted to frontend via `engine_status`.
 Tauri hot-rebuild round-trip 6.6 s.
 
-## M3 — Chunking + VAD  ⬜
+## M3 — Chunking + VAD  ✅
 
 RMS VAD v1. 16kHz mono · chunk 2–5s · pre-roll ~300ms · silence timeout
 500–800ms · max segment 8s · configurable threshold.
 **Acceptance:** silence doesn't trigger ASR · speech produces chunks · chunk
 start/end timestamps logged. Later: Silero/WebRTC VAD.
+
+**Implemented:** `pipeline/vad.rs` — RMS VAD state machine (25 ms frames,
+SPEECH_THRESHOLD=0.005 ≈ −46 dBFS, 300 ms pre-roll, 500 ms silence timeout,
+8 s max). `capture.rs` resamples WASAPI output to 16 kHz mono via
+`audio/resample.rs` (rubato SincFixedIn) and forwards to VAD via `mpsc`
+channel. `pipeline/mod.rs` declared; `lib.rs` includes `mod pipeline`.
 
 ## M4 — ASR (whisper.cpp)  ⬜
 

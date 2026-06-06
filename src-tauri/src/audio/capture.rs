@@ -1,25 +1,31 @@
 //! WASAPI loopback capture (Windows only, shared mode, ADR-0002).
 //! Spawns a detached thread that reads from the default render endpoint in
 //! loopback mode, computes RMS, and emits `engine_status` every ~200 ms.
+//! Also resamples to 16 kHz mono and forwards chunks to the VAD worker (M3).
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 use wasapi::{Direction, ShareMode, get_default_device};
 
+use crate::audio::resample::Resampler16k;
 use crate::state::AppState;
 use crate::types::EngineStatus;
 
-/// Spawn the WASAPI loopback capture thread (detached).
-/// The thread exits cleanly when `stop` is set to `true`.
+/// Spawn the WASAPI loopback capture thread and the VAD worker (detached).
+/// Both threads exit cleanly when `stop` is set to `true`.
 pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
+    let (tx, rx) = mpsc::channel::<Vec<f32>>();
+    crate::pipeline::vad::start_vad_worker(rx, Arc::clone(&stop));
+
     std::thread::Builder::new()
         .name("wasapi-loopback".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(&app, &stop) {
+            if let Err(e) = capture_loop(&app, &stop, tx) {
                 log::error!("WASAPI capture error: {e}");
             }
             log::info!("WASAPI capture thread exited");
@@ -27,7 +33,11 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
         .expect("spawn wasapi-loopback thread");
 }
 
-fn capture_loop(app: &AppHandle, stop: &Arc<AtomicBool>) -> Result<(), String> {
+fn capture_loop(
+    app: &AppHandle,
+    stop: &Arc<AtomicBool>,
+    tx: mpsc::Sender<Vec<f32>>,
+) -> Result<(), String> {
     // Initialize COM for this thread (MTA, safe on a new non-UI thread).
     wasapi::initialize_mta().map_err(|e| e.to_string())?;
 
@@ -47,6 +57,8 @@ fn capture_loop(app: &AppHandle, stop: &Arc<AtomicBool>) -> Result<(), String> {
         "WASAPI loopback: {} Hz  {} ch  {} bps  block_align={}",
         sample_rate, channels, bits_per_sample, block_align
     );
+
+    let mut resampler = Resampler16k::new(sample_rate, channels)?;
 
     let (default_period, _) = audio_client.get_periods().map_err(|e| e.to_string())?;
 
@@ -103,14 +115,13 @@ fn capture_loop(app: &AppHandle, stop: &Arc<AtomicBool>) -> Result<(), String> {
             f32_buf.extend_from_slice(&bytes_to_f32(&frame_bytes, bits_per_sample));
         }
 
-        // Emit RMS every ~200 ms; skip if we've been asked to stop.
+        // Every ~200 ms: emit RMS to UI and forward resampled audio to VAD.
         if last_emit.elapsed() >= Duration::from_millis(200)
             && !f32_buf.is_empty()
             && !stop.load(Ordering::Relaxed)
         {
             let mono = interleaved_to_mono(&f32_buf, channels);
             let rms = super::meter::rms(&mono);
-            f32_buf.clear();
             last_emit = Instant::now();
 
             log::info!(
@@ -118,8 +129,18 @@ fn capture_loop(app: &AppHandle, stop: &Arc<AtomicBool>) -> Result<(), String> {
                 rms,
                 super::meter::rms_to_dbfs(rms)
             );
-
             push_rms(app, rms);
+
+            // Resample to 16 kHz mono and send to the VAD pipeline.
+            match resampler.process(&f32_buf) {
+                Ok(samples_16k) if !samples_16k.is_empty() => {
+                    let _ = tx.send(samples_16k);
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("resample error: {e}"),
+            }
+
+            f32_buf.clear();
         }
     }
 

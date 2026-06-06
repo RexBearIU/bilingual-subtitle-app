@@ -5,7 +5,6 @@ use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-#[allow(dead_code)]
 pub struct Resampler16k {
     inner: SincFixedIn<f32>,
     channels: usize,
@@ -14,7 +13,6 @@ pub struct Resampler16k {
     pending: Vec<Vec<f32>>,
 }
 
-#[allow(dead_code)]
 impl Resampler16k {
     pub fn new(input_rate: u32, channels: usize) -> Result<Self, String> {
         let params = SincInterpolationParameters {

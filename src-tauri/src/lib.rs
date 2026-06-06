@@ -1,5 +1,6 @@
 mod audio;
 mod commands;
+mod pipeline;
 mod state;
 mod types;
 
