@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "bilingual-subtitle-app",
+  "productName": "Bilingual Subtitles",
   "version": "0.1.0",
   "identifier": "com.bilingualsubtitle.app",
   "build": {
@@ -35,7 +35,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": "nsis",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -43,8 +43,44 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "android": {
-      "debugApplicationIdSuffix": ".debug"
+    "resources": {
+      "../faster_whisper_srv.py": "faster_whisper_srv.py",
+      "../binaries/llama-server.exe": "llama-server.exe",
+      "../binaries/llama.dll": "llama.dll",
+      "../binaries/llama-common.dll": "llama-common.dll",
+      "../binaries/llama-server-impl.dll": "llama-server-impl.dll",
+      "../binaries/llama-completion-impl.dll": "llama-completion-impl.dll",
+      "../binaries/mtmd.dll": "mtmd.dll",
+      "../binaries/ggml.dll": "ggml.dll",
+      "../binaries/ggml-base.dll": "ggml-base.dll",
+      "../binaries/ggml-blas.dll": "ggml-blas.dll",
+      "../binaries/ggml-cpu.dll": "ggml-cpu.dll",
+      "../binaries/ggml-cpu-alderlake.dll": "ggml-cpu-alderlake.dll",
+      "../binaries/ggml-cpu-cannonlake.dll": "ggml-cpu-cannonlake.dll",
+      "../binaries/ggml-cpu-cascadelake.dll": "ggml-cpu-cascadelake.dll",
+      "../binaries/ggml-cpu-cooperlake.dll": "ggml-cpu-cooperlake.dll",
+      "../binaries/ggml-cpu-haswell.dll": "ggml-cpu-haswell.dll",
+      "../binaries/ggml-cpu-icelake.dll": "ggml-cpu-icelake.dll",
+      "../binaries/ggml-cpu-ivybridge.dll": "ggml-cpu-ivybridge.dll",
+      "../binaries/ggml-cpu-piledriver.dll": "ggml-cpu-piledriver.dll",
+      "../binaries/ggml-cpu-sandybridge.dll": "ggml-cpu-sandybridge.dll",
+      "../binaries/ggml-cpu-sapphirerapids.dll": "ggml-cpu-sapphirerapids.dll",
+      "../binaries/ggml-cpu-skylakex.dll": "ggml-cpu-skylakex.dll",
+      "../binaries/ggml-cpu-sse42.dll": "ggml-cpu-sse42.dll",
+      "../binaries/ggml-cpu-x64.dll": "ggml-cpu-x64.dll",
+      "../binaries/ggml-cpu-zen4.dll": "ggml-cpu-zen4.dll",
+      "../binaries/ggml-cuda.dll": "ggml-cuda.dll",
+      "../binaries/ggml-rpc.dll": "ggml-rpc.dll",
+      "../binaries/ggml-vulkan.dll": "ggml-vulkan.dll",
+      "../binaries/libopenblas.dll": "libopenblas.dll",
+      "../binaries/libomp140.x86_64.dll": "libomp140.x86_64.dll"
+    },
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "installMode": "currentUser"
+      }
     }
   }
 }

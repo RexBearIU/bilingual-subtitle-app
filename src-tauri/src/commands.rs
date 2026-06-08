@@ -121,20 +121,63 @@ pub fn stop_captioning(
     Ok(())
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── path resolution ───────────────────────────────────────────────────────────
+
+/// Returns the directory that contains the running executable.
+/// In a bundled release this is the install dir, where sidecars and DLLs live.
+fn exe_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+}
+
+/// Resolve a sidecar executable path.
+/// Priority: (1) env var override → (2) exe dir → (3) PATH.
+fn resolve_bin(env_var: &str, stem: &str) -> String {
+    if let Ok(v) = std::env::var(env_var) {
+        if !v.is_empty() { return v; }
+    }
+    if let Some(dir) = exe_dir() {
+        // Try with .exe suffix (Windows) then without (PATH fallback handles it).
+        #[cfg(target_os = "windows")]
+        let name = format!("{stem}.exe");
+        #[cfg(not(target_os = "windows"))]
+        let name = stem.to_string();
+        let candidate = dir.join(&name);
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    stem.to_string()
+}
+
+/// Resolve a resource file path (e.g. a Python script bundled alongside the exe).
+/// Priority: (1) env var override → (2) exe dir → (3) cwd (dev mode).
+fn resolve_resource(env_var: &str, name: &str) -> String {
+    if let Ok(v) = std::env::var(env_var) {
+        if !v.is_empty() { return v; }
+    }
+    if let Some(dir) = exe_dir() {
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    name.to_string()
+}
+
+// ── sidecar launchers ─────────────────────────────────────────────────────────
 
 /// Spawn faster-whisper-server as a child process (Python script).
 ///
-/// Python bin:  env `PYTHON_BIN`              → `python`.
-/// Script path: env `WHISPER_SERVER_SCRIPT`   → `faster_whisper_srv.py`.
+/// Python bin:  env `PYTHON_BIN`              → `python` (system Python).
+/// Script path: env `WHISPER_SERVER_SCRIPT`   → exe-dir/faster_whisper_srv.py → cwd.
 /// Model:       env `WHISPER_MODEL`           → `Systran/faster-whisper-medium`
 ///              (HuggingFace repo id; downloaded on first run ~1.5 GB).
 /// Port:        env `WHISPER_ASR_PORT`        → 9001.
 fn launch_whisper_server() -> Result<std::process::Child, String> {
     let python = std::env::var("PYTHON_BIN")
         .unwrap_or_else(|_| "python".to_string());
-    let script = std::env::var("WHISPER_SERVER_SCRIPT")
-        .unwrap_or_else(|_| "faster_whisper_srv.py".to_string());
+    let script = resolve_resource("WHISPER_SERVER_SCRIPT", "faster_whisper_srv.py");
     let model = std::env::var("WHISPER_MODEL")
         .unwrap_or_else(|_| "Systran/faster-whisper-medium".to_string());
     let port = std::env::var("WHISPER_ASR_PORT")
@@ -162,13 +205,12 @@ fn launch_whisper_server() -> Result<std::process::Child, String> {
 
 /// Spawn llama-server as a child process.
 ///
-/// Binary path:  env `LLAMA_SERVER_BIN`  → `llama-server` (PATH).
+/// Binary path:  env `LLAMA_SERVER_BIN`  → exe-dir/llama-server.exe → PATH.
 /// Model path:   env `LLAMA_MODEL`       → `models/Qwen3-4B-Q4_K_M.gguf`.
 /// Port:         env `LLAMA_PORT`        → 9002.
-/// GPU layers:   AppState.llama_gpu_layers → env `LLAMA_GPU_LAYERS` → 36.
+/// GPU layers:   AppState.llama_gpu_layers (UI toggle) → env `LLAMA_GPU_LAYERS` → 36.
 fn launch_llama_server(ngl_override: u32) -> Result<std::process::Child, String> {
-    let bin = std::env::var("LLAMA_SERVER_BIN")
-        .unwrap_or_else(|_| "llama-server".to_string());
+    let bin = resolve_bin("LLAMA_SERVER_BIN", "llama-server");
     let model = std::env::var("LLAMA_MODEL")
         .unwrap_or_else(|_| "models/Qwen3-4B-Q4_K_M.gguf".to_string());
     let port = std::env::var("LLAMA_PORT")
