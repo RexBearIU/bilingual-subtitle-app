@@ -115,18 +115,63 @@ Invoke-WebRequest `
 
 ### llama-server (translation, M5)
 
+**No CUDA Toolkit required** — use the **Vulkan** build (self-contained, ships
+with any NVIDIA driver).
+
 ```powershell
-# Download llama.cpp release (check https://github.com/ggml-org/llama.cpp/releases for latest)
-# Look for: llama-<version>-bin-win-cuda-cu12.4-x64.zip  (GPU)
-#       or: llama-<version>-bin-win-openblas-x64.zip      (CPU)
-# Extract llama-server.exe + DLLs to binaries/
-# Download model from HuggingFace (Qwen2.5-1.5B-Instruct-Q4_K_M.gguf, ~1 GB)
+# Download Vulkan build (check https://github.com/ggml-org/llama.cpp/releases for latest)
+$ProgressPreference = 'SilentlyContinue'
+Invoke-WebRequest `
+  "https://github.com/ggml-org/llama.cpp/releases/download/b9542/llama-b9542-bin-win-vulkan-x64.zip" `
+  -OutFile "$env:TEMP\llama-vulkan.zip" -UseBasicParsing
+Expand-Archive "$env:TEMP\llama-vulkan.zip" -DestinationPath "$env:TEMP\llama-vulkan" -Force
+
+$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
+Get-ChildItem "$env:TEMP\llama-vulkan" -Recurse |
+    Where-Object { $_.Extension -in ".exe",".dll" } |
+    ForEach-Object { Copy-Item $_.FullName "$proj\binaries\$($_.Name)" -Force }
 ```
 
-_M5 env vars (to be set when implementing translation):_
+Download Qwen3-4B model (~2.4 GB):
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `LLAMA_SERVER_BIN` | `llama-server` | Path to llama-server.exe |
-| `LLAMA_MODEL` | `models/qwen2.5-1.5b-q4.gguf` | Path to Qwen GGUF model |
+```powershell
+$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
+Invoke-WebRequest `
+  "https://huggingface.co/bartowski/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf" `
+  -OutFile "$proj\models\Qwen3-4B-Q4_K_M.gguf" -UseBasicParsing
+```
+
+Set env vars:
+
+```powershell
+$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
+[System.Environment]::SetEnvironmentVariable("LLAMA_SERVER_BIN",  "$proj\binaries\llama-server.exe",    "User")
+[System.Environment]::SetEnvironmentVariable("LLAMA_MODEL",       "$proj\models\Qwen3-4B-Q4_K_M.gguf", "User")
+[System.Environment]::SetEnvironmentVariable("LLAMA_PORT",        "9002",                               "User")
+[System.Environment]::SetEnvironmentVariable("LLAMA_GPU_LAYERS",  "36",                                 "User")
+```
+
+Smoke-test:
+
+```powershell
+$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
+& "$proj\binaries\llama-server.exe" `
+  -m "$proj\models\Qwen3-4B-Q4_K_M.gguf" `
+  --port 9002 -ngl 36 -c 2048 --no-webui
+# In another terminal:
+# Invoke-WebRequest http://127.0.0.1:9002/health   → {"status":"ok"}
+# Then POST /v1/chat/completions with /no_think prompt
+```
+
+**Gaming scenario** (free VRAM for the game): set `LLAMA_GPU_LAYERS=0` to run
+translation on CPU only. Latency increases ~3× but typically stays under 1s for
+subtitle-length text.
+
+_M5 env vars:_
+
+| Env var | Default in code | Description |
+|---------|-----------------|-------------|
+| `LLAMA_SERVER_BIN` | `llama-server` (PATH) | Path to llama-server.exe |
+| `LLAMA_MODEL` | `models/Qwen3-4B-Q4_K_M.gguf` | Path to Qwen3 GGUF model |
 | `LLAMA_PORT` | `9002` | HTTP port for llama-server |
+| `LLAMA_GPU_LAYERS` | `36` | GPU offload layers (0=CPU, 36=all GPU) |

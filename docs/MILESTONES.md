@@ -9,10 +9,10 @@ Status legend: ⬜ not started · 🟡 in progress · ✅ done
 | 2 | WASAPI system audio capture | ✅ |
 | 3 | Audio chunking + VAD | ✅ |
 | 4 | Local ASR (whisper.cpp) | ✅ |
-| 5 | Translation engine (Qwen) | ⬜ |
-| 6 | Subtitle state manager | ⬜ |
-| 7 | Product settings | ⬜ |
-| 8 | Performance optimization | ⬜ |
+| 5 | Translation engine (Qwen) | ✅ |
+| 6 | Subtitle state manager | ✅ |
+| 7 | Product settings | ✅ |
+| 8 | Performance optimization | ✅ |
 | 9 | Optional SenseVoice backend | ⬜ |
 
 ---
@@ -106,7 +106,7 @@ for server readiness (30 s), then streams chunks from VAD → WAV → POST →
 and put a model at `models/ggml-medium.bin` (or set `WHISPER_MODEL`) relative
 to the working directory when running `npm run tauri dev`.
 
-## M5 — Translation (Qwen)  ⬜
+## M5 — Translation (Qwen)  ✅
 
 `llama-server` sidecar. Models: Qwen2.5-1.5B-Instruct Q4_K_M; upgrade to Qwen3-4B
 if quality insufficient. Output subtitle text only · Traditional Chinese · natural
@@ -114,23 +114,73 @@ subtitle style · preserve names/brands/common English tech terms · no explanat
 Mode logic in [ARCHITECTURE.md](ARCHITECTURE.md).
 **Acceptance:** ko→zh-en · en→zh-ko · zh→zh-en/zh-ko · acceptable latency.
 
-## M6 — Subtitle state manager  ⬜
+**Implemented:** `translate/mod.rs` (`TranslationRequest` boundary type) +
+`translate/llama_server.rs` (HTTP client calling OpenAI-compatible
+`/v1/chat/completions`). Qwen3 `/no_think` directive used to suppress
+chain-of-thought and get direct translation output. `strip_think_tags` safety-net
+strips any residual `<think>…</think>` blocks. `state.rs` adds `translation_status`
++ `LlamaProc` managed state. `commands.rs` launches `llama-server` on
+`start_captioning` (env-configurable: `LLAMA_SERVER_BIN`, `LLAMA_MODEL`,
+`LLAMA_PORT`, `LLAMA_GPU_LAYERS`; defaults: PATH, `models/Qwen3-4B-Q4_K_M.gguf`,
+9002, 36 GPU layers). ASR worker emits source-only subtitle immediately
+(`is_final=false`), then enqueues a `TranslationRequest`; translation worker emits
+updated event with same `id` and `zh` slot filled (`is_final=true`). Pipeline:
+WASAPI → VAD → ASR → [translate channel] → Translation → `subtitle_update`.
+
+## M6 — Subtitle state manager  ✅
 
 `SubtitleSegment` store: dedup · merge fragments · expire after 3–5s · partial &
 final · keep last N segments as translation context.
 **Acceptance:** no flicker · no duplicate text · subtitles disappear naturally.
 
-## M7 — Settings  ⬜
+**Implemented:** `subtitles.svelte.ts` — `OverlayStore.segments: SubtitleUpdate[]`
+(Svelte 5 `$state`). `_handleUpdate()`: dedup by `id` (splice-replace in-place) +
+merge partial→final (same slot). `_expiry: Map<id, number|null>` tracks
+per-segment expiry timestamp (set when `is_final=true`, null while still partial).
+`_prune()` runs every 500ms via `setInterval`, removes segments past their expiry.
+`MAX_SEGMENTS=3` caps the display count; oldest are evicted when over limit.
+`SubtitleView.svelte` now accepts `segments: SubtitleUpdate[]` and stacks them
+oldest-first; partial segments get `opacity: 0.75` while awaiting translation.
+`EXPIRE_MS=4000` (4s on-screen after final).
+
+## M7 — Settings  ✅
 
 mode · ASR model path · translation model path · font size · max lines · overlay
 position · opacity · click-through · low-latency / high-quality. Persisted via
 `tauri-plugin-store`.
 **Acceptance:** settings survive restart · mode changeable while running.
 
-## M8 — Performance  ⬜
+**Implemented:** `settings.rs` — `PersistSettings` + `OverlayRect` structs,
+JSON file stored at `{AppData}/com.bilingualsubtitle.app/settings.json` (no
+plugin dependency, uses `serde_json` + `std::fs`). `SettingsPath` managed state
+holds the resolved path.  `setup` in `lib.rs` loads settings at launch, applies
+window position/size via `set_position`/`set_size`, syncs AppState
+(mode/font_size/subtitle_opacity/llama_gpu_layers). Commands: `get_settings`
+(returns current settings) and `update_settings(patch)` (partial update →
+AppState + file). `set_font_size` / `set_subtitle_mode` call `save_current_settings`
+after updating.  Frontend: `App.svelte` listens to `window.onMoved` /
+`window.onResized` (400ms debounce) → `updateSettings({overlay})`.  ControlBar
+adds opacity slider (◐ icon) and GPU/CPU toggle button (persists
+`llama_gpu_layers`: 36 ↔ 0). Subtitle background uses CSS `--subtitle-bg-opacity`
+custom property driven by `EngineStatus.subtitleOpacity`.
+
+## M8 — Performance  ✅
 
 Targets: 1–3s end-to-end · low idle CPU · models stay loaded · no memory growth.
 Separate worker threads + bounded channels · drop stale chunks under back-pressure.
+
+**Implemented:**
+- **Bounded channels** — VAD→ASR and ASR→Translation channels changed from
+  `mpsc::channel` (unbounded) to `mpsc::sync_channel(2)`. VAD and ASR use
+  `try_send`; if the consumer is busy and the queue is full, the chunk is dropped
+  with a WARN log instead of piling up in memory. Capture→VAD stays unbounded
+  (VAD is fast — pure RMS arithmetic).
+- **Whisper rolling prompt** — after each successful transcription, the last
+  ≤200 chars of text are passed as `initial_prompt` to the next whisper-server
+  request. This improves continuity (names, punctuation, sentence context) across
+  chunk boundaries at zero latency cost.
+- **RMS log → debug** — audio meter was logging at INFO every 200ms (5 lines/s).
+  Changed to DEBUG to keep the log readable during normal use.
 
 ## M9 — SenseVoice (optional)  ⬜
 

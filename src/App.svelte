@@ -1,55 +1,90 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import ControlBar from "./components/ControlBar.svelte";
+  import SettingsPanel from "./components/SettingsPanel.svelte";
   import SubtitleView from "./components/SubtitleView.svelte";
   import { overlay } from "./lib/subtitles.svelte";
-  import { getStatus } from "./lib/commands";
+  import { getStatus, updateSettings } from "./lib/commands";
 
-  // Show the control bar on hover; the subtitle stays visible always.
-  let hovering = $state(false);
+  let settingsOpen  = $state(false);
+  let subsHidden    = $state(false);   // subtitle visibility toggle
 
   onMount(() => {
     let disconnected = false;
+
     (async () => {
       await overlay.connect();
-      // Hydrate initial status (mode / font size / click-through).
-      try {
-        overlay.status = await getStatus();
-      } catch (e) {
-        console.error("getStatus failed", e);
+
+      try { overlay.status = await getStatus(); }
+      catch (e) { console.error("getStatus failed", e); }
+
+      if (disconnected) { overlay.disconnect(); return; }
+
+      const appWindow = getCurrentWindow();
+      let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+      async function saveOverlay() {
+        try {
+          const [pos, size] = await Promise.all([
+            appWindow.outerPosition(),
+            appWindow.outerSize(),
+          ]);
+          await updateSettings({ overlay: { x: pos.x, y: pos.y, w: size.width, h: size.height } });
+        } catch (e) { console.warn("saveOverlay failed", e); }
       }
-      if (disconnected) overlay.disconnect();
+
+      function scheduleOverlaySave() {
+        if (saveTimer !== null) clearTimeout(saveTimer);
+        saveTimer = setTimeout(saveOverlay, 400);
+      }
+
+      const unlistenMove   = await appWindow.onMoved(scheduleOverlaySave);
+      const unlistenResize = await appWindow.onResized(scheduleOverlaySave);
+
+      if (disconnected) {
+        overlay.disconnect(); unlistenMove(); unlistenResize(); return;
+      }
+
+      return () => {
+        disconnected = true;
+        overlay.disconnect(); unlistenMove(); unlistenResize();
+        if (saveTimer !== null) clearTimeout(saveTimer);
+      };
     })();
-    return () => {
-      disconnected = true;
-      overlay.disconnect();
-    };
   });
 
-  let fontSize = $derived(overlay.status?.fontSize ?? 28);
-  let clickThrough = $derived(overlay.status?.clickThrough ?? false);
-  // When click-through is on the window passes the mouse through, so the control
-  // bar is unreachable anyway — hide it for a clean caption-only overlay.
-  let showControls = $derived(hovering && !clickThrough);
+  let fontSize     = $derived(overlay.status?.fontSize       ?? 28);
+  let clickThrough = $derived(overlay.status?.clickThrough   ?? false);
+  let opacity      = $derived(overlay.status?.subtitleOpacity ?? 0.55);
 
-  $effect(() => {
-    // No mouseleave fires once the mouse starts passing through, so reset here.
-    if (clickThrough) hovering = false;
-  });
+  // Controls are always interactive when not in click-through mode.
+  // We no longer rely on mouseenter/leave (unreliable on Tauri transparent windows).
+  let showControls = $derived(!clickThrough);
 </script>
 
 <main
   class="overlay"
-  onmouseenter={() => (hovering = true)}
-  onmouseleave={() => (hovering = false)}
+  style="--subtitle-bg-opacity: {opacity};"
   role="application"
 >
-  <div class="controls" class:visible={showControls}>
-    <ControlBar status={overlay.status} />
+  {#if settingsOpen}
+    <SettingsPanel status={overlay.status} onClose={() => (settingsOpen = false)} />
+  {/if}
+
+  <!-- subtitles sit ABOVE the control bar so the bar stays at the bottom edge -->
+  <div class="stage" class:hidden={subsHidden}>
+    <SubtitleView segments={overlay.segments} {fontSize} />
   </div>
 
-  <div class="stage">
-    <SubtitleView update={overlay.current} {fontSize} />
+  <!-- ControlBar always anchored at the very bottom; shows on hover -->
+  <div class="controls" class:visible={showControls}>
+    <ControlBar
+      status={overlay.status}
+      subsHidden={subsHidden}
+      onToggleSubs={() => (subsHidden = !subsHidden)}
+      onSettingsOpen={() => (settingsOpen = true)}
+    />
   </div>
 </main>
 
@@ -64,20 +99,31 @@
     padding: 8px;
     background: transparent;
   }
+
   .controls {
+    /* Hidden + non-interactive in click-through mode. */
     opacity: 0;
-    transform: translateY(-4px);
-    transition: opacity 0.12s ease, transform 0.12s ease;
     pointer-events: none;
-    margin-bottom: 8px;
+    transition: opacity 0.15s ease;
+    margin-top: 6px;
   }
+  /* Visible & interactive when NOT in click-through mode.
+     Always rendered so no mouseenter dependency needed. */
   .controls.visible {
-    opacity: 1;
-    transform: none;
+    opacity: 0.5;
     pointer-events: auto;
   }
+  .controls.visible:hover {
+    opacity: 1;
+  }
+
   .stage {
     display: flex;
     justify-content: center;
+    transition: opacity 0.15s ease;
+  }
+  .stage.hidden {
+    opacity: 0;
+    pointer-events: none;
   }
 </style>

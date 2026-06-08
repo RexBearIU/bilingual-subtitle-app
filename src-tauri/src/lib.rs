@@ -2,7 +2,9 @@ mod asr;
 mod audio;
 mod commands;
 mod pipeline;
+mod settings;
 mod state;
+mod translate;
 mod types;
 
 use std::sync::Mutex;
@@ -61,19 +63,63 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
         .manage(Mutex::new(state::WhisperProc(None)))
+        .manage(Mutex::new(state::LlamaProc(None)))
+        .manage(Mutex::new(settings::SettingsPath(std::path::PathBuf::new())))
         .invoke_handler(tauri::generate_handler![
             commands::start_captioning,
             commands::stop_captioning,
             commands::set_subtitle_mode,
+            commands::set_source_hint,
+            commands::set_music_mode,
             commands::set_click_through,
             commands::set_always_on_top,
             commands::set_font_size,
             commands::get_status,
             commands::dev_inject_subtitle,
+            commands::get_settings,
+            commands::update_settings,
+            commands::list_audio_processes,
+            commands::set_capture_process,
         ])
         .setup(|app| {
-            // Start in a known-good interactive, topmost state every launch.
+            // ── Load persistent settings ────────────────────────────────────
+            let settings_path = app
+                .path()
+                .app_data_dir()
+                .map(|d| d.join("settings.json"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("settings.json"));
+
+            let cfg = settings::PersistSettings::load(&settings_path);
+            log::info!("settings loaded from {:?}", settings_path);
+
+            // Store the path so commands can read/write it.
+            if let Some(sp) = app.try_state::<Mutex<settings::SettingsPath>>() {
+                if let Ok(mut sp) = sp.lock() {
+                    sp.0 = settings_path;
+                }
+            }
+
+            // Apply saved settings to AppState.
+            if let Some(st) = app.try_state::<Mutex<AppState>>() {
+                if let Ok(mut s) = st.lock() {
+                    s.mode = cfg.mode;
+                    s.source_hint = cfg.source_hint;
+                    s.music_mode = cfg.music_mode;
+                    s.music_mode_flag.store(cfg.music_mode, std::sync::atomic::Ordering::Relaxed);
+                    s.font_size = cfg.font_size;
+                    s.subtitle_opacity = cfg.subtitle_opacity;
+                    s.llama_gpu_layers = cfg.llama_gpu_layers;
+                    s.speech_threshold = cfg.speech_threshold;
+                }
+            }
+
+            // ── Restore window position / size ──────────────────────────────
             if let Some(w) = app.get_webview_window("main") {
+                use tauri::PhysicalPosition;
+                use tauri::PhysicalSize;
+                let _ = w.set_position(PhysicalPosition::new(cfg.overlay.x, cfg.overlay.y));
+                let _ = w.set_size(PhysicalSize::new(cfg.overlay.w, cfg.overlay.h));
+                // Start in a known-good interactive, topmost state.
                 let _ = w.set_ignore_cursor_events(false);
                 let _ = w.set_always_on_top(true);
             }

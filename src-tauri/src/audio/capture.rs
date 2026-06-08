@@ -15,12 +15,15 @@ use crate::asr;
 use crate::audio::resample::Resampler16k;
 use crate::pipeline;
 use crate::state::AppState;
+use crate::translate;
 use crate::types::EngineStatus;
 
 /// Port whisper-server listens on.  Configurable via env `WHISPER_ASR_PORT`.
 const DEFAULT_ASR_PORT: u16 = 9001;
+/// Port llama-server listens on.  Configurable via env `LLAMA_PORT`.
+const DEFAULT_LLAMA_PORT: u16 = 9002;
 
-/// Spawn the full audio pipeline: WASAPI capture → VAD → ASR.
+/// Spawn the full audio pipeline: WASAPI capture → VAD → ASR → Translation.
 /// All workers exit cleanly when `stop` is set to `true`.
 pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     let asr_port = std::env::var("WHISPER_ASR_PORT")
@@ -28,21 +31,55 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ASR_PORT);
 
-    // VAD → ASR channel
-    let (asr_tx, asr_rx) = mpsc::channel::<asr::AudioChunk>();
-    // Capture → VAD channel
+    let llama_port = std::env::var("LLAMA_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_LLAMA_PORT);
+
+    // ASR → Translation: bounded to 2 — drop translation requests rather than
+    // accumulate stale ones if the translation worker falls behind.
+    let (tl_tx, tl_rx) = mpsc::sync_channel::<translate::TranslationRequest>(2);
+    // VAD → ASR: bounded to 2 — drop audio chunks rather than queue indefinitely
+    // if ASR falls behind (e.g. long whisper inference).
+    let (asr_tx, asr_rx) = mpsc::sync_channel::<asr::AudioChunk>(2);
+    // Capture → VAD: unbounded is fine — VAD is fast (just RMS).
     let (vad_tx, vad_rx) = mpsc::channel::<Vec<f32>>();
 
-    asr::whisper_server::start_asr_worker(asr_rx, app.clone(), asr_port, Arc::clone(&stop));
-    pipeline::vad::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop));
+    // Read current settings once at pipeline start.
+    let (speech_threshold, music_mode_flag, capture_pid) = app
+        .try_state::<Mutex<AppState>>()
+        .and_then(|st| st.lock().ok().map(|s| {
+            (
+                s.speech_threshold,
+                Arc::clone(&s.music_mode_flag),
+                s.capture_target.as_ref().map(|p| p.pid).unwrap_or(0),
+            )
+        }))
+        .unwrap_or_else(|| (0.032, Arc::new(AtomicBool::new(false)), 0));
+
+    log::info!(
+        "pipeline start: speech_threshold={speech_threshold:.4} ({:.1} dBFS)  music_mode={}",
+        20.0_f32 * speech_threshold.log10(),
+        music_mode_flag.load(Ordering::Relaxed),
+    );
+
+    translate::llama_server::start_translate_worker(tl_rx, app.clone(), llama_port, Arc::clone(&stop));
+    asr::whisper_server::start_asr_worker(asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx);
+    pipeline::vad::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop), speech_threshold, music_mode_flag);
 
     std::thread::Builder::new()
         .name("wasapi-loopback".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(&app, &stop, vad_tx) {
-                log::error!("WASAPI capture error: {e}");
+            let result = if capture_pid == 0 {
+                capture_loop(&app, &stop, vad_tx)
+            } else {
+                log::info!("Using process loopback for PID {capture_pid}");
+                super::process_loopback::run_process_loopback(&app, &stop, vad_tx, capture_pid)
+            };
+            if let Err(e) = result {
+                log::error!("capture error: {e}");
             }
-            log::info!("WASAPI capture thread exited");
+            log::info!("capture thread exited");
         })
         .expect("spawn wasapi-loopback thread");
 }
@@ -127,7 +164,7 @@ fn capture_loop(
             let rms = super::meter::rms(&mono);
             last_emit = Instant::now();
 
-            log::info!("RMS {:.5} ({:.1} dBFS)", rms, super::meter::rms_to_dbfs(rms));
+            log::debug!("RMS {:.5} ({:.1} dBFS)", rms, super::meter::rms_to_dbfs(rms));
             push_rms(app, rms);
 
             match resampler.process(&f32_buf) {
@@ -157,7 +194,9 @@ fn push_rms(app: &AppHandle, rms: f32) {
     }
 }
 
-fn bytes_to_f32(bytes: &[u8], bits_per_sample: u16) -> Vec<f32> {
+/// Convert raw PCM bytes to normalised f32 samples.
+/// Shared with `process_loopback`.
+pub fn bytes_to_f32(bytes: &[u8], bits_per_sample: u16) -> Vec<f32> {
     match bits_per_sample {
         32 => bytes
             .chunks_exact(4)
@@ -185,7 +224,9 @@ fn bytes_to_f32(bytes: &[u8], bits_per_sample: u16) -> Vec<f32> {
     }
 }
 
-fn interleaved_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+/// Mix interleaved multi-channel samples down to mono.
+/// Shared with `process_loopback`.
+pub fn interleaved_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     if channels == 1 {
         return samples.to_vec();
     }
