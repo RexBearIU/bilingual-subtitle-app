@@ -15,6 +15,12 @@ click-through window.
 
 > Status: **M0–M8 complete** (overlay · WASAPI capture · VAD · ASR · translation · subtitle store · settings · performance). M9 (SenseVoice) optional — see [docs/MILESTONES.md](docs/MILESTONES.md).
 
+## Download & install
+
+1. Download **`Bilingual Subtitles_0.1.0_x64-setup.exe`** from the [latest release](https://github.com/RexBearIU/bilingual-subtitle-app/releases/latest).
+2. Run the installer (current-user install, no admin required).
+3. Follow the **[post-install setup in SETUP.md](docs/SETUP.md#post-install-setup-end-users)** to install Python dependencies and download models (~4 GB total).
+
 ## Tech stack
 
 | Layer | Choice |

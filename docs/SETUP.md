@@ -1,5 +1,54 @@
 # Setup
 
+## Post-install setup (end users)
+
+If you installed from the **release `.exe`**, skip the dev-build prerequisites below
+and follow these steps instead.
+
+### 1 — Install Python 3.10+
+
+Download from [python.org](https://www.python.org/downloads/) and tick
+**"Add Python to PATH"** during install.
+
+### 2 — Install faster-whisper and its dependencies
+
+```powershell
+pip install faster-whisper fastapi uvicorn ctranslate2
+```
+
+> On first launch, the Whisper medium model (~1.5 GB) downloads automatically from
+> HuggingFace. This takes a few minutes. The ASR status dot will show **loading**
+> until the download is complete.
+
+### 3 — Download the Qwen3-4B translation model
+
+```powershell
+# ~2.4 GB — run once
+$dest = "$env:APPDATA\BilingSubs\models"
+New-Item -ItemType Directory -Force $dest | Out-Null
+Invoke-WebRequest `
+  "https://huggingface.co/bartowski/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf" `
+  -OutFile "$dest\Qwen3-4B-Q4_K_M.gguf" -UseBasicParsing
+```
+
+Then tell the app where the model is (run once in a terminal):
+
+```powershell
+[System.Environment]::SetEnvironmentVariable(
+  "LLAMA_MODEL",
+  "$env:APPDATA\BilingSubs\models\Qwen3-4B-Q4_K_M.gguf",
+  "User"
+)
+```
+
+### 4 — Launch
+
+Find **Bilingual Subtitles** in the Start menu (or the install directory) and run it.
+The two status dots in the overlay should turn green within ~30 s on first run
+(longer on very first launch while the Whisper model downloads).
+
+---
+
 ## Prerequisites (Windows native — **not** WSL)
 
 WASAPI loopback and the overlay window require a native Windows build. Do not
