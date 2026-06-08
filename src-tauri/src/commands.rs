@@ -178,8 +178,23 @@ fn launch_whisper_server() -> Result<std::process::Child, String> {
     let python = std::env::var("PYTHON_BIN")
         .unwrap_or_else(|_| "python".to_string());
     let script = resolve_resource("WHISPER_SERVER_SCRIPT", "faster_whisper_srv.py");
-    let model = std::env::var("WHISPER_MODEL")
-        .unwrap_or_else(|_| "Systran/faster-whisper-medium".to_string());
+    // Accept a HuggingFace repo id or a local directory. If WHISPER_MODEL still
+    // points to a whisper.cpp .bin file (old env var value), ignore it and use
+    // the faster-whisper default so the app works without manual env var cleanup.
+    let model = {
+        let raw = std::env::var("WHISPER_MODEL")
+            .unwrap_or_default();
+        if raw.is_empty() || raw.ends_with(".bin") {
+            if !raw.is_empty() {
+                log::warn!("WHISPER_MODEL={raw:?} looks like a whisper.cpp model file — \
+                            faster-whisper needs a HuggingFace repo id or local directory. \
+                            Falling back to Systran/faster-whisper-medium.");
+            }
+            "Systran/faster-whisper-medium".to_string()
+        } else {
+            raw
+        }
+    };
     let port = std::env::var("WHISPER_ASR_PORT")
         .unwrap_or_else(|_| "9001".to_string());
 
