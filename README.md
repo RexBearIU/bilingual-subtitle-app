@@ -9,9 +9,11 @@ click-through window.
   (model/binary downloads happen once at setup).
 - **Any source app.** Browser video/live streams, Discord, VLC, games — anything
   that plays through the Windows default output device.
-- **Subtitle modes:** `zh-ko` and `zh-en`.
+- **Subtitle modes:** translate to `zh` / `ko` / `en`, or `none` (source text only).
+- **Per-process capture:** target a single app (e.g. a game) instead of all system audio.
+- **Music mode:** bypasses VAD for continuous lyrics captioning.
 
-> Status: **Milestone 1 (Tauri overlay shell)** — see [docs/MILESTONES.md](docs/MILESTONES.md).
+> Status: **M0–M8 complete** (overlay · WASAPI capture · VAD · ASR · translation · subtitle store · settings · performance). M9 (SenseVoice) optional — see [docs/MILESTONES.md](docs/MILESTONES.md).
 
 ## Tech stack
 
@@ -19,11 +21,11 @@ click-through window.
 |-------|--------|
 | Shell | Tauri v2 |
 | Backend | Rust |
-| Frontend | Svelte + Vite (no SvelteKit — single overlay, no routing needed) |
-| Audio capture | Windows WASAPI loopback via `wasapi` crate (**not** cpal) |
-| ASR | whisper.cpp — `whisper-server` sidecar first, `whisper-rs` FFI later |
-| Translation | Qwen GGUF via `llama-server` sidecar (OpenAI-compatible HTTP) |
-| Later | SenseVoice ASR backend (optional) |
+| Frontend | Svelte 5 + Vite (no SvelteKit — single overlay, no routing needed) |
+| Audio capture | Windows WASAPI loopback + per-process loopback (`process_loopback.rs`) |
+| ASR | faster-whisper — Python HTTP sidecar (`faster_whisper_srv.py`) |
+| Translation | Qwen3-4B GGUF via `llama-server` sidecar (OpenAI-compatible HTTP, Vulkan GPU) |
+| Later | SenseVoice ASR backend (optional, M9) |
 
 ## Documentation
 

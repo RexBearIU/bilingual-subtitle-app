@@ -95,12 +95,19 @@ without translation.
 **Implemented:** `asr/mod.rs` (`AudioChunk` type) + `asr/whisper_server.rs`
 (HTTP client with multipart WAV upload, verbose_json response parsing,
 `normalize_lang` mapping, `encode_wav_16bit`, `subtitle_update` emission).
-`commands.rs` launches `whisper-server` via `std::process::Command` on
-`start_captioning` (env-configurable: `WHISPER_SERVER_BIN`, `WHISPER_MODEL`,
-`WHISPER_ASR_PORT`; defaults: PATH lookup, `models/ggml-medium.bin`, 9001).
+`commands.rs` launches `faster_whisper_srv.py` (Python) via `std::process::Command`
+on `start_captioning` (env-configurable: `PYTHON_BIN`, `WHISPER_SERVER_SCRIPT`,
+`WHISPER_MODEL` as HuggingFace repo ID, `WHISPER_ASR_PORT`; defaults: `python`,
+`faster_whisper_srv.py`, `Systran/faster-whisper-medium`, 9001).
 `state.rs` adds `asr_status` + `WhisperProc` managed state. ASR worker polls
-for server readiness (30 s), then streams chunks from VAD → WAV → POST →
-`subtitle_update`. `ureq` v2 used for synchronous HTTP (no tokio conflict).
+for server readiness (300 s — allows first-run model download), then streams
+chunks from VAD → WAV → POST → `subtitle_update`. `ureq` v2 used for synchronous
+HTTP (no tokio conflict).
+
+**ASR quality filters** (added post-M4, in `whisper_server.rs`):
+- `no_speech_prob ≥ 0.7` suppresses silence/noise chunks
+- Hallucination blocklist (YouTube credits, `[Music]`, etc.)
+- Consecutive-repeat detection (initial_prompt feedback loop guard)
 
 **To activate:** place `whisper-server.exe` on PATH (or set `WHISPER_SERVER_BIN`)
 and put a model at `models/ggml-medium.bin` (or set `WHISPER_MODEL`) relative
@@ -176,11 +183,23 @@ Separate worker threads + bounded channels · drop stale chunks under back-press
   with a WARN log instead of piling up in memory. Capture→VAD stays unbounded
   (VAD is fast — pure RMS arithmetic).
 - **Whisper rolling prompt** — after each successful transcription, the last
-  ≤200 chars of text are passed as `initial_prompt` to the next whisper-server
-  request. This improves continuity (names, punctuation, sentence context) across
-  chunk boundaries at zero latency cost.
-- **RMS log → debug** — audio meter was logging at INFO every 200ms (5 lines/s).
+  ≤200 chars of text are passed as `initial_prompt` to the next request.
+  This improves continuity (names, punctuation, sentence context) across chunk
+  boundaries at zero latency cost.
+- **RMS log → debug** — audio meter was logging at INFO every 200 ms (5 lines/s).
   Changed to DEBUG to keep the log readable during normal use.
+- **Adaptive VAD** — `speech_threshold == 0` activates noise-floor EMA auto-mode.
+  3-frame onset detection (75 ms) suppresses music beats and game SFX. Partial
+  flush every 5 s keeps subtitles appearing without waiting for silence.
+- **Music mode** — bypasses VAD; fixed 10 s chunks + "Song lyrics:" prompt;
+  beam_size=3 for better lyric accuracy.
+- **Per-process capture** — `audio/process_loopback.rs` uses Windows Process
+  Loopback API to capture a single PID. `list_audio_processes` / `set_capture_process`
+  commands. `audio/session_enum.rs` for audio session enumeration.
+- **SubtitleMode redesign** — `zh-ko`/`zh-en` bilingual modes replaced by single-
+  target `none`/`zh`/`ko`/`en` (ADR-0007). `SourceHint` added for Whisper language lock.
+- **faster-whisper ASR** — switched from whisper.cpp binary to Python faster-whisper
+  sidecar for `no_speech_prob` access and easier model management (ADR-0006).
 
 ## M9 — SenseVoice (optional)  ⬜
 

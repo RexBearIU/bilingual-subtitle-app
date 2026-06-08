@@ -41,77 +41,67 @@ cargo tauri dev          # run the overlay in dev mode
 
 ## Sidecar binaries & models (M4 onward)
 
-All files are git-ignored (`/binaries/`, `/models/`).  
-**Three env vars** must be set (user-level, persists across terminals):
+Models and binaries are git-ignored (`/binaries/`, `/models/`).
 
-| Env var | Default in code | Machine value |
-|---------|-----------------|---------------|
-| `WHISPER_SERVER_BIN` | `whisper-server` (PATH) | `<project>\binaries\whisper-server.exe` |
-| `WHISPER_MODEL` | `models/ggml-medium.bin` | `<project>\models\ggml-medium.bin` |
-| `WHISPER_ASR_PORT` | `9001` | `9001` |
+### faster-whisper (ASR — Python sidecar)
 
-Set them once:
+The ASR backend is `faster_whisper_srv.py` — a Python HTTP server wrapping the
+`faster-whisper` library.  On first run it downloads the model automatically
+from HuggingFace (~1.5 GB for medium).
+
+**Step 1 — Install Python 3.10+ and dependencies:**
+
+```powershell
+# Verify Python is available
+python --version   # expect 3.10+
+
+# Install required packages (once)
+pip install faster-whisper fastapi uvicorn ctranslate2
+```
+
+**Step 2 — Set env vars** (user-level, persists across terminals):
+
+| Env var | Default in code | Description |
+|---------|-----------------|-------------|
+| `PYTHON_BIN` | `python` | Python interpreter to use |
+| `WHISPER_SERVER_SCRIPT` | `faster_whisper_srv.py` | Path to the server script |
+| `WHISPER_MODEL` | `Systran/faster-whisper-medium` | HuggingFace repo ID **or** local path |
+| `WHISPER_ASR_PORT` | `9001` | HTTP port |
 
 ```powershell
 $proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-[System.Environment]::SetEnvironmentVariable("WHISPER_SERVER_BIN", "$proj\binaries\whisper-server.exe", "User")
-[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL",      "$proj\models\ggml-medium.bin",      "User")
-[System.Environment]::SetEnvironmentVariable("WHISPER_ASR_PORT",   "9001",                               "User")
+[System.Environment]::SetEnvironmentVariable("WHISPER_SERVER_SCRIPT", "$proj\faster_whisper_srv.py", "User")
+[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL",         "Systran/faster-whisper-medium", "User")
+[System.Environment]::SetEnvironmentVariable("WHISPER_ASR_PORT",      "9001",                          "User")
+# PYTHON_BIN defaults to "python" — only set if you use a venv:
+# [System.Environment]::SetEnvironmentVariable("PYTHON_BIN", "C:\path\to\venv\Scripts\python.exe", "User")
 ```
 
-### whisper-server (ASR)
-
-**No CUDA Toolkit installation required** — the cublas zip bundles its own
-CUDA runtime DLLs (`cublas64_12.dll`, `cublasLt64_12.dll`, `cudart64_12.dll`, etc.).
-
-```powershell
-# Download GPU build (whisper.cpp v1.8.6, CUDA 12.4, self-contained)
-$ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest `
-  "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.6/whisper-cublas-12.4.0-bin-x64.zip" `
-  -OutFile "$env:TEMP\whisper-cublas.zip" -UseBasicParsing
-Expand-Archive "$env:TEMP\whisper-cublas.zip" -DestinationPath "$env:TEMP\whisper-cublas" -Force
-
-$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-New-Item -ItemType Directory -Force "$proj\binaries" | Out-Null
-Get-ChildItem "$env:TEMP\whisper-cublas\Release" | Where-Object { $_.Extension -in ".exe",".dll" } |
-    ForEach-Object { Copy-Item $_.FullName "$proj\binaries\$($_.Name)" -Force }
-```
-
-Download medium model (~1.5 GB):
+**Smoke-test:**
 
 ```powershell
 $proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-New-Item -ItemType Directory -Force "$proj\models" | Out-Null
-$ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest `
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin" `
-  -OutFile "$proj\models\ggml-medium.bin" -UseBasicParsing
+python "$proj\faster_whisper_srv.py" --model Systran/faster-whisper-medium --port 9001
+# First run downloads ~1.5 GB — wait for "Uvicorn running on http://127.0.0.1:9001"
+# In another terminal:
+Invoke-WebRequest http://127.0.0.1:9001/   # should return 200
 ```
 
-Smoke-test (should respond within ~15s for medium):
+**Alternative models:**
 
-```powershell
-$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-& "$proj\binaries\whisper-server.exe" -m "$proj\models\ggml-medium.bin" --port 9001 --language auto
-# Open another terminal: Invoke-WebRequest http://127.0.0.1:9001/ — should return 200
-```
+| Model | Size | Notes |
+|-------|------|-------|
+| `Systran/faster-whisper-small` | ~500 MB | Faster, lower accuracy |
+| `Systran/faster-whisper-medium` | ~1.5 GB | **Default** — good balance |
+| `Systran/faster-whisper-large-v3` | ~3 GB | Best quality |
 
-### CPU fallback (no GPU / testing)
+To use a local path instead of a HuggingFace ID, set `WHISPER_MODEL` to the
+directory containing the model files.
 
-If you have no NVIDIA GPU or want to test without CUDA:
-
-```powershell
-Invoke-WebRequest `
-  "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.6/whisper-blas-bin-x64.zip" `
-  -OutFile "$env:TEMP\whisper-blas.zip" -UseBasicParsing
-# ... same extraction steps ...
-# Use ggml-small.bin (~465 MB) for acceptable CPU latency
-Invoke-WebRequest `
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin" `
-  -OutFile "$proj\models\ggml-small.bin" -UseBasicParsing
-[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL", "$proj\models\ggml-small.bin", "User")
-```
+**GPU acceleration:** faster-whisper uses CTranslate2. On Windows with an NVIDIA
+GPU, `pip install ctranslate2` picks up CUDA automatically.  The `binaries/`
+directory is added to the DLL search path by the script so the cublas DLLs that
+ship with llama-server's Vulkan build are also found.
 
 ### llama-server (translation, M5)
 
