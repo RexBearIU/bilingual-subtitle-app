@@ -39,9 +39,9 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     // ASR → Translation: bounded to 2 — drop translation requests rather than
     // accumulate stale ones if the translation worker falls behind.
     let (tl_tx, tl_rx) = mpsc::sync_channel::<translate::TranslationRequest>(2);
-    // VAD → ASR: bounded to 2 — drop audio chunks rather than queue indefinitely
-    // if ASR falls behind (e.g. long whisper inference).
-    let (asr_tx, asr_rx) = mpsc::sync_channel::<asr::AudioChunk>(2);
+    // VAD → ASR: bounded to 4 — drop audio chunks rather than queue indefinitely
+    // if ASR falls behind (e.g. long whisper inference on CPU).
+    let (asr_tx, asr_rx) = mpsc::sync_channel::<asr::AudioChunk>(4);
     // Capture → VAD: unbounded is fine — VAD is fast (just RMS).
     let (vad_tx, vad_rx) = mpsc::channel::<Vec<f32>>();
 
@@ -58,14 +58,13 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
         .unwrap_or_else(|| (0.032, Arc::new(AtomicBool::new(false)), 0));
 
     log::info!(
-        "pipeline start: speech_threshold={speech_threshold:.4} ({:.1} dBFS)  music_mode={}",
-        20.0_f32 * speech_threshold.log10(),
+        "pipeline start: music_mode={}",
         music_mode_flag.load(Ordering::Relaxed),
     );
 
     translate::llama_server::start_translate_worker(tl_rx, app.clone(), llama_port, Arc::clone(&stop));
     asr::whisper_server::start_asr_worker(asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx);
-    pipeline::vad::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop), speech_threshold, music_mode_flag);
+    pipeline::chunker::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop), speech_threshold, music_mode_flag);
 
     std::thread::Builder::new()
         .name("wasapi-loopback".into())
@@ -164,7 +163,6 @@ fn capture_loop(
             let rms = super::meter::rms(&mono);
             last_emit = Instant::now();
 
-            log::debug!("RMS {:.5} ({:.1} dBFS)", rms, super::meter::rms_to_dbfs(rms));
             push_rms(app, rms);
 
             match resampler.process(&f32_buf) {

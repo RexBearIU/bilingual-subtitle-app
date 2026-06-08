@@ -47,84 +47,91 @@
 
 <div class="bar">
 
-  <!-- ① Start / Stop -->
-  <button class="run" class:on={running} onclick={toggleRun}>
-    {running ? "■ 停止" : "▶ 開始"}
-  </button>
+  <!-- 左側：可縮放的控制群 -->
+  <div class="left-group">
 
-  <div class="sep"></div>
+    <!-- ① Start / Stop -->
+    <button class="run" class:on={running} onclick={toggleRun}>
+      {running ? "■ 停止" : "▶ 開始"}
+    </button>
 
-  <!-- ② 語言：接收 → 翻譯 -->
-  <div class="lang-group" title="接收語言 → 翻譯目標語言">
-    <span class="lang-label">聽</span>
-    <select class="lang-sel" value={sourceHint} onchange={onSourceHint}
-            title="Whisper 接收語言（自動 = 每句自動判斷）">
-      <option value="auto">自動</option>
-      <option value="zh">繁中</option>
-      <option value="ko">한국</option>
-      <option value="en">EN</option>
-    </select>
-    <span class="lang-arrow">→</span>
-    <select class="lang-sel" value={mode} onchange={onMode}
-            title="翻譯目標語言（不翻 = 只顯示原文）">
-      <option value="none">不翻</option>
-      <option value="zh">繁中</option>
-      <option value="ko">한국</option>
-      <option value="en">EN</option>
-    </select>
+    <div class="sep"></div>
+
+    <!-- ② 語言：接收 → 翻譯 -->
+    <div class="lang-group" title="接收語言 → 翻譯目標語言">
+      <select class="lang-sel" value={sourceHint} onchange={onSourceHint}
+              title="Whisper 接收語言（自動 = 每句自動判斷）">
+        <option value="auto">自動</option>
+        <option value="zh">繁中</option>
+        <option value="ko">한국</option>
+        <option value="en">EN</option>
+      </select>
+      <span class="lang-arrow">→</span>
+      <select class="lang-sel" value={mode} onchange={onMode}
+              title="翻譯目標語言（不翻 = 只顯示原文）">
+        <option value="none">不翻</option>
+        <option value="zh">繁中</option>
+        <option value="ko">한국</option>
+        <option value="en">EN</option>
+      </select>
+    </div>
+
+    <div class="sep"></div>
+
+    <!-- ③ 音訊來源 -->
+    <ProcessPicker {status} />
+
+    <!-- ④ 音樂模式 -->
+    <button
+      class="icon-btn"
+      class:active={musicMode}
+      onclick={() => cmd.setMusicMode(!musicMode)}
+      title={musicMode ? "音樂模式（10s 切片 + beam=3）" : "語音模式（VAD）"}
+    >🎵</button>
+
+    <div class="sep"></div>
+
+    <!-- ⑤ 視窗控制 -->
+    <button class="icon-btn" class:active={alwaysOnTop}
+      onclick={() => cmd.setAlwaysOnTop(!alwaysOnTop)}
+      title={alwaysOnTop ? "置頂：開（再按關閉）" : "置頂：關"}>
+      📌
+    </button>
+
+    <button
+      class="txt-btn passthru"
+      class:active={clickThrough}
+      onclick={() => cmd.setClickThrough(!clickThrough)}
+      title={clickThrough ? "穿透：開 — 無法操作覆蓋層，再按解除" : "穿透：關 — 可操作覆蓋層"}
+    >{clickThrough ? "⊙ 穿透" : "● 互動"}</button>
+
+    <button
+      class="txt-btn"
+      class:dim={subsHidden}
+      onclick={() => onToggleSubs()}
+      title={subsHidden ? "字幕已隱藏（點擊顯示）" : "隱藏字幕"}>
+      字幕
+    </button>
+
   </div>
-
-  <div class="sep"></div>
-
-  <!-- ③ 音訊來源 -->
-  <ProcessPicker {status} />
-
-  <!-- ④ 音樂模式 -->
-  <button
-    class="icon-btn"
-    class:active={musicMode}
-    onclick={() => cmd.setMusicMode(!musicMode)}
-    title={musicMode ? "音樂模式（10s 切片 + beam=3）" : "語音模式（VAD）"}
-  >🎵</button>
-
-  <div class="sep"></div>
-
-  <!-- ⑤ 視窗控制 -->
-  <button class="icon-btn" class:active={alwaysOnTop}
-    onclick={() => cmd.setAlwaysOnTop(!alwaysOnTop)}
-    title={alwaysOnTop ? "置頂：開（再按關閉）" : "置頂：關"}>
-    📌
-  </button>
-
-  <button
-    class="txt-btn passthru"
-    class:active={clickThrough}
-    onclick={() => cmd.setClickThrough(!clickThrough)}
-    title={clickThrough ? "穿透：開 — 無法操作覆蓋層，再按解除" : "穿透：關 — 可操作覆蓋層"}
-  >{clickThrough ? "⊙ 穿透" : "● 互動"}</button>
-
-  <button
-    class="txt-btn"
-    class:dim={subsHidden}
-    onclick={() => onToggleSubs()}
-    title={subsHidden ? "字幕已隱藏（點擊顯示）" : "隱藏字幕"}>
-    字幕
-  </button>
-
-  <div class="sep"></div>
-
-  <!-- ⑥ 設定 / Dev -->
-  <button class="icon-btn" onclick={() => onSettingsOpen()} title="設定">⚙️</button>
-  <button class="dev" onclick={injectSample} title="注入測試字幕 (dev)">✦</button>
 
   <!-- spacer -->
   <div class="spacer"></div>
 
-  <!-- ⑦ 狀態指示 -->
-  <div class="status" title="音訊 · 語音 · 翻譯">
-    <span class="dot {dot(status?.capture)}" title="音訊捕捉"></span>
-    <span class="dot {dot(status?.asr)}"     title="語音辨識"></span>
-    <span class="dot {dot(status?.translation)}" title="翻譯引擎"></span>
+  <!-- 右側：永遠固定在右邊 -->
+  <div class="right-group">
+    <div class="sep"></div>
+
+    <!-- ⑥ 設定 / Dev -->
+    <button class="icon-btn" onclick={() => onSettingsOpen()} title="設定">⚙️</button>
+    <button class="dev" onclick={injectSample} title="注入測試字幕 (dev)">✦</button>
+
+    <!-- ⑦ 狀態指示 -->
+    <div class="status" title="音訊 · 語音 · 翻譯">
+      <span class="dot {dot(status?.capture)}" title="音訊捕捉"></span>
+      <span class="dot {dot(status?.asr)}"     title="語音辨識"></span>
+      <span class="dot {dot(status?.translation)}" title="翻譯引擎"></span>
+    </div>
   </div>
 
 </div>
@@ -193,11 +200,6 @@
     gap: 4px;
     flex-shrink: 0;
   }
-  .lang-label {
-    font-size: 10px;
-    color: #5a6878;
-    flex-shrink: 0;
-  }
   .lang-sel {
     background: #242b34;
     color: #c8d0da;
@@ -242,8 +244,23 @@
   .dev { opacity: 0.3; width: 22px; border-color: transparent; background: transparent; font-size: 11px; }
   .dev:hover { opacity: 0.7; background: #242b34; border-color: #343d4a; }
 
+  /* ── 左右群組 ───────────────────────────────── */
+  .left-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .right-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
   /* ── Spacer + 狀態 ───────────────────────────── */
-  .spacer { flex: 1; min-width: 4px; }
+  .spacer { flex: 0 0 8px; }
 
   .status {
     display: flex;

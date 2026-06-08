@@ -17,6 +17,9 @@ dist-ssr
 /binaries/
 /src-tauri/binaries/
 
+# Local dev launcher (personal convenience script)
+dev.bat
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

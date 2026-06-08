@@ -208,7 +208,14 @@ pub fn run() {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
+                        // Our own code: full debug
+                        .level(log::LevelFilter::Debug)
+                        // External crates: warn-only (suppress ureq/wasapi spam)
+                        .level_for("ureq",   log::LevelFilter::Warn)
+                        .level_for("wasapi", log::LevelFilter::Warn)
+                        .level_for("tauri",  log::LevelFilter::Warn)
+                        .level_for("tao",    log::LevelFilter::Warn)
+                        .level_for("wry",    log::LevelFilter::Warn)
                         .build(),
                 )?;
             }

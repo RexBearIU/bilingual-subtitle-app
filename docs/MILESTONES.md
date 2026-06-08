@@ -63,7 +63,7 @@ subtitles · zh-ko/zh-en switch works · stays above browser/video.
 
 ## M2 — WASAPI capture  ✅
 
-Modules: `audio/{mod,capture,resample,ring_buffer,meter}.rs`.
+Modules: `audio/{mod,capture,resample,meter}.rs`.
 **Acceptance:** YouTube playback → non-zero captured audio · RMS shown in
 debug/UI · no mic · no WSL.
 
@@ -71,18 +71,18 @@ debug/UI · no mic · no WSL.
 Start→stop lifecycle clean. RMS emitted to frontend via `engine_status`.
 Tauri hot-rebuild round-trip 6.6 s.
 
-## M3 — Chunking + VAD  ✅
+## M3 — Audio chunking  ✅
 
-RMS VAD v1. 16kHz mono · chunk 2–5s · pre-roll ~300ms · silence timeout
-500–800ms · max segment 8s · configurable threshold.
-**Acceptance:** silence doesn't trigger ASR · speech produces chunks · chunk
-start/end timestamps logged. Later: Silero/WebRTC VAD.
+Fixed-chunk accumulator (replaced original RMS VAD — see ADR-0009).
+16 kHz mono · 4 s video chunks · 10 s music-mode chunks · stop-flush ≥ 0.5 s.
+**Acceptance:** audio reaches ASR in regularly-sized chunks · silence handled
+by Whisper `no_speech_prob` · no memory growth over long sessions.
 
-**Implemented:** `pipeline/vad.rs` — RMS VAD state machine (25 ms frames,
-SPEECH_THRESHOLD=0.005 ≈ −46 dBFS, 300 ms pre-roll, 500 ms silence timeout,
-8 s max). `capture.rs` resamples WASAPI output to 16 kHz mono via
-`audio/resample.rs` (rubato SincFixedIn) and forwards to VAD via `mpsc`
-channel. `pipeline/mod.rs` declared; `lib.rs` includes `mod pipeline`.
+**Implemented:** `pipeline/chunker.rs` — simple fixed-size accumulator.
+`capture.rs` resamples WASAPI output to 16 kHz mono via `audio/resample.rs`
+(rubato SincFixedIn) and forwards 200 ms blocks to chunker via unbounded
+`mpsc::channel`. Chunker emits complete chunks to ASR via `sync_channel(4)`.
+`pipeline/mod.rs` declares `pub mod chunker`.
 
 ## M4 — ASR (whisper.cpp)  ✅
 
@@ -188,18 +188,43 @@ Separate worker threads + bounded channels · drop stale chunks under back-press
   boundaries at zero latency cost.
 - **RMS log → debug** — audio meter was logging at INFO every 200 ms (5 lines/s).
   Changed to DEBUG to keep the log readable during normal use.
-- **Adaptive VAD** — `speech_threshold == 0` activates noise-floor EMA auto-mode.
-  3-frame onset detection (75 ms) suppresses music beats and game SFX. Partial
-  flush every 5 s keeps subtitles appearing without waiting for silence.
-- **Music mode** — bypasses VAD; fixed 10 s chunks + "Song lyrics:" prompt;
-  beam_size=3 for better lyric accuracy.
+- **Fixed-chunk pipeline (replaces VAD)** — `pipeline/vad.rs` and
+  `audio/ring_buffer.rs` deleted. New `pipeline/chunker.rs` emits fixed 4 s
+  chunks unconditionally. Silence filtered by Whisper `no_speech_prob ≥ 0.7`
+  instead of RMS gating (more reliable for video/stream content — ADR-0009).
+- **Music mode** — fixed 10 s chunks + "Song lyrics:" prompt; beam_size=3 for
+  better lyric accuracy. Music mode is the only remaining chunk-size variant.
+- **Zombie sidecar cleanup** — `kill_port()` helper in `commands.rs` runs
+  `netstat -ano` + `taskkill /F /PID` before each sidecar launch to evict
+  leftover processes from a previous session that didn't clean up (e.g. after
+  force-kill or crash).
+- **Log level tuning** — debug builds use `LevelFilter::Debug` for own crates
+  with `level_for()` suppressors on `ureq`, `wasapi`, `tauri`, `tao`, `wry`
+  (previously these flooded the log at DEBUG, making useful output unreadable).
+- **ASR channel capacity** — chunker→ASR `sync_channel` raised from 2 → 4 to
+  absorb bursts without dropping chunks during normal GPU inference latency.
 - **Per-process capture** — `audio/process_loopback.rs` uses Windows Process
   Loopback API to capture a single PID. `list_audio_processes` / `set_capture_process`
   commands. `audio/session_enum.rs` for audio session enumeration.
+  Bug fix: `IsSystemSoundsSession()` in windows-rs returns `Ok(())` for both
+  S_OK and S_FALSE, causing all sessions to be filtered out. Fixed by relying on
+  PID 0 check only.
 - **SubtitleMode redesign** — `zh-ko`/`zh-en` bilingual modes replaced by single-
   target `none`/`zh`/`ko`/`en` (ADR-0007). `SourceHint` added for Whisper language lock.
 - **faster-whisper ASR** — switched from whisper.cpp binary to Python faster-whisper
   sidecar for `no_speech_prob` access and easier model management (ADR-0006).
+  Default model upgraded to `Systran/faster-whisper-large-v3-turbo` (better
+  multilingual accuracy, similar VRAM to medium, same encoder as large-v3).
+- **Two-phase chunker** — partial flush after 1 s (beam=1, fast preview) + final
+  flush on silence/cap (beam=5, accurate). Subtitle appears ~1.5 s from speech
+  start instead of waiting for full sentence silence. Consecutive-repeat filter
+  exempts final chunks that complete a partial utterance (same utterance_id).
+- **Silence-triggered early flush** — video mode flushes on 400 ms of RMS below
+  −46 dBFS, enabling sentence-by-sentence subtitles instead of fixed 4 s batches.
+  Falls back to 4 s cap when background music prevents the threshold.
+- **Korean ASR/translation improvements** — `condition_on_previous_text=True` in
+  faster-whisper; beam_size=5 for final chunks; language-pair-aware translation
+  prompt for Korean source (English loanwords, phonetic names, register matching).
 
 ## M9 — SenseVoice (optional)  ⬜
 

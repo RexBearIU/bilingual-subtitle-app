@@ -57,11 +57,11 @@ pub fn list_audio_processes() -> Result<Vec<AudioProcess>, String> {
                 Err(_) => continue,
             };
 
-            // Skip the System Sounds session (IsSystemSoundsSession returns S_OK).
-            if ctrl2.IsSystemSoundsSession().is_ok() {
-                continue;
-            }
-
+            // PID 0 = System Sounds — skip it.
+            // NOTE: IsSystemSoundsSession() is NOT used here because in windows-rs
+            // both S_OK and S_FALSE resolve to Ok(()), making is_ok() useless for
+            // distinguishing system-sounds vs regular sessions. PID 0 is the
+            // reliable discriminator.
             let pid = match ctrl2.GetProcessId() {
                 Ok(p) if p != 0 => p,
                 _ => continue,

@@ -13,7 +13,7 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `stop_captioning` | — | `Result<()>` | Stops pipeline; sidecars stay resident (models stay loaded) |
 | `set_subtitle_mode` | `{ mode: SubtitleMode }` | `Result<()>` | Hot-swappable while running |
 | `set_source_hint` | `{ hint: SourceHint }` | `Result<()>` | Language hint passed to Whisper per chunk |
-| `set_music_mode` | `{ enabled: bool }` | `Result<()>` | Bypasses VAD; sends fixed 10 s chunks + lyrics prompt |
+| `set_music_mode` | `{ enabled: bool }` | `Result<()>` | Switches chunker to 10 s chunks + "Song lyrics:" prompt + beam_size=3 |
 | `set_click_through` | `{ enabled: bool }` | `Result<()>` | Toggles window mouse pass-through. **Escape hatch:** `Ctrl+Alt+P` hotkey always forces OFF + re-pins on top |
 | `set_always_on_top` | `{ enabled: bool }` | `Result<()>` | Re-asserts topmost; re-stacks above other topmost windows |
 | `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120) |
@@ -88,7 +88,7 @@ interface EngineStatus {
   alwaysOnTop: boolean;
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
   llamaGpuLayers: number;     // 0 = CPU, 36 = full RTX 3070
-  speechThreshold: number;    // VAD RMS threshold linear (0 = adaptive auto-mode)
+  speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
   musicMode: boolean;
   captureTarget?: AudioProcess; // absent/null = system-wide loopback
   rms?: number;               // present only while capturing
@@ -140,7 +140,7 @@ All fields optional — only supplied keys are updated:
 interface SettingsPatch {
   subtitleOpacity?: number;
   llamaGpuLayers?: number;
-  speechThreshold?: number;
+  speechThreshold?: number;   // retained for API compat — no longer used by chunker
   overlay?: { x: number; y: number; w: number; h: number };
 }
 ```

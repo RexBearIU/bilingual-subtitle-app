@@ -13,9 +13,13 @@ Usage:
   python faster_whisper_srv.py [--model MODEL] [--host HOST] [--port PORT]
 
   MODEL  HuggingFace repo id or local path.
-         Default: Systran/faster-whisper-medium  (~1.5 GB, downloads on first run)
-         Other options: Systran/faster-whisper-small (faster, ~500 MB)
-                        Systran/faster-whisper-large-v3 (best quality, ~3 GB)
+         Recommended for Korean / multilingual content:
+           Systran/faster-whisper-large-v3        best quality, ~3 GB VRAM (float16)
+           Systran/faster-whisper-large-v3-turbo  fast + good, ~1.5 GB VRAM  ← recommended
+           Systran/faster-whisper-medium           default, ~1.5 GB VRAM, weaker on Korean
+           Systran/faster-whisper-small            fastest, ~500 MB, lowest quality
+
+         Set via env var:  WHISPER_MODEL=Systran/faster-whisper-large-v3-turbo
 """
 
 import argparse
@@ -88,7 +92,8 @@ async def inference(
             language=lang,
             initial_prompt=initial_prompt or None,
             beam_size=beam_size,
-            vad_filter=False,   # VAD is handled by the Rust pipeline
+            condition_on_previous_text=True,  # use prior segments as context within chunk
+            vad_filter=False,   # silence filtering handled by the Rust pipeline
         )
         segs = list(segments_iter)
         text = "".join(s.text for s in segs)
@@ -119,8 +124,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="faster-whisper HTTP server")
     parser.add_argument(
         "--model", "-m",
-        default="Systran/faster-whisper-medium",
-        help="HuggingFace model id or local path (default: Systran/faster-whisper-medium)",
+        default=os.environ.get("WHISPER_MODEL", "Systran/faster-whisper-large-v3-turbo"),
+        help="HuggingFace model id or local path (env: WHISPER_MODEL)",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9001)

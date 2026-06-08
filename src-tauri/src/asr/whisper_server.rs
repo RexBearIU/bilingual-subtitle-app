@@ -69,6 +69,9 @@ fn asr_loop(
     let mut last_prompt: Option<String> = None;
     // Last valid (non-hallucinated) text, used for consecutive-repetition detection.
     let mut last_valid_text: Option<String> = None;
+    // Track which utterance_id had a partial sent, so the following final chunk
+    // is not incorrectly flagged as a consecutive repeat of the partial's text.
+    let mut last_partial_utterance_id: Option<u64> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -111,16 +114,32 @@ fn asr_loop(
         };
         let effective_prompt = music_prompt.as_deref().or(last_prompt.as_deref());
 
-        // beam_size=3 in music mode for better lyric accuracy.
-        let beam_size = if music_mode { Some(3u32) } else { None };
+        // Partial chunks are throw-away previews — greedy (1) is fast enough.
+        // Final chunks get beam=5 for accuracy; Korean especially benefits from this.
+        // Music mode always uses beam=3 for lyric accuracy.
+        let beam_size = if music_mode {
+            Some(3u32)
+        } else if chunk.is_partial {
+            Some(1u32)
+        } else {
+            Some(5u32)
+        };
 
+        let duration_s = chunk.samples.len() as f64 / SAMPLE_RATE as f64;
+        log::info!(
+            "ASR [u{} {}] {:.2}s → whisper (prompt={})...",
+            chunk.utterance_id,
+            if chunk.is_partial { "partial" } else { "final" },
+            duration_s,
+            effective_prompt.map_or(0, |p| p.len()),
+        );
         let t_infer = std::time::Instant::now();
         match transcribe(&infer_url, &chunk, effective_prompt, lang_hint.as_deref(), beam_size) {
             Ok((text, lang, no_speech_prob)) => {
                 let infer_ms = t_infer.elapsed().as_millis();
                 let text = text.trim().to_string();
                 if text.is_empty() {
-                    log::debug!("ASR chunk {chunk_seq} [u{}]: empty transcription ({infer_ms}ms), skipping", chunk.utterance_id);
+                    log::info!("ASR [u{}]: empty result ({infer_ms}ms) — skipped", chunk.utterance_id);
                     continue;
                 }
 
@@ -129,25 +148,34 @@ fn asr_loop(
                 // in this chunk — silence, music bed, or background noise.
                 if no_speech_prob >= 0.7 {
                     log::info!(
-                        "ASR chunk {} [u{}]: no_speech_prob={no_speech_prob:.2} ≥ 0.7, suppressed ({infer_ms}ms): {text:?}",
-                        chunk_seq, chunk.utterance_id
+                        "ASR [u{}]: no_speech={no_speech_prob:.2} ≥ 0.7, suppressed ({infer_ms}ms): {text:?}",
+                        chunk.utterance_id,
                     );
                     continue;
                 }
 
-                // Secondary filter: keyword blocklist for known hallucination phrases
-                // that slip through even when no_speech_prob is low (e.g. music mode).
-                if is_hallucination(&text, last_valid_text.as_deref()) {
+                // Secondary filter: keyword blocklist + consecutive-repeat detection.
+                // Skip the repeat check for a final chunk that completes a partial of
+                // the same utterance — the partial already set last_valid_text to the
+                // same sentence, so the final would be falsely flagged as a repeat.
+                let is_completing_partial =
+                    !chunk.is_partial && last_partial_utterance_id == Some(chunk.utterance_id);
+                let repeat_baseline = if is_completing_partial {
+                    None // don't compare against the partial's own text
+                } else {
+                    last_valid_text.as_deref()
+                };
+                if is_hallucination(&text, repeat_baseline) {
                     log::info!(
-                        "ASR chunk {} [u{}]: hallucination suppressed ({infer_ms}ms): {text:?}",
-                        chunk_seq, chunk.utterance_id
+                        "ASR [u{}]: hallucination suppressed ({infer_ms}ms): {text:?}",
+                        chunk.utterance_id,
                     );
                     continue;
                 }
 
                 log::info!(
-                    "ASR chunk {} [u{} {}]: infer={infer_ms}ms  lang={lang:?}  text={text:?}",
-                    chunk_seq, chunk.utterance_id,
+                    "ASR [u{} {}]: {infer_ms}ms  no_speech={no_speech_prob:.2}  lang={lang:?}  {text:?}",
+                    chunk.utterance_id,
                     if chunk.is_partial { "partial" } else { "final" },
                 );
 
@@ -166,12 +194,16 @@ fn asr_loop(
                 // 1. Emit source-language subtitle immediately.
                 emit_subtitle(app, subtitle_id, &text, &lang, chunk.started_at_ms, chunk.ended_at_ms);
 
-                // 2. For PARTIAL chunks: skip translation — the text will be superseded
-                //    shortly and translating every 5 s chunk wastes LLM calls.
-                //    For FINAL chunks: enqueue for translation (non-blocking).
+                // 2. For PARTIAL chunks: record utterance id so the following final
+                //    skips the consecutive-repeat check, then skip translation.
                 if chunk.is_partial {
+                    last_partial_utterance_id = Some(chunk.utterance_id);
                     log::debug!("ASR u{subtitle_id}: partial — translation skipped");
                     continue;
+                }
+                // Clear the partial tracker now that the final has arrived.
+                if is_completing_partial {
+                    last_partial_utterance_id = None;
                 }
 
                 let mode = app

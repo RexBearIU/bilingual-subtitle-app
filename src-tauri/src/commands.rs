@@ -190,20 +190,67 @@ fn find_dll_dir() -> Option<std::path::PathBuf> {
 
 // ── sidecar launchers ─────────────────────────────────────────────────────────
 
+/// Kill any process currently listening on `port` (Windows: netstat + taskkill).
+///
+/// Called before spawning a new sidecar to evict zombie processes left behind
+/// when the app was force-killed without running its Drop impls.
+fn kill_port(port: u16) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const NO_WINDOW: u32 = 0x0800_0000;
+
+        let output = match std::process::Command::new("netstat")
+            .args(["-ano"])
+            .creation_flags(NO_WINDOW)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => { log::debug!("kill_port: netstat failed: {e}"); return; }
+        };
+
+        let port_tag = format!(":{port}");
+        let mut found = false;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if !line.contains(&port_tag) || !line.contains("LISTENING") {
+                continue;
+            }
+            if let Some(pid_str) = line.split_whitespace().last() {
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if pid > 1 {
+                        log::info!("kill_port {port}: evicting zombie PID {pid}");
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/PID", &pid.to_string()])
+                            .creation_flags(NO_WINDOW)
+                            .output();
+                        found = true;
+                    }
+                }
+            }
+        }
+        if !found {
+            log::info!("kill_port {port}: port is clear");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = port; // no-op on non-Windows
+}
+
 /// Spawn faster-whisper-server as a child process (Python script).
 ///
 /// Python bin:  env `PYTHON_BIN`              → `python` (system Python).
-/// Script path: env `WHISPER_SERVER_SCRIPT`   → exe-dir/faster_whisper_srv.py → cwd.
-/// Model:       env `WHISPER_MODEL`           → `Systran/faster-whisper-medium`
-///              (HuggingFace repo id; downloaded on first run ~1.5 GB).
-/// Port:        env `WHISPER_ASR_PORT`        → 9001.
+/// Script path: env `WHISPER_SERVER_SCRIPT`      → exe-dir/faster_whisper_srv.py → cwd.
+/// Model:       env `WHISPER_MODEL`              → `Systran/faster-whisper-large-v3-turbo`
+///              (HuggingFace repo id; downloaded on first run ~1.6 GB).
+///              Override to `Systran/faster-whisper-large-v3` for best quality (~3 GB VRAM).
+/// Port:        env `WHISPER_ASR_PORT`           → 9001.
 fn launch_whisper_server() -> Result<std::process::Child, String> {
     let python = std::env::var("PYTHON_BIN")
         .unwrap_or_else(|_| "python".to_string());
     let script = resolve_resource("WHISPER_SERVER_SCRIPT", "faster_whisper_srv.py");
     // Accept a HuggingFace repo id or a local directory. If WHISPER_MODEL still
     // points to a whisper.cpp .bin file (old env var value), ignore it and use
-    // the faster-whisper default so the app works without manual env var cleanup.
+    // the default so the app works without manual env var cleanup.
     let model = {
         let raw = std::env::var("WHISPER_MODEL")
             .unwrap_or_default();
@@ -211,15 +258,18 @@ fn launch_whisper_server() -> Result<std::process::Child, String> {
             if !raw.is_empty() {
                 log::warn!("WHISPER_MODEL={raw:?} looks like a whisper.cpp model file — \
                             faster-whisper needs a HuggingFace repo id or local directory. \
-                            Falling back to Systran/faster-whisper-medium.");
+                            Falling back to Systran/faster-whisper-large-v3-turbo.");
             }
-            "Systran/faster-whisper-medium".to_string()
+            "Systran/faster-whisper-large-v3-turbo".to_string()
         } else {
             raw
         }
     };
     let port = std::env::var("WHISPER_ASR_PORT")
         .unwrap_or_else(|_| "9001".to_string());
+
+    // Evict any zombie from a previous session before binding.
+    kill_port(port.parse().unwrap_or(9001));
 
     log::info!("launching faster-whisper: python={python}  script={script}  model={model}  port={port}");
 
@@ -264,6 +314,9 @@ fn launch_llama_server(ngl_override: u32) -> Result<std::process::Child, String>
     let port = std::env::var("LLAMA_PORT")
         .unwrap_or_else(|_| "9002".to_string());
     let ngl = ngl_override.to_string();
+
+    // Evict any zombie from a previous session before binding.
+    kill_port(port.parse().unwrap_or(9002));
 
     log::info!("launching llama-server: bin={bin}  model={model}  port={port}  ngl={ngl}");
 

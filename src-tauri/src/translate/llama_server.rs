@@ -120,6 +120,25 @@ fn translate_loop(
     log::info!("translate worker exited");
 }
 
+fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
+    let base = format!(
+        "You are a real-time subtitle translator. \
+         Output ONLY the {target_name} translation — no explanations, no additions. \
+         Keep the natural spoken tone. Translate incomplete sentences as-is."
+    );
+
+    if source_lang == "ko" {
+        format!(
+            "{base} \
+             For Korean: keep English loanwords in English, \
+             transliterate proper names phonetically, \
+             match the speaker's formal or casual register."
+        )
+    } else {
+        base
+    }
+}
+
 /// Call llama-server and return the translation in the target language.
 fn call_translate(
     url: &str,
@@ -135,11 +154,7 @@ fn call_translate(
     };
     let target_name = mode.target_name();
 
-    let system = format!(
-        "You are a real-time subtitle translator. \
-         Output ONLY the {target_name} translation — no explanations, no additions. \
-         Keep the natural spoken tone. Translate incomplete sentences as-is."
-    );
+    let system = build_system_prompt(source_lang, target_name);
 
     // /no_think disables Qwen3's chain-of-thought so the first token is the answer.
     let user = format!("/no_think [{source_name}→{target_name}] {text}");
@@ -179,7 +194,7 @@ fn call_translate(
         );
         Err(format!("empty translation for: {text}"))
     } else {
-        log::debug!("TL raw={raw:?}  stripped={content:?}");
+        log::info!("TL raw={raw:?}  stripped={content:?}");
         Ok(content)
     }
 }

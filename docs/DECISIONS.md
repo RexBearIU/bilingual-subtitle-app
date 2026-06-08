@@ -165,3 +165,32 @@ Requires Windows 10 Build 20348 / Windows 11.
 vs process loopback. Change takes effect on next `start_captioning` (no hot-swap
 while running). COM must be initialised as MTA on a fresh thread for `list_audio_processes`
 (Tauri's WebView2 STA thread is incompatible).
+
+---
+
+## ADR-0009 — Replace RMS VAD with fixed-chunk accumulator
+
+**Date:** 2026-06-08 · **Status:** Accepted · **Supersedes:** M3 VAD design
+
+**Context.** The original `pipeline/vad.rs` used an adaptive RMS threshold with
+exponential noise-floor EMA and onset/silence state machine. This worked for
+microphone input but proved unreliable for the primary use case — video and live
+stream loopback — for two reasons:
+1. Background music keeps the RMS continuously above any sensible speech threshold,
+   so either speech is missed (threshold too high) or silence chunks flood ASR
+   (threshold too low). No single threshold works across content types.
+2. Whisper already provides `no_speech_prob` per segment, which is a superior
+   silence discriminator trained on diverse audio — no RMS tuning required.
+
+**Decision.** Delete `pipeline/vad.rs` (and `audio/ring_buffer.rs` which only it
+used). Replace with `pipeline/chunker.rs`: a simple fixed-chunk accumulator that
+emits 4 s chunks (64 000 samples @ 16 kHz) unconditionally. Music mode still uses
+10 s chunks. Silence detection is fully delegated to Whisper's `no_speech_prob ≥ 0.7`
+filter in the ASR worker.
+
+**Consequence.** The pipeline thread structure is unchanged — a chunker worker is
+still needed to buffer the 200 ms capture events into ASR-sized chunks without
+blocking the capture thread. `speech_threshold` is retained in settings/state/IPC
+for API compatibility but is no longer read by the chunker. Whisper may process a
+slightly higher volume of chunks (a silent 4 s chunk every 4 s instead of nothing)
+but `no_speech_prob` drops them cheaply before any translation is attempted.
