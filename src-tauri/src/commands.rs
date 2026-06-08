@@ -165,6 +165,29 @@ fn resolve_resource(env_var: &str, name: &str) -> String {
     name.to_string()
 }
 
+/// Find the directory that contains the sidecar DLLs (e.g. cublas64_12.dll).
+///
+/// - Release: DLLs are bundled alongside the exe, so exe_dir() is it.
+/// - Dev:     LLAMA_SERVER_BIN points to binaries/llama-server.exe;
+///            its parent directory is the binaries/ folder with all DLLs.
+fn find_dll_dir() -> Option<std::path::PathBuf> {
+    // Release mode: DLLs are in the same directory as the app exe.
+    if let Some(dir) = exe_dir() {
+        if dir.join("cublas64_12.dll").exists() {
+            return Some(dir);
+        }
+    }
+    // Dev mode: derive from LLAMA_SERVER_BIN env var.
+    if let Ok(llama_bin) = std::env::var("LLAMA_SERVER_BIN") {
+        if let Some(parent) = std::path::Path::new(&llama_bin).parent() {
+            if parent.join("cublas64_12.dll").exists() {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 // ── sidecar launchers ─────────────────────────────────────────────────────────
 
 /// Spawn faster-whisper-server as a child process (Python script).
@@ -207,6 +230,16 @@ fn launch_whisper_server() -> Result<std::process::Child, String> {
         "--host", "127.0.0.1",
         "--port", &port,
     ]);
+
+    // Prepend the DLL directory to PATH so ctranslate2 finds cublas64_12.dll.
+    // The Python script no longer needs to search for it.
+    if let Some(dll_dir) = find_dll_dir() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{};{}", dll_dir.display(), path));
+        log::info!("faster-whisper: DLL dir → {}", dll_dir.display());
+    } else {
+        log::warn!("faster-whisper: cublas64_12.dll not found — GPU inference may fail");
+    }
 
     // Suppress the console window that would flash up on Windows.
     #[cfg(target_os = "windows")]

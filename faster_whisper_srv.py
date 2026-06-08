@@ -24,39 +24,18 @@ import sys
 import tempfile
 
 # ── DLL search path (Windows) ────────────────────────────────────────────────
-# MUST happen before importing ctranslate2/faster_whisper so the loader can
-# find cublas64_12.dll and other CUDA libraries that ship in binaries/.
-#
-# The script may run from different locations depending on mode:
-#   - dev:     <project>/src-tauri/target/debug/  (Tauri copies it there)
-#   - release: <install_dir>/  (installed alongside the exe)
-#   - direct:  <project>/  (python faster_whisper_srv.py)
-#
-# Strategy: walk up from __file__ until we find a directory that contains
-# "binaries/" with the CUDA DLLs inside, or the exe dir itself (release).
+# The Rust launcher prepends the sidecar DLL directory to PATH before spawning
+# this process, so ctranslate2 can find cublas64_12.dll and friends.
+# We just need to call os.add_dll_directory() for each PATH entry that contains
+# the DLLs (os.add_dll_directory is needed for delay-loaded DLLs on Python 3.8+).
 if sys.platform == "win32":
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _dll_added = False
-    _search = _here
-    for _ in range(8):
-        for _subdir in ["binaries", "."]:
-            _candidate = os.path.join(_search, _subdir) if _subdir != "." else _search
-            if os.path.isdir(_candidate) and os.path.exists(
-                os.path.join(_candidate, "cublas64_12.dll")
-            ):
-                os.add_dll_directory(_candidate)
-                os.environ["PATH"] = _candidate + os.pathsep + os.environ.get("PATH", "")
-                print(f"[faster-whisper] DLL path: {_candidate}", flush=True)
-                _dll_added = True
-                break
-        if _dll_added:
+    for _p in os.environ.get("PATH", "").split(os.pathsep):
+        if _p and os.path.exists(os.path.join(_p, "cublas64_12.dll")):
+            os.add_dll_directory(_p)
+            print(f"[faster-whisper] DLL path: {_p}", flush=True)
             break
-        _parent = os.path.dirname(_search)
-        if _parent == _search:
-            break  # filesystem root
-        _search = _parent
-    if not _dll_added:
-        print("[faster-whisper] WARN: cublas64_12.dll not found — GPU may not work", flush=True)
+    else:
+        print("[faster-whisper] WARN: cublas64_12.dll not found in PATH — GPU may not work", flush=True)
 
 # ── dependency check ────────────────────────────────────────────────────────
 try:
