@@ -92,65 +92,69 @@ cargo tauri dev          # run the overlay in dev mode
 
 Models and binaries are git-ignored (`/binaries/`, `/models/`).
 
-### faster-whisper (ASR — Python sidecar)
+### ASR — Python sidecar (`asr_srv.py`)
 
-The ASR backend is `faster_whisper_srv.py` — a Python HTTP server wrapping the
-`faster-whisper` library.  On first run it downloads the model automatically
-from HuggingFace (~1.5 GB for medium).
+The ASR backend is `asr_srv.py` — a Python HTTP server that supports two backends:
+
+| Backend | Engine | Korean accuracy | GPU |
+|---------|--------|-----------------|-----|
+| `whisper` (default) | faster-whisper (CTranslate2) | moderate | yes, via CUDA |
+| `sensevoice` | SenseVoice ONNX (sherpa-onnx) | excellent | CPU only (fast enough) |
 
 **Step 1 — Install Python 3.10+ and dependencies:**
 
 ```powershell
-# Verify Python is available
 python --version   # expect 3.10+
 
-# Install required packages (once)
+# whisper backend
 pip install faster-whisper fastapi uvicorn ctranslate2
+
+# sensevoice backend (additional)
+pip install sherpa-onnx
 ```
 
 **Step 2 — Set env vars** (user-level, persists across terminals):
 
-| Env var | Default in code | Description |
-|---------|-----------------|-------------|
-| `PYTHON_BIN` | `python` | Python interpreter to use |
-| `WHISPER_SERVER_SCRIPT` | `faster_whisper_srv.py` | Path to the server script |
-| `WHISPER_MODEL` | `Systran/faster-whisper-medium` | HuggingFace repo ID **or** local path |
-| `WHISPER_ASR_PORT` | `9001` | HTTP port |
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `PYTHON_BIN` | `python` | Python interpreter |
+| `ASR_BACKEND` | `whisper` | `whisper` or `sensevoice` |
+| `ASR_SERVER_SCRIPT` | `asr_srv.py` | Path to the server script |
+| `WHISPER_MODEL` | `Systran/faster-whisper-large-v3-turbo` | HuggingFace repo ID (whisper backend) |
+| `SENSEVOICE_MODEL` | `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | HuggingFace repo ID (sensevoice backend) |
+| `ASR_PORT` | `9001` | HTTP port |
 
 ```powershell
 $proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-[System.Environment]::SetEnvironmentVariable("WHISPER_SERVER_SCRIPT", "$proj\faster_whisper_srv.py", "User")
-[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL",         "Systran/faster-whisper-medium", "User")
-[System.Environment]::SetEnvironmentVariable("WHISPER_ASR_PORT",      "9001",                          "User")
-# PYTHON_BIN defaults to "python" — only set if you use a venv:
-# [System.Environment]::SetEnvironmentVariable("PYTHON_BIN", "C:\path\to\venv\Scripts\python.exe", "User")
+
+# To use whisper backend (default):
+[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL", "Systran/faster-whisper-large-v3-turbo", "User")
+
+# To switch to SenseVoice (better Korean):
+[System.Environment]::SetEnvironmentVariable("ASR_BACKEND", "sensevoice", "User")
 ```
 
 **Smoke-test:**
 
 ```powershell
 $proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-python "$proj\faster_whisper_srv.py" --model Systran/faster-whisper-medium --port 9001
-# First run downloads ~1.5 GB — wait for "Uvicorn running on http://127.0.0.1:9001"
+python "$proj\asr_srv.py" --backend whisper --port 9001
+# First run downloads the model — wait for "Ready on http://127.0.0.1:9001"
 # In another terminal:
 Invoke-WebRequest http://127.0.0.1:9001/   # should return 200
 ```
 
-**Alternative models:**
+**Whisper model options:**
 
 | Model | Size | Notes |
 |-------|------|-------|
-| `Systran/faster-whisper-small` | ~500 MB | Faster, lower accuracy |
-| `Systran/faster-whisper-medium` | ~1.5 GB | **Default** — good balance |
+| `Systran/faster-whisper-small` | ~500 MB | Fastest, lower accuracy |
+| `Systran/faster-whisper-large-v3-turbo` | ~1.5 GB | **Default** — good balance |
 | `Systran/faster-whisper-large-v3` | ~3 GB | Best quality |
 
-To use a local path instead of a HuggingFace ID, set `WHISPER_MODEL` to the
-directory containing the model files.
-
-**GPU acceleration:** faster-whisper uses CTranslate2. On Windows with an NVIDIA
-GPU, `pip install ctranslate2` picks up CUDA automatically.  The `binaries/`
-directory is added to the DLL search path by the script so the cublas DLLs that
-ship with llama-server's Vulkan build are also found.
+**GPU acceleration:** faster-whisper uses CTranslate2 with CUDA automatically when
+an NVIDIA GPU is present.  SenseVoice runs on CPU (INT8 ONNX) and is already ~70x
+faster than real-time, so GPU is not needed for that backend.
 
 ### llama-server (translation, M5)
 

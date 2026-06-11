@@ -4,17 +4,19 @@
 //!
 //! Two-phase emission per utterance:
 //!
-//! 1. **Partial flush** — after PARTIAL_FLUSH_SAMPLES (1 s) a partial chunk is
-//!    sent immediately (`is_partial = true`).  ASR starts working while the speaker
-//!    is still talking → partial subtitle appears ~1.5 s from speech start.
+//! 1. **Rolling partial flush** — after 1 s a COPY of the buffer is sent
+//!    (`is_partial = true`), then an updated copy every further 1.5 s while
+//!    the utterance continues.  The on-screen text keeps refreshing during
+//!    long utterances.  The buffer is NOT drained so the final always has the
+//!    full audio.
 //!
-//! 2. **Final flush** — triggered by silence (≥ SILENCE_FRAMES × 200 ms below
-//!    SILENCE_RMS) or the 4 s cap.  Sends the remaining samples with the same
-//!    utterance_id (`is_partial = false`) so the frontend replaces the partial
-//!    in-place with the final transcription + translation.
-//!
-//! If there is no silence and the cap is reached, the whole 4 s goes as a single
-//! non-partial chunk (no separate partial).
+//! 2. **Final flush** — triggered by a graduated silence rule (the more audio
+//!    buffered, the shorter the pause needed: 800 ms under 1.5 s of audio,
+//!    down to 200 ms past 2.5 s) or the 6 s hard cap (only reached when
+//!    speech never pauses — fast talkers benefit from the longer Whisper
+//!    context).  Sends the **complete utterance audio** with the same
+//!    utterance_id (`is_partial = false`) so the frontend replaces the
+//!    partial in-place with the final transcription + translation.
 //!
 //! ## Music mode
 //! Fixed 10 s chunks; no partial or silence detection.
@@ -25,11 +27,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::asr::AudioChunk;
+use crate::audio::meter::rms;
 
 const SAMPLE_RATE: usize = 16_000;
 
-/// Maximum chunk for video / stream capture.
-const CHUNK_SAMPLES: usize = 64_000; // 4 s
+/// Hard cap for video / stream capture.  Only reached when speech never
+/// pauses (fast talkers, no gaps) — more context per chunk is exactly what
+/// Whisper needs there, and the rolling partials below keep the on-screen
+/// latency low while the buffer grows.
+const CHUNK_SAMPLES: usize = 96_000; // 6 s
 
 /// Music mode chunk size — longer window for full lyric lines.
 const MUSIC_CHUNK_SAMPLES: usize = 160_000; // 10 s
@@ -37,15 +43,32 @@ const MUSIC_CHUNK_SAMPLES: usize = 160_000; // 10 s
 /// Minimum samples for the stop-flush (avoid sending a near-empty WAV).
 const MIN_FLUSH_SAMPLES: usize = SAMPLE_RATE / 2; // 0.5 s
 
-/// Send a partial chunk after this many samples to start ASR early (video mode).
+/// Send the first partial chunk after this many samples (video mode).
 const PARTIAL_FLUSH_SAMPLES: usize = SAMPLE_RATE; // 1 s
+
+/// Re-send an updated partial every additional 1.5 s while the utterance keeps
+/// going, so long utterances show live text instead of a stale 1 s preview.
+const PARTIAL_REFRESH_SAMPLES: usize = SAMPLE_RATE * 3 / 2; // 1.5 s
 
 /// RMS below this is considered silence (≈ −46 dBFS).
 /// Conservative — only catches genuine quiet moments, not music dips.
 const SILENCE_RMS: f32 = 0.005;
 
-/// Consecutive ~200 ms blocks below SILENCE_RMS before a final flush.
-const SILENCE_FRAMES: usize = 2; // ≈ 400 ms
+/// Graduated silence flush: how many consecutive ~200 ms silent blocks are
+/// required to end an utterance, given how much audio is already buffered.
+///
+/// Short buffer → demand a long pause, so a breath after 0.8 s doesn't produce
+/// a useless fragment ("아.").  Long buffer → cut at the first real dip, so
+/// utterances reach a natural boundary instead of the 4 s hard cap.
+fn required_silence_frames(buf_len: usize) -> usize {
+    if buf_len < SAMPLE_RATE * 3 / 2 {
+        4 // < 1.5 s of audio: need ≈ 800 ms of silence
+    } else if buf_len < SAMPLE_RATE * 5 / 2 {
+        2 // 1.5 – 2.5 s: ≈ 400 ms
+    } else {
+        1 // ≥ 2.5 s: the first ≈ 200 ms dip is a good enough boundary
+    }
+}
 
 pub fn start_vad_worker(
     rx: Receiver<Vec<f32>>,
@@ -55,10 +78,9 @@ pub fn start_vad_worker(
     music_mode: Arc<AtomicBool>,
 ) {
     log::info!(
-        "chunker: video={}s max / {}s partial / {}ms silence-flush  music={}s",
+        "chunker: video={}s max / {}s partial / graduated silence-flush (800→200ms)  music={}s",
         CHUNK_SAMPLES / SAMPLE_RATE,
         PARTIAL_FLUSH_SAMPLES / SAMPLE_RATE,
-        SILENCE_FRAMES * 200,
         MUSIC_CHUNK_SAMPLES / SAMPLE_RATE,
     );
 
@@ -68,11 +90,33 @@ pub fn start_vad_worker(
         .expect("spawn vad-worker thread");
 }
 
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
+/// Pick a cut point for a max-cap flush: the centre of the quietest 50 ms
+/// window within the last 1.5 s before `target`.  A hard cut at exactly
+/// `target` regularly lands mid-syllable ("아름답" → "아름" + "답"), which both
+/// garbles ASR output at the boundary and feeds the next chunk a word tail it
+/// can't make sense of.  Cutting at the local energy minimum lands between
+/// words/breaths most of the time.  The remainder stays in the buffer and
+/// opens the next utterance.
+fn quietest_cut(buf: &[f32], target: usize) -> usize {
+    const WIN: usize = SAMPLE_RATE / 20;          // 50 ms
+    const LOOKBACK: usize = SAMPLE_RATE * 3 / 2;  // search the last 1.5 s
+    let hi = buf.len().min(target);
+    let lo = hi.saturating_sub(LOOKBACK);
+    if hi - lo < WIN * 2 {
+        return hi;
     }
-    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    let mut best_start = hi - WIN;
+    let mut best_rms = f32::INFINITY;
+    let mut start = lo;
+    while start + WIN <= hi {
+        let r = rms(&buf[start..start + WIN]);
+        if r < best_rms {
+            best_rms = r;
+            best_start = start;
+        }
+        start += WIN;
+    }
+    best_start + WIN / 2
 }
 
 fn send_chunk(
@@ -95,18 +139,27 @@ fn send_chunk(
         ended_at_ms as f64 / 1000.0,
         if tag.is_empty() { String::new() } else { format!("  [{tag}]") },
     );
-    match asr_tx.try_send(AudioChunk {
+    let chunk = AudioChunk {
         samples,
         started_at_ms,
         ended_at_ms,
         utterance_id,
         is_partial,
-    }) {
-        Ok(_) => {}
-        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-            log::warn!("ASR channel full — dropping chunk [{}]", seq);
+    };
+    if is_partial {
+        // Partials are disposable previews — drop rather than block.
+        match asr_tx.try_send(chunk) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                log::debug!("ASR channel full — dropping partial [{}]", seq);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
         }
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+    } else {
+        // Finals carry the actual subtitle — block briefly rather than lose
+        // a whole utterance.  The ASR worker coalesces its backlog, so this
+        // only stalls when inference is genuinely saturated.
+        let _ = asr_tx.send(chunk);
     }
 }
 
@@ -126,6 +179,8 @@ fn chunk_loop(
 
     // Video mode state
     let mut partial_sent: bool = false;
+    // Buffer length at which the next (rolling) partial fires.
+    let mut next_partial: usize = PARTIAL_FLUSH_SAMPLES;
     let mut silence_count: usize = 0;
     let mut has_speech: bool = false;
 
@@ -181,35 +236,55 @@ fn chunk_loop(
 
         let target = if is_music { MUSIC_CHUNK_SAMPLES } else { CHUNK_SAMPLES };
 
-        // ── Partial flush (video mode, 1 s, once per utterance) ──────────────
-        if !is_music && !partial_sent && buf.len() >= PARTIAL_FLUSH_SAMPLES {
-            utterance_id += 1;
-            utterance_started_ms = chunk_started_ms;
-            let partial: Vec<f32> = buf.drain(..PARTIAL_FLUSH_SAMPLES).collect();
-            let partial_end_ms = now_ms;
+        // ── Rolling partial flush (video mode, 1 s then every 1.5 s) ─────────
+        // Gated on has_speech: don't burn an ASR call previewing pure silence.
+        // Clone, do NOT drain — the final must see the complete utterance audio
+        // from the beginning so ASR doesn't start mid-sentence.
+        if !is_music && has_speech && buf.len() >= next_partial {
+            if !partial_sent {
+                utterance_id += 1;
+                utterance_started_ms = chunk_started_ms;
+                partial_sent = true;
+            }
             seq += 1;
             send_chunk(
                 &asr_tx,
-                partial,
+                buf.clone(),
                 utterance_id,
                 utterance_started_ms,
-                partial_end_ms,
+                now_ms,
                 true,
                 seq,
                 "",
             );
-            partial_sent = true;
-            chunk_started_ms = partial_end_ms;
+            next_partial = buf.len() + PARTIAL_REFRESH_SAMPLES;
+            // Don't update chunk_started_ms — the final starts from the same point.
         }
 
         // ── Final flush (silence or max) ──────────────────────────────────────
         let silence_flush = !is_music
             && has_speech
-            && silence_count >= SILENCE_FRAMES
+            && silence_count >= required_silence_frames(buf.len())
             && buf.len() >= MIN_FLUSH_SAMPLES;
 
+        // Buffer hit the cap without any speech in it — pure silence/noise.
+        // Discard instead of sending 4 s of nothing through ASR.
+        if buf.len() >= target && !is_music && !has_speech {
+            buf.clear();
+            chunk_started_ms = now_ms;
+            silence_count = 0;
+            continue;
+        }
+
         if buf.len() >= target || silence_flush {
-            let drain = buf.len().min(target);
+            // Silence flush: the utterance ended naturally, take everything.
+            // Max-cap flush: cut at the quietest spot near the cap so we don't
+            // split a word in half; the remainder seeds the next utterance.
+            let drain = if silence_flush {
+                buf.len().min(target)
+            } else {
+                quietest_cut(&buf, target)
+            };
             let samples: Vec<f32> = buf.drain(..drain).collect();
             let ended_ms = session_start.elapsed().as_millis() as u64;
             seq += 1;
@@ -240,6 +315,7 @@ fn chunk_loop(
 
             chunk_started_ms = ended_ms;
             partial_sent = false;
+            next_partial = PARTIAL_FLUSH_SAMPLES;
             silence_count = 0;
             has_speech = false;
         }

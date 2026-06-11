@@ -11,10 +11,11 @@
     const out: { lang: Lang; text: string; primary: boolean }[] = [];
     const subs = update.subtitles;
     const src = update.sourceLang as Lang;
-    if (subs[src]) out.push({ lang: src, text: subs[src]!, primary: true });
+    // Translation first (white, prominent), source below (gray, small).
     for (const l of LANG_ORDER) {
       if (l !== src && subs[l]) out.push({ lang: l, text: subs[l]!, primary: false });
     }
+    if (subs[src]) out.push({ lang: src, text: subs[src]!, primary: true });
     return out;
   }
 </script>
@@ -84,14 +85,14 @@
   }
 
   .primary {
-    color: #ffffff;
-    font-weight: 600;
-  }
-
-  .secondary {
     color: #b8c4d0;
     font-size: 0.82em;
     font-weight: 500;
+  }
+
+  .secondary {
+    color: #ffffff;
+    font-weight: 600;
   }
 
   .placeholder {

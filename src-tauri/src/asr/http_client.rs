@@ -1,30 +1,29 @@
-//! whisper-server HTTP client (ADR-0001).
+//! ASR server HTTP client.
 //!
 //! Receives `AudioChunk`s from the VAD pipeline, encodes them as 16-bit PCM
-//! WAV, POSTs them to whisper-server's `/inference` endpoint, and emits
+//! WAV, POSTs them to the ASR server's `/inference` endpoint, and emits
 //! `subtitle_update` events with the resulting transcription.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::asr::AudioChunk;
-use crate::state::AppState;
+use crate::state;
 use crate::translate::TranslationRequest;
-use crate::types::{EngineStatus, SubtitleTexts, SubtitleUpdate};
+use crate::types::{SubtitleTexts, SubtitleUpdate};
 
 const SAMPLE_RATE: u32 = 16_000;
 /// Multipart boundary (arbitrary fixed string).
-const BOUNDARY: &str = "----WhisperBoundary8f3a2e1d";
+const BOUNDARY: &str = "----AsrBoundary8f3a2e1d";
 
 // ── public API ──────────────────────────────────────────────────────────────
 
 /// Spawn the ASR worker thread (detached).
 /// Exits when `stop` is set or the sender side of `rx` is dropped.
-/// `lang_hint` is an optional ISO-639-1 code to pass to whisper per request
-/// (e.g. `Some("ko")` for Korean-only streams for better accuracy).
+/// `lang_hint` is an optional ISO-639-1 code passed to the ASR server per request.
 /// `None` = auto-detect (multilingual).
 pub fn start_asr_worker(
     rx: std::sync::mpsc::Receiver<AudioChunk>,
@@ -49,16 +48,16 @@ fn asr_loop(
     translate_tx: SyncSender<TranslationRequest>,
 ) {
     let base = format!("http://127.0.0.1:{port}");
-    log::info!("ASR: waiting for whisper-server at {base}");
+    log::info!("ASR: waiting for asr-srv at {base}");
     set_asr_status(app, "loading");
 
-    // Longer timeout: first run of faster-whisper downloads ~1.5 GB model.
-    if !wait_for_server(&base, 300) {
-        log::error!("ASR: whisper-server did not respond within 5 min — check binary/model path");
+    // Longer timeout: first run downloads the model from HuggingFace.
+    if !crate::util::wait_for_http_ok(&format!("{base}/"), 300) {
+        log::error!("ASR: asr-srv did not respond within 5 min — check Python path and model");
         set_asr_status(app, "error");
         return;
     }
-    log::info!("ASR: whisper-server ready");
+    log::info!("ASR: asr-srv ready");
     set_asr_status(app, "ready");
 
     let infer_url = format!("{base}/inference");
@@ -69,18 +68,52 @@ fn asr_loop(
     let mut last_prompt: Option<String> = None;
     // Last valid (non-hallucinated) text, used for consecutive-repetition detection.
     let mut last_valid_text: Option<String> = None;
+    // How many consecutive chunks produced exactly the same text.
+    let mut repeat_count: u32 = 0;
     // Track which utterance_id had a partial sent, so the following final chunk
     // is not incorrectly flagged as a consecutive repeat of the partial's text.
     let mut last_partial_utterance_id: Option<u64> = None;
+
+    // Backlog of chunks pulled off the channel but not yet transcribed.
+    let mut pending: std::collections::VecDeque<AudioChunk> = std::collections::VecDeque::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let chunk = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(c) => c,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        if pending.is_empty() {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(c) => pending.push_back(c),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        // Drain whatever else is already queued, then coalesce: a partial is a
+        // throw-away preview, so any partial with a newer chunk behind it is
+        // stale — skip it instead of burning an inference on it.  Finals are
+        // always kept.
+        while let Ok(c) = rx.try_recv() {
+            pending.push_back(c);
+        }
+        if pending.len() > 1 {
+            let last_idx = pending.len() - 1;
+            let before = pending.len();
+            let mut kept: std::collections::VecDeque<AudioChunk> =
+                std::collections::VecDeque::with_capacity(pending.len());
+            for (i, c) in pending.drain(..).enumerate() {
+                if c.is_partial && i < last_idx {
+                    continue;
+                }
+                kept.push_back(c);
+            }
+            pending = kept;
+            if pending.len() < before {
+                log::debug!("ASR: skipped {} stale partial(s) in backlog", before - pending.len());
+            }
+        }
+        let chunk = match pending.pop_front() {
+            Some(c) => c,
+            None => continue,
         };
 
         chunk_seq += 1;
@@ -94,13 +127,11 @@ fn asr_loop(
         );
 
         // Read live settings (source hint + music mode) for this chunk.
-        let (lang_hint, music_mode) = app
-            .try_state::<std::sync::Mutex<crate::state::AppState>>()
-            .and_then(|st| st.lock().ok().map(|s| (
-                s.source_hint.lang_code().map(str::to_string),
-                s.music_mode,
-            )))
-            .unwrap_or((None, false));
+        let (lang_hint, music_mode) = state::read_state(app, |s| (
+            s.source_hint.lang_code().map(str::to_string),
+            s.music_mode,
+        ))
+        .unwrap_or((None, false));
 
         // In music mode, prepend "Song lyrics:" so Whisper knows the context.
         let music_prompt = if music_mode {
@@ -127,7 +158,7 @@ fn asr_loop(
 
         let duration_s = chunk.samples.len() as f64 / SAMPLE_RATE as f64;
         log::info!(
-            "ASR [u{} {}] {:.2}s → whisper (prompt={})...",
+            "ASR [u{} {}] {:.2}s → asr-srv (prompt={})...",
             chunk.utterance_id,
             if chunk.is_partial { "partial" } else { "final" },
             duration_s,
@@ -154,21 +185,32 @@ fn asr_loop(
                     continue;
                 }
 
-                // Secondary filter: keyword blocklist + consecutive-repeat detection.
-                // Skip the repeat check for a final chunk that completes a partial of
-                // the same utterance — the partial already set last_valid_text to the
-                // same sentence, so the final would be falsely flagged as a repeat.
-                let is_completing_partial =
-                    !chunk.is_partial && last_partial_utterance_id == Some(chunk.utterance_id);
-                let repeat_baseline = if is_completing_partial {
-                    None // don't compare against the partial's own text
-                } else {
-                    last_valid_text.as_deref()
-                };
-                if is_hallucination(&text, repeat_baseline) {
+                // Secondary filter: keyword blocklist.
+                if is_hallucination(&text) {
                     log::info!(
                         "ASR [u{}]: hallucination suppressed ({infer_ms}ms): {text:?}",
                         chunk.utterance_id,
+                    );
+                    continue;
+                }
+
+                // Consecutive-repeat detection (initial_prompt feedback loop).
+                // ONE exact repeat is allowed — quick echoed replies between
+                // speakers ("네." / "네.") are real speech.  A second consecutive
+                // repeat is a feedback loop and gets suppressed.
+                // Skip the check for a final chunk that completes a partial of
+                // the same utterance — the partial already set last_valid_text
+                // to the same sentence.
+                let is_completing_partial =
+                    !chunk.is_partial && last_partial_utterance_id == Some(chunk.utterance_id);
+                let is_repeat = !is_completing_partial
+                    && text.chars().count() < 60
+                    && last_valid_text.as_deref().is_some_and(|prev| prev.trim() == text);
+                repeat_count = if is_repeat { repeat_count + 1 } else { 0 };
+                if repeat_count >= 2 {
+                    log::info!(
+                        "ASR [u{}]: repeated {}× consecutively — suppressed ({infer_ms}ms): {text:?}",
+                        chunk.utterance_id, repeat_count + 1,
                     );
                     continue;
                 }
@@ -180,8 +222,14 @@ fn asr_loop(
                 );
 
                 // Update rolling prompt and valid-text tracker.
+                // Truncate on a char boundary — a raw byte slice panics when
+                // it lands inside a multi-byte char (Korean is 3 bytes/char).
                 last_prompt = Some(if text.len() > 200 {
-                    text[text.len() - 200..].to_string()
+                    let mut start = text.len() - 200;
+                    while !text.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    text[start..].to_string()
                 } else {
                     text.clone()
                 });
@@ -206,10 +254,7 @@ fn asr_loop(
                     last_partial_utterance_id = None;
                 }
 
-                let mode = app
-                    .try_state::<std::sync::Mutex<AppState>>()
-                    .and_then(|st| st.lock().ok().map(|s| s.mode))
-                    .unwrap_or_default();
+                let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
 
                 let req = TranslationRequest {
                     id: format!("asr_{subtitle_id}"),
@@ -237,26 +282,12 @@ fn asr_loop(
     log::info!("ASR worker exited");
 }
 
-/// Poll `GET /` until the server responds 200 or the timeout expires.
-fn wait_for_server(base: &str, timeout_secs: u64) -> bool {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let url = format!("{base}/");
-    while std::time::Instant::now() < deadline {
-        if ureq::get(&url).call().is_ok() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    false
-}
-
-/// Send a chunk to whisper-server and return `(text, lang, no_speech_prob)`.
+/// Send a chunk to asr-srv and return `(text, lang, no_speech_prob)`.
 ///
 /// `no_speech_prob` is the mean probability across all returned segments that
 /// the audio contains no real speech.  Values ≥ 0.7 typically indicate silence,
 /// noise, or music without lyrics — the caller should discard such results.
-/// Returns 0.0 when the field is absent (old whisper.cpp server builds).
+/// Returns 0.0 when the field is absent.
 fn transcribe(
     url: &str,
     chunk: &AudioChunk,
@@ -289,6 +320,19 @@ fn transcribe(
         .unwrap_or("en")
         .to_lowercase();
     let lang = normalize_lang(&lang_raw);
+
+    // Whisper's per-chunk language detection is unreliable on short audio —
+    // it regularly claims "en" while emitting Hangul text.  The downstream
+    // translation prompt then says [English→…] with Korean input, which
+    // confuses the LLM.  The text's actual script is ground truth: override
+    // the claimed language whenever they clearly disagree.
+    let lang = match detect_script_lang(&text) {
+        Some(script_lang) if script_lang != lang => {
+            log::debug!("ASR lang: whisper said {lang:?} but text script is {script_lang:?} — overriding");
+            script_lang.to_string()
+        }
+        _ => lang,
+    };
 
     // Log at debug level; unknown codes are warned inside normalize_lang.
     log::debug!("ASR lang: whisper={lang_raw:?} → {lang:?}");
@@ -376,9 +420,9 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
 ///
 /// Whisper is trained on YouTube data and hallucinates common closing phrases
 /// (subscribe, credits, etc.) when the audio has no clear speech — especially
-/// during music or silence.  We also suppress consecutive-duplicate outputs
-/// which indicate a feedback loop via `initial_prompt`.
-fn is_hallucination(text: &str, last_valid: Option<&str>) -> bool {
+/// during music or silence.  Consecutive-repeat detection lives in the caller
+/// (it needs cross-chunk state).
+fn is_hallucination(text: &str) -> bool {
     let t = text.trim();
 
     // 1. Pure bracket-enclosed event tags: "[Music]", "[BLANK_AUDIO]", "[訂閱 / 感謝]", …
@@ -411,19 +455,46 @@ fn is_hallucination(text: &str, last_valid: Option<&str>) -> bool {
         "[박수]",   // Korean [Applause]
     ];
     let lower = t.to_lowercase();
-    if DENY.iter().any(|&h| lower.contains(h)) {
-        return true;
-    }
+    DENY.iter().any(|&h| lower.contains(h))
+}
 
-    // 3. Consecutive exact repetition → feedback loop via initial_prompt.
-    //    Only trigger for shorter texts to avoid suppressing real repeated speech.
-    if let Some(prev) = last_valid {
-        if prev.trim() == t && t.chars().count() < 60 {
-            return true;
+/// Detect the dominant script of `text` and map it to a language code.
+/// Returns `None` when no script reaches a clear majority (mixed/ambiguous
+/// text keeps whisper's own detection).
+fn detect_script_lang(text: &str) -> Option<&'static str> {
+    let mut hangul = 0usize;
+    let mut cjk = 0usize;    // Han ideographs (zh; also ja kanji)
+    let mut kana = 0usize;   // hiragana / katakana → ja
+    let mut latin = 0usize;
+    for c in text.chars() {
+        match c as u32 {
+            0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => hangul += 1,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF => cjk += 1,
+            0x3040..=0x30FF => kana += 1,
+            _ if c.is_ascii_alphabetic() => latin += 1,
+            _ => {}
         }
     }
-
-    false
+    let total = hangul + cjk + kana + latin;
+    if total < 2 {
+        return None; // too short to judge
+    }
+    // Any kana at all marks Japanese (ja text mixes kanji + kana freely).
+    if kana * 4 >= total {
+        return Some("ja");
+    }
+    let majority = |n: usize| n * 2 > total;
+    if majority(hangul) {
+        Some("ko")
+    } else if majority(cjk + kana) && kana > 0 {
+        Some("ja")
+    } else if majority(cjk) {
+        Some("zh")
+    } else if majority(latin) {
+        Some("en")
+    } else {
+        None
+    }
 }
 
 /// Map full language names and ISO codes to our canonical 2-letter codes.
@@ -458,10 +529,7 @@ fn emit_subtitle(
     started_at_ms: u64,
     ended_at_ms: u64,
 ) {
-    let mode = app
-        .try_state::<Mutex<AppState>>()
-        .and_then(|st| st.lock().ok().map(|s| s.mode))
-        .unwrap_or_default();
+    let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
 
     // Populate only the source-language slot; translation worker fills zh.
     let mut subtitles = SubtitleTexts::default();
@@ -487,13 +555,7 @@ fn emit_subtitle(
 
 /// Update `AppState.asr_status` and re-broadcast `engine_status`.
 fn set_asr_status(app: &AppHandle, status: &str) {
-    if let Some(st) = app.try_state::<Mutex<AppState>>() {
-        if let Ok(mut s) = st.lock() {
-            s.asr_status = status.to_string();
-            let eng = EngineStatus::from_state(&s);
-            let _ = app.emit("engine_status", eng);
-        }
-    }
+    state::update_and_emit(app, |s| s.asr_status = status.to_string());
 }
 
 /// Encode f32 samples as 16-bit PCM WAV at 16 kHz mono.

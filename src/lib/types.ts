@@ -43,6 +43,9 @@ export interface EngineStatus {
   llamaGpuLayers: number;    // 0 = CPU only, 36 = full GPU
   speechThreshold: number;   // VAD RMS threshold, linear 0–1 (~0.032 = −30 dBFS)
   musicMode: boolean;
+  asrBackend: string;        // "whisper" | "sensevoice"
+  whisperModel: string;      // "turbo" | "large"
+  sensevoicePrecision: string; // "int8" | "fp32"
   captureTarget?: AudioProcess; // null / absent = system-wide loopback
   rms?: number;
   message?: string;

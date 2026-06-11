@@ -90,20 +90,21 @@ from whisper.cpp.  Two issues surfaced: (1) the C++ binary did not return
 unreliable; (2) model variants (large-v3-turbo, distil-whisper) were not available
 as prebuilt Windows executables, limiting upgrade paths.
 
-**Decision.** Switch the ASR sidecar to `faster_whisper_srv.py` — a Python
-`fastapi` server wrapping the `faster-whisper` library (CTranslate2 backend).
-- Returns full `verbose_json` including `no_speech_prob` per segment → reliable
-  silence/noise suppression.
-- Models are downloaded automatically on first run from HuggingFace (no manual
-  binary management).
-- GPU acceleration via CTranslate2 (CUDA or CPU fallback).
+**Decision.** Switch the ASR sidecar to `asr_srv.py` — a Python `fastapi` server
+supporting two pluggable backends, selected via `ASR_BACKEND` env var:
+- `whisper` (default): wraps `faster-whisper` (CTranslate2). Returns `no_speech_prob`
+  per segment for reliable silence/noise suppression. GPU via CUDA or CPU fallback.
+- `sensevoice`: wraps SenseVoice ONNX via `sherpa-onnx`. Better Korean/multilingual
+  accuracy, ~70x faster than real-time on CPU. Model ~100 MB INT8 ONNX.
+
+Models are downloaded automatically on first run from HuggingFace.
 
 **Consequence.** Requires Python 3.10+ and `pip install faster-whisper fastapi
-uvicorn ctranslate2` on the target machine. The HTTP API is the same multipart
-`/inference` endpoint, so `asr/whisper_server.rs` needed only minor changes (longer
-startup timeout for first-run model download, `no_speech_prob` extraction). The
-`WHISPER_SERVER_BIN` env var is replaced by `PYTHON_BIN` + `WHISPER_SERVER_SCRIPT`;
-`WHISPER_MODEL` now accepts a HuggingFace repo ID or local directory path.
+uvicorn sherpa-onnx` on the target machine. The HTTP API is the same multipart
+`/inference` endpoint. The Rust client lives in `asr/http_client.rs`; managed state
+uses `AsrProc`. Env vars: `ASR_BACKEND`, `ASR_SERVER_SCRIPT`, `WHISPER_MODEL`,
+`SENSEVOICE_MODEL`, `ASR_PORT` (legacy aliases `WHISPER_SERVER_SCRIPT`,
+`WHISPER_ASR_PORT` remain accepted).
 
 ---
 
@@ -194,3 +195,29 @@ blocking the capture thread. `speech_threshold` is retained in settings/state/IP
 for API compatibility but is no longer read by the chunker. Whisper may process a
 slightly higher volume of chunks (a silent 4 s chunk every 4 s instead of nothing)
 but `no_speech_prob` drops them cheaply before any translation is attempted.
+
+---
+
+## ADR-0010 — SenseVoice via sherpa-onnx for Korean ASR
+
+**Date:** 2026-06-11 · **Status:** Accepted
+
+**Context.** Whisper (all sizes) produces noticeably lower accuracy on Korean than
+on Chinese or English, particularly for casual speech and mixed-language content.
+The initial approach used `funasr` to run `FunAudioLLM/SenseVoiceSmall`, but
+`funasr`'s dependency `editdistance` had no pre-built wheel for Python 3.14,
+requiring a separate Python 3.12 venv.
+
+**Decision.** Switch the SenseVoice backend to `sherpa-onnx`. Key advantages:
+- `pip install sherpa-onnx` has pre-built wheels for Python 3.14 — no venv needed.
+- Ships an INT8 ONNX export (~100 MB vs ~600 MB) with no PyTorch dependency.
+- Structured result fields (`result.lang`, `result.event`) replace manual tag parsing.
+- SenseVoice CTC runs ~70x faster than real-time on CPU; GPU not necessary.
+
+Model: `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` (auto-downloaded).
+Backend selected via `ASR_BACKEND=sensevoice`; whisper remains the default.
+
+**Consequence.** `asr_srv.py` now has two inference paths behind a unified
+`/inference` HTTP endpoint — Rust side unchanged. The `_sv_parse()` tag-stripping
+logic from the funasr approach is replaced by reading `result.event` directly
+to determine `no_speech_prob`.

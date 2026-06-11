@@ -17,6 +17,9 @@ dist-ssr
 /binaries/
 /src-tauri/binaries/
 
+# SenseVoice funasr venv (replaced by sherpa-onnx, no longer needed)
+.venv-sensevoice/
+
 # Local dev launcher (personal convenience script)
 dev.bat
 

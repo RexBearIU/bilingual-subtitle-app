@@ -4,8 +4,8 @@
 //! Requires COM to be initialised on the calling thread.
 
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2,
-    IMMDeviceEnumerator, MMDeviceEnumerator,
+    eConsole, eRender, AudioSessionStateActive, IAudioSessionControl2,
+    IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Threading::{
@@ -22,6 +22,10 @@ use crate::types::AudioProcess;
 ///
 /// Duplicate PIDs (multiple sessions per process) are collapsed.
 /// The "System Sounds" session (PID 0) is skipped.
+///
+/// Returns the PID that directly owns the WASAPI audio session — for Chromium
+/// browsers this is the audio renderer subprocess, which is the correct PID
+/// for `ActivateAudioInterfaceAsync` process loopback.
 pub fn list_audio_processes() -> Result<Vec<AudioProcess>, String> {
     unsafe {
         let enumerator: IMMDeviceEnumerator =
@@ -50,6 +54,16 @@ pub fn list_audio_processes() -> Result<Vec<AudioProcess>, String> {
                 Ok(c) => c,
                 Err(_) => continue,
             };
+
+            // Only ACTIVE sessions: the enumerator also returns inactive and
+            // expired sessions whose owning process may have already exited
+            // (Chromium tears down its audio renderer subprocess when playback
+            // stops).  Activating process loopback on a dead PID fails with
+            // E_NOTIMPL, so skip anything not currently rendering audio.
+            match ctrl.GetState() {
+                Ok(s) if s == AudioSessionStateActive => {}
+                _ => continue,
+            }
 
             // Cast to the extended interface for PID access.
             let ctrl2: IAudioSessionControl2 = match ctrl.cast() {

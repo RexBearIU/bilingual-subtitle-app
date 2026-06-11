@@ -52,7 +52,20 @@ pub struct PersistSettings {
     /// Music mode persisted across restarts.
     #[serde(default)]
     pub music_mode: bool,
+    /// ASR backend: "whisper" (default) | "sensevoice".
+    #[serde(default = "default_asr_backend")]
+    pub asr_backend: String,
+    /// Whisper model size: "turbo" (default) | "large" (large-v3 int8-quantized).
+    #[serde(default = "default_whisper_model")]
+    pub whisper_model: String,
+    /// SenseVoice model precision: "int8" (default) | "fp32".
+    #[serde(default = "default_sv_precision")]
+    pub sensevoice_precision: String,
 }
+
+fn default_asr_backend() -> String { "whisper".into() }
+fn default_whisper_model() -> String { "turbo".into() }
+fn default_sv_precision() -> String { "int8".into() }
 
 impl Default for PersistSettings {
     fn default() -> Self {
@@ -63,8 +76,11 @@ impl Default for PersistSettings {
             subtitle_opacity: 0.55,
             overlay: OverlayRect::default(),
             llama_gpu_layers: 36,
-            speech_threshold: 0.0, // 0 = adaptive (auto-adjusts to room noise)
+            speech_threshold: 0.0,
             music_mode: false,
+            asr_backend: default_asr_backend(),
+            whisper_model: default_whisper_model(),
+            sensevoice_precision: default_sv_precision(),
         }
     }
 }

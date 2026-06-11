@@ -12,7 +12,7 @@ pub struct TranslationRequest {
     pub id: String,
     /// ISO-639-1 source language (`"ko"` / `"en"` / `"zh"`).
     pub source_lang: String,
-    /// Source text as returned by whisper-server.
+    /// Source text as returned by asr-srv.
     pub source_text: String,
     /// Active subtitle display mode (drives which target language we need).
     pub mode: SubtitleMode,

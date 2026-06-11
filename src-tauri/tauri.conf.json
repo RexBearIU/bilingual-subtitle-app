@@ -44,7 +44,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../faster_whisper_srv.py": "faster_whisper_srv.py",
+      "../asr_srv.py": "asr_srv.py",
       "../binaries/llama-server.exe": "llama-server.exe",
       "../binaries/llama.dll": "llama.dll",
       "../binaries/llama-common.dll": "llama-common.dll",

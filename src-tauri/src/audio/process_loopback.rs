@@ -3,13 +3,12 @@
 //! Uses `ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
 //! to capture audio from a single process without needing a virtual audio device.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
 use windows::core::{implement, Interface, HRESULT};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::Audio::{
@@ -29,9 +28,7 @@ use windows::Win32::Media::Audio::{
 // CreateEventW needs Win32_Security feature (SECURITY_ATTRIBUTES parameter).
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-use crate::audio::resample::Resampler16k;
-use crate::state::AppState;
-use crate::types::EngineStatus;
+use crate::audio::capture::AudioPump;
 
 // ── COM completion handler ───────────────────────────────────────────────────
 
@@ -104,7 +101,7 @@ pub fn run_process_loopback(
         sample_rate, channels, bits_per_sample
     );
 
-    let mut resampler = Resampler16k::new(sample_rate, channels)?;
+    let mut pump = AudioPump::new(sample_rate, channels, bits_per_sample, block_align)?;
 
     // Re-query format for Initialize (the pointer was freed above).
     let format_ptr2 = unsafe {
@@ -142,10 +139,6 @@ pub fn run_process_loopback(
 
     unsafe { audio_client.Start().map_err(|e| e.to_string())? };
     log::info!("Process loopback stream started (pid {pid})");
-
-    let mut byte_queue: VecDeque<u8> = VecDeque::new();
-    let mut f32_buf: Vec<f32> = Vec::new();
-    let mut last_emit = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let wait_result = unsafe { WaitForSingleObject(h_event, 100) };
@@ -197,40 +190,15 @@ pub fn run_process_loopback(
                 )
             };
             // VecDeque has `extend` but not `extend_from_slice`; use extend.
-            byte_queue.extend(bytes.iter().copied());
+            pump.byte_queue.extend(bytes.iter().copied());
 
             unsafe {
                 let _ = capture_client.ReleaseBuffer(num_frames);
             }
         }
 
-        // Drain byte queue into f32 samples.
-        while byte_queue.len() >= block_align {
-            let frame_bytes: Vec<u8> = byte_queue.drain(..block_align).collect();
-            f32_buf.extend_from_slice(&super::capture::bytes_to_f32(
-                &frame_bytes,
-                bits_per_sample,
-            ));
-        }
-
-        if last_emit.elapsed() >= Duration::from_millis(200)
-            && !f32_buf.is_empty()
-            && !stop.load(Ordering::Relaxed)
-        {
-            let mono = super::capture::interleaved_to_mono(&f32_buf, channels);
-            let rms = super::meter::rms(&mono);
-            last_emit = Instant::now();
-            push_rms(app, rms);
-
-            match resampler.process(&f32_buf) {
-                Ok(s) if !s.is_empty() => {
-                    let _ = vad_tx.send(s);
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("resample error: {e}"),
-            }
-            f32_buf.clear();
-        }
+        pump.drain_frames();
+        pump.tick(app, &vad_tx);
     }
 
     unsafe {
@@ -295,15 +263,14 @@ fn activate_for_process(pid: u32) -> Result<IAudioClient, String> {
     // ActivateAudioInterfaceAsync returned (synchronous portion of the call).
     rx.recv_timeout(Duration::from_secs(10))
         .map_err(|_| format!("process loopback activation timed out for pid {pid}"))?
-        .map_err(|e| format!("process loopback activation failed: {e}"))
+        .map_err(|e| {
+            // E_NOTIMPL (0x80004001): Windows has no active render stream for
+            // this PID right now — the app must be playing audio when Start is clicked.
+            if e.code() == windows::core::HRESULT(0x80004001_u32 as i32) {
+                format!("process loopback: 目標應用程式目前沒有音訊輸出，請先讓它播放聲音再按 Start")
+            } else {
+                format!("process loopback activation failed: {e}")
+            }
+        })
 }
 
-fn push_rms(app: &AppHandle, rms: f32) {
-    if let Some(st) = app.try_state::<Mutex<AppState>>() {
-        if let Ok(mut s) = st.lock() {
-            s.rms = rms;
-            let status = EngineStatus::from_state(&s);
-            let _ = app.emit("engine_status", status);
-        }
-    }
-}

@@ -4,9 +4,13 @@
 
   let { status, onClose }: { status: EngineStatus | null; onClose: () => void } = $props();
 
-  let fontSize    = $derived(status?.fontSize       ?? 28);
-  let opacity     = $derived(status?.subtitleOpacity ?? 0.55);
-  let llamaGpu    = $derived(status?.llamaGpuLayers  ?? 36);
+  let fontSize          = $derived(status?.fontSize             ?? 28);
+  let opacity           = $derived(status?.subtitleOpacity      ?? 0.55);
+  let llamaGpu          = $derived(status?.llamaGpuLayers       ?? 36);
+  let asrBackend        = $derived(status?.asrBackend           ?? 'whisper');
+  let whisperModel      = $derived(status?.whisperModel         ?? 'turbo');
+  let sensevoicePrecision = $derived(status?.sensevoicePrecision ?? 'int8');
+
   async function onFont(e: Event) {
     await cmd.setFontSize(Number((e.target as HTMLInputElement).value));
   }
@@ -15,6 +19,15 @@
   }
   async function toggleGpu() {
     await cmd.updateSettings({ llamaGpuLayers: llamaGpu > 0 ? 0 : 36 });
+  }
+  async function toggleAsr() {
+    await cmd.updateSettings({ asrBackend: asrBackend === 'sensevoice' ? 'whisper' : 'sensevoice' });
+  }
+  async function toggleWhisperModel() {
+    await cmd.updateSettings({ whisperModel: whisperModel === 'large' ? 'turbo' : 'large' });
+  }
+  async function toggleSvPrecision() {
+    await cmd.updateSettings({ sensevoicePrecision: sensevoicePrecision === 'fp32' ? 'int8' : 'fp32' });
   }
 </script>
 
@@ -43,15 +56,50 @@
       <span class="val">{Math.round(opacity * 100)} %</span>
     </div>
 
+    <!-- row: ASR backend -->
+    <div class="row">
+      <span class="label">辨識引擎</span>
+      <button class="gpu-btn" class:sv={asrBackend === 'sensevoice'} onclick={toggleAsr}>
+        {asrBackend === 'sensevoice' ? 'SenseVoice' : 'Whisper'}
+      </button>
+      <span class="val hint-inline">{asrBackend === 'sensevoice' ? '韓文佳' : '預設'}</span>
+    </div>
+
+    {#if asrBackend === 'whisper'}
+    <!-- row: Whisper model size -->
+    <div class="row sub-row">
+      <span class="label">模型大小</span>
+      <button class="gpu-btn" class:large={whisperModel === 'large'} onclick={toggleWhisperModel}>
+        {whisperModel === 'large' ? 'Large-v3 int8' : 'Turbo'}
+      </button>
+      <span class="val hint-inline">{whisperModel === 'large' ? '高品質' : '較快'}</span>
+    </div>
+    <p class="hint">Large-v3 int8：品質更好，首次下載需要時間，GPU VRAM ~1.5 GB。切換後重新 Start 生效。</p>
+    {/if}
+
+    {#if asrBackend === 'sensevoice'}
+    <!-- row: SenseVoice precision -->
+    <div class="row sub-row">
+      <span class="label">模型精度</span>
+      <button class="gpu-btn" class:sv={sensevoicePrecision === 'fp32'} onclick={toggleSvPrecision}>
+        {sensevoicePrecision === 'fp32' ? 'float32' : 'int8'}
+      </button>
+      <span class="val hint-inline">{sensevoicePrecision === 'fp32' ? '更精準' : '較快'}</span>
+    </div>
+    <p class="hint">float32：完整精度模型 (~220 MB)，準確率更高。切換後重新 Start 生效。</p>
+    {/if}
+
+    <p class="hint">切換引擎後重新 Start 生效。</p>
+
     <!-- row: GPU -->
     <div class="row">
       <span class="label">翻譯引擎</span>
       <button class="gpu-btn" class:cpu={llamaGpu === 0} onclick={toggleGpu}>
         {llamaGpu > 0 ? `GPU（${llamaGpu} layers）` : 'CPU only'}
       </button>
-      <span class="val hint-inline">{llamaGpu > 0 ? '~150ms' : '慢'}</span>
+      <span class="val hint-inline">{llamaGpu > 0 ? '~150ms' : '~1.3s'}</span>
     </div>
-    <p class="hint">切換後重新 Start 生效。打遊戲時用 CPU 避免 GPU 搶佔。</p>
+    <p class="hint">打遊戲時用 CPU 避免 GPU 搶佔。</p>
   </div>
 </div>
 
@@ -152,4 +200,8 @@
   }
   .gpu-btn:hover { background: #334880; }
   .gpu-btn.cpu { background: #3a2a2a; border-color: #6a3a3a; color: #ffb0a0; }
+  .gpu-btn.sv    { background: #2a4a3a; border-color: #3a7a5a; color: #90e8b0; }
+  .gpu-btn.large { background: #3a2a6a; border-color: #5a4aaa; color: #c0a8ff; }
+
+  .sub-row { padding-left: 28px; }
 </style>

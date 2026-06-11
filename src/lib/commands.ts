@@ -37,6 +37,9 @@ export const getSettings = () => invoke<PersistSettings>("get_settings");
 export interface SettingsPatch {
   subtitleOpacity?: number;
   llamaGpuLayers?: number;
+  asrBackend?: string;
+  whisperModel?: string;
+  sensevoicePrecision?: string;
   speechThreshold?: number;
   overlay?: OverlayRect;
 }

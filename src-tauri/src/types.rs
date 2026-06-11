@@ -129,6 +129,12 @@ pub struct EngineStatus {
     /// VAD speech threshold (linear RMS, 0.0–1.0).
     pub speech_threshold: f32,
     pub music_mode: bool,
+    /// Active ASR backend: "whisper" | "sensevoice".
+    pub asr_backend: String,
+    /// Whisper model size: "turbo" | "large".
+    pub whisper_model: String,
+    /// SenseVoice model precision: "int8" | "fp32".
+    pub sensevoice_precision: String,
     /// Currently targeted audio process; `null` = system-wide loopback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_target: Option<AudioProcess>,
@@ -153,10 +159,12 @@ impl EngineStatus {
             llama_gpu_layers: s.llama_gpu_layers,
             speech_threshold: s.speech_threshold,
             music_mode: s.music_mode,
+            asr_backend: s.asr_backend.clone(),
+            whisper_model: s.whisper_model.clone(),
+            sensevoice_precision: s.sensevoice_precision.clone(),
             capture_target: s.capture_target.clone(),
-            // Emit rms only while capturing so the UI doesn't show a stale value.
             rms: if s.captioning { Some(s.rms) } else { None },
-            message: None,
+            message: s.loopback_error.clone(),
         }
     }
 }

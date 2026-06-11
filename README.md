@@ -13,7 +13,7 @@ click-through window.
 - **Per-process capture:** target a single app (e.g. a game) instead of all system audio.
 - **Music mode:** bypasses VAD for continuous lyrics captioning.
 
-> Status: **M0–M8 complete** (overlay · WASAPI capture · VAD · ASR · translation · subtitle store · settings · performance). M9 (SenseVoice) optional — see [docs/MILESTONES.md](docs/MILESTONES.md).
+> Status: **M0–M9 complete** (overlay · WASAPI capture · VAD · ASR · translation · subtitle store · settings · performance · SenseVoice backend). See [docs/MILESTONES.md](docs/MILESTONES.md).
 
 ## Download & install
 
@@ -29,9 +29,8 @@ click-through window.
 | Backend | Rust |
 | Frontend | Svelte 5 + Vite (no SvelteKit — single overlay, no routing needed) |
 | Audio capture | Windows WASAPI loopback + per-process loopback (`process_loopback.rs`) |
-| ASR | faster-whisper — Python HTTP sidecar (`faster_whisper_srv.py`) |
+| ASR | `asr_srv.py` Python sidecar — faster-whisper (default) or SenseVoice via sherpa-onnx (`ASR_BACKEND=sensevoice`) |
 | Translation | Qwen3-4B GGUF via `llama-server` sidecar (OpenAI-compatible HTTP, Vulkan GPU) |
-| Later | SenseVoice ASR backend (optional, M9) |
 
 ## Documentation
 

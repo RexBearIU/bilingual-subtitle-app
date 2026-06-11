@@ -7,11 +7,11 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::audio;
 use crate::settings::{PersistSettings, SettingsPath};
-use crate::state::{AppState, LlamaProc, WhisperProc};
+use crate::state::{AppState, AsrProc, LlamaProc};
 use crate::types::{AudioProcess, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate};
 
 type Db<'a>      = State<'a, Mutex<AppState>>;
-type ProcDb<'a>  = State<'a, Mutex<WhisperProc>>;
+type ProcDb<'a>  = State<'a, Mutex<AsrProc>>;
 type LlamDb<'a>  = State<'a, Mutex<LlamaProc>>;
 type SpDb<'a>    = State<'a, Mutex<SettingsPath>>;
 
@@ -29,7 +29,7 @@ pub fn start_captioning(
     app: AppHandle,
 ) -> Result<(), String> {
     // Set state and build stop flag while holding the AppState lock.
-    let (stop, ngl) = {
+    let (stop, ngl, asr_backend, whisper_model, sv_precision) = {
         let mut s = state.lock().map_err(|e| e.to_string())?;
         if s.captioning {
             return Ok(());
@@ -41,27 +41,28 @@ pub fn start_captioning(
         s.asr_status = "loading".into();
         s.translation_status = "loading".into();
         emit_status(&app, &s);
-        (stop, s.llama_gpu_layers)
+        (stop, s.llama_gpu_layers, s.asr_backend.clone(),
+         s.whisper_model.clone(), s.sensevoice_precision.clone())
     }; // AppState lock released
 
-    // Launch whisper-server only if it is not already running.
+    // Launch asr-srv only if it is not already running.
     // On subsequent Start calls the process stays alive — no model reload needed.
     {
         let mut proc = proc_db.lock().map_err(|e| e.to_string())?;
         let alive = proc.0.as_mut()
             .map_or(false, |c| c.try_wait().ok().flatten().is_none());
         if alive {
-            log::info!("whisper-server already running — reusing");
+            log::info!("asr-srv already running — reusing");
         } else {
             proc.0 = None; // clear any zombie handle
-            match launch_whisper_server() {
+            match launch_asr_server(&asr_backend, &whisper_model, &sv_precision) {
                 Ok(child) => {
-                    log::info!("whisper-server started (pid {})", child.id());
+                    log::info!("asr-srv started (pid {})", child.id());
                     proc.0 = Some(child);
                 }
                 Err(e) => {
-                    log::warn!("could not start whisper-server: {e}");
-                    log::warn!("  → set WHISPER_SERVER_BIN / WHISPER_MODEL env vars or place binary on PATH");
+                    log::warn!("could not start asr-srv: {e}");
+                    log::warn!("  → set PYTHON_BIN / ASR_BACKEND / WHISPER_MODEL env vars");
                 }
             }
         }
@@ -112,10 +113,10 @@ pub fn stop_captioning(
         emit_status(&app, &s);
     }
 
-    // NOTE: whisper-server and llama-server are intentionally kept alive here.
+    // NOTE: asr-srv and llama-server are intentionally kept alive here.
     // Killing and restarting them on every Stop/Start cycle reloads the models
     // from disk (~10-30 s).  Instead they stay resident until the app exits,
-    // at which point WhisperProc / LlamaProc Drop impls kill them automatically.
+    // at which point AsrProc / LlamaProc Drop impls kill them automatically.
 
     log::info!("stop_captioning");
     Ok(())
@@ -236,59 +237,98 @@ fn kill_port(port: u16) {
     let _ = port; // no-op on non-Windows
 }
 
-/// Spawn faster-whisper-server as a child process (Python script).
+/// Spawn the ASR server as a child process (Python script).
 ///
-/// Python bin:  env `PYTHON_BIN`              → `python` (system Python).
-/// Script path: env `WHISPER_SERVER_SCRIPT`      → exe-dir/faster_whisper_srv.py → cwd.
-/// Model:       env `WHISPER_MODEL`              → `Systran/faster-whisper-large-v3-turbo`
-///              (HuggingFace repo id; downloaded on first run ~1.6 GB).
-///              Override to `Systran/faster-whisper-large-v3` for best quality (~3 GB VRAM).
-/// Port:        env `WHISPER_ASR_PORT`           → 9001.
-fn launch_whisper_server() -> Result<std::process::Child, String> {
+/// Python bin:  env `PYTHON_BIN`          → `python` (system Python).
+/// Script path: env `ASR_SERVER_SCRIPT`   → exe-dir/asr_srv.py → cwd.
+///              (also accepts legacy `WHISPER_SERVER_SCRIPT`)
+/// Backend:     `backend_override` (from AppState/settings) → env `ASR_BACKEND` → `whisper`.
+/// Model:       env `WHISPER_MODEL`       → `Systran/faster-whisper-large-v3-turbo`
+///              env `SENSEVOICE_MODEL`    → sherpa-onnx SenseVoice HF repo id
+/// Port:        env `ASR_PORT`            → 9001  (also accepts legacy `WHISPER_ASR_PORT`).
+fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precision: &str) -> Result<std::process::Child, String> {
+    // Prefer ASR_SERVER_SCRIPT; fall back to legacy WHISPER_SERVER_SCRIPT env var,
+    // then exe-dir/asr_srv.py, then cwd.
+    let script = match std::env::var("ASR_SERVER_SCRIPT") {
+        Ok(v) if !v.is_empty() => v,
+        _ => resolve_resource("WHISPER_SERVER_SCRIPT", "asr_srv.py"),
+    };
+    let port = std::env::var("ASR_PORT")
+        .or_else(|_| std::env::var("WHISPER_ASR_PORT")) // legacy compat
+        .unwrap_or_else(|_| "9001".to_string());
+
     let python = std::env::var("PYTHON_BIN")
         .unwrap_or_else(|_| "python".to_string());
-    let script = resolve_resource("WHISPER_SERVER_SCRIPT", "faster_whisper_srv.py");
-    // Accept a HuggingFace repo id or a local directory. If WHISPER_MODEL still
-    // points to a whisper.cpp .bin file (old env var value), ignore it and use
-    // the default so the app works without manual env var cleanup.
-    let model = {
-        let raw = std::env::var("WHISPER_MODEL")
-            .unwrap_or_default();
-        if raw.is_empty() || raw.ends_with(".bin") {
-            if !raw.is_empty() {
-                log::warn!("WHISPER_MODEL={raw:?} looks like a whisper.cpp model file — \
-                            faster-whisper needs a HuggingFace repo id or local directory. \
-                            Falling back to Systran/faster-whisper-large-v3-turbo.");
-            }
-            "Systran/faster-whisper-large-v3-turbo".to_string()
+
+    // Resolve backend: in-app setting takes priority over ASR_BACKEND env var.
+    let backend = if !backend_override.is_empty() {
+        backend_override.to_string()
+    } else {
+        std::env::var("ASR_BACKEND").unwrap_or_else(|_| "whisper".to_string())
+    };
+    // Resolve model and optional extra CLI args (compute-type, sv-precision).
+    // WHISPER_MODEL / SENSEVOICE_MODEL env vars override the UI setting.
+    let env_model = if backend == "sensevoice" {
+        std::env::var("SENSEVOICE_MODEL").unwrap_or_default()
+    } else {
+        std::env::var("WHISPER_MODEL").unwrap_or_default()
+    };
+
+    let (model, apply_size_setting) = if backend == "sensevoice" {
+        let m = if env_model.is_empty() {
+            "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17".to_string()
         } else {
-            raw
+            env_model.clone()
+        };
+        (m, env_model.is_empty())
+    } else {
+        if env_model.is_empty() || env_model.ends_with(".bin") {
+            if !env_model.is_empty() {
+                log::warn!("WHISPER_MODEL={env_model:?} looks like a whisper.cpp model — \
+                            falling back to HuggingFace repo.");
+            }
+            let repo = if whisper_model_size == "large" {
+                "Systran/faster-whisper-large-v3"
+            } else {
+                "Systran/faster-whisper-large-v3-turbo"
+            };
+            (repo.to_string(), true)
+        } else {
+            (env_model.clone(), false)
         }
     };
-    let port = std::env::var("WHISPER_ASR_PORT")
-        .unwrap_or_else(|_| "9001".to_string());
 
     // Evict any zombie from a previous session before binding.
     kill_port(port.parse().unwrap_or(9001));
 
-    log::info!("launching faster-whisper: python={python}  script={script}  model={model}  port={port}");
+    log::info!("launching asr-srv: python={python}  script={script}  backend={backend}  model={model}  port={port}");
 
     let mut cmd = std::process::Command::new(&python);
     cmd.args([
         script.as_str(),
+        "--backend", &backend,
         "--model", &model,
         "--host", "127.0.0.1",
         "--port", &port,
     ]);
+
+    // Quantize large-v3 to int8_float16 on GPU to keep VRAM ~1.5 GB instead of ~3 GB.
+    if backend != "sensevoice" && apply_size_setting && whisper_model_size == "large" {
+        cmd.args(["--compute-type", "int8_float16"]);
+    }
+    // SenseVoice precision (fp32 = full-precision model.onnx, better accuracy).
+    if backend == "sensevoice" && apply_size_setting && sv_precision != "int8" {
+        cmd.args(["--sv-precision", sv_precision]);
+    }
 
     // Prepend the DLL directory to PATH so ctranslate2 finds cublas64_12.dll.
     // The Python script no longer needs to search for it.
     if let Some(dll_dir) = find_dll_dir() {
         let path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{};{}", dll_dir.display(), path));
-        log::info!("faster-whisper: DLL dir → {}", dll_dir.display());
+        log::info!("asr-srv: DLL dir → {}", dll_dir.display());
     } else {
-        log::warn!("faster-whisper: cublas64_12.dll not found — GPU inference may fail");
+        log::warn!("asr-srv: cublas64_12.dll not found — GPU inference may fail");
     }
 
     // Suppress the console window that would flash up on Windows.
@@ -326,9 +366,15 @@ fn launch_llama_server(ngl_override: u32) -> Result<std::process::Child, String>
         "--host", "127.0.0.1",
         "--port", &port,
         "-ngl", &ngl,
-        "-c", "512",    // subtitle prompts are short; 512 tokens is plenty
+        // 2048: system prompt + one-shot example + input + 200-token output can
+        // exceed 512, and llama-server silently truncates the prompt when it
+        // does — which degrades translation quality mid-session.
+        "-c", "2048",
         "--no-webui",
     ]);
+    // CUDA graphs cause 10× decode regression for batch=1 small contexts on some
+    // driver/build combinations (measured: 1.28 tok/s with graphs vs 87 tok/s without).
+    cmd.env("GGML_CUDA_NO_GRAPHS", "1");
 
     // Suppress the console window on Windows.
     #[cfg(target_os = "windows")]
@@ -503,6 +549,9 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
         llama_gpu_layers: s.llama_gpu_layers,
         speech_threshold: s.speech_threshold,
         music_mode: s.music_mode,
+        asr_backend: s.asr_backend.clone(),
+        whisper_model: s.whisper_model.clone(),
+        sensevoice_precision: s.sensevoice_precision.clone(),
     })
 }
 
@@ -516,6 +565,7 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
 pub fn update_settings(
     patch: SettingsPatch,
     state: Db,
+    proc_db: ProcDb,
     sp: SpDb,
     app: AppHandle,
 ) -> Result<(), String> {
@@ -534,6 +584,55 @@ pub fn update_settings(
             s.llama_gpu_layers = ngl;
             saved.llama_gpu_layers = ngl;
             log::info!("settings: llama_gpu_layers → {ngl}");
+        }
+        if let Some(ref backend) = patch.asr_backend {
+            let backend = backend.trim().to_lowercase();
+            let backend = if backend == "sensevoice" { "sensevoice" } else { "whisper" };
+            if s.asr_backend != backend {
+                log::info!("settings: asr_backend → {backend}");
+                s.asr_backend = backend.into();
+                saved.asr_backend = backend.into();
+                if !s.captioning {
+                    if let Ok(mut proc) = proc_db.lock() {
+                        if let Some(mut child) = proc.0.take() {
+                            let _ = child.kill();
+                            log::info!("settings: asr-srv killed for backend switch");
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref wm) = patch.whisper_model {
+            let wm = if wm.trim() == "large" { "large" } else { "turbo" };
+            if s.whisper_model != wm {
+                log::info!("settings: whisper_model → {wm}");
+                s.whisper_model = wm.into();
+                saved.whisper_model = wm.into();
+                if !s.captioning {
+                    if let Ok(mut proc) = proc_db.lock() {
+                        if let Some(mut child) = proc.0.take() {
+                            let _ = child.kill();
+                            log::info!("settings: asr-srv killed for model switch");
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref sp) = patch.sensevoice_precision {
+            let sp = if sp.trim() == "fp32" { "fp32" } else { "int8" };
+            if s.sensevoice_precision != sp {
+                log::info!("settings: sensevoice_precision → {sp}");
+                s.sensevoice_precision = sp.into();
+                saved.sensevoice_precision = sp.into();
+                if !s.captioning {
+                    if let Ok(mut proc) = proc_db.lock() {
+                        if let Some(mut child) = proc.0.take() {
+                            let _ = child.kill();
+                            log::info!("settings: asr-srv killed for precision switch");
+                        }
+                    }
+                }
+            }
         }
         if let Some(thr) = patch.speech_threshold {
             // Allow 0 as "auto mode"; otherwise clamp to [0.001, 0.5].
@@ -569,6 +668,9 @@ pub fn update_settings(
 pub struct SettingsPatch {
     pub subtitle_opacity: Option<f64>,
     pub llama_gpu_layers: Option<u32>,
+    pub asr_backend: Option<String>,
+    pub whisper_model: Option<String>,
+    pub sensevoice_precision: Option<String>,
     pub speech_threshold: Option<f32>,
     pub overlay: Option<crate::settings::OverlayRect>,
 }
@@ -592,6 +694,9 @@ pub fn save_current_settings(app: &AppHandle) {
     cfg.subtitle_opacity = s.subtitle_opacity;
     cfg.llama_gpu_layers = s.llama_gpu_layers;
     cfg.speech_threshold = s.speech_threshold;
+    cfg.asr_backend = s.asr_backend.clone();
+    cfg.whisper_model = s.whisper_model.clone();
+    cfg.sensevoice_precision = s.sensevoice_precision.clone();
     if let Err(e) = cfg.save(&sp.0) {
         log::warn!("settings save failed: {e}");
     }

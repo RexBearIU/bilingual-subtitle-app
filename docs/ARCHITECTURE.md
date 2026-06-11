@@ -51,7 +51,7 @@ capture(thread) ──► chunker(worker) ──►[sync_channel(4)]──► as
 ```text
 Tauri app (Rust)
  ├─ owns: WASAPI/process capture, chunker, state manager, UI events
- ├─ spawns: python faster_whisper_srv.py  (HTTP :9001)  ── ASR
+ ├─ spawns: python asr_srv.py             (HTTP :9001)  ── ASR (whisper or sensevoice backend)
  └─ spawns: llama-server.exe             (HTTP :9002)  ── translation (Vulkan GPU)
 ```
 
@@ -150,7 +150,7 @@ src-tauri/src/
 ├─ main.rs                    # Tauri builder entry point
 ├─ lib.rs                     # setup: managed state, tray, shortcuts, log filters
 ├─ commands.rs                # #[tauri::command] handlers; sidecar launch + kill_port()
-├─ state.rs                   # AppState + WhisperProc + LlamaProc managed state
+├─ state.rs                   # AppState + AsrProc + LlamaProc managed state
 ├─ types.rs                   # Shared IPC types (SubtitleMode, EngineStatus, …)
 ├─ settings.rs                # PersistSettings + OverlayRect; JSON file I/O
 ├─ pipeline/
@@ -165,7 +165,7 @@ src-tauri/src/
 │  └─ meter.rs                # RMS helper (used for UI level meter)
 ├─ asr/
 │  ├─ mod.rs                  # AudioChunk type
-│  └─ whisper_server.rs       # faster-whisper HTTP client; hallucination filters
+│  └─ http_client.rs          # ASR HTTP client; hallucination filters
 └─ translate/
    ├─ mod.rs                  # TranslationRequest type
    └─ llama_server.rs         # llama-server HTTP client (OpenAI-compatible)

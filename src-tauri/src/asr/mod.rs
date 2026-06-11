@@ -1,5 +1,5 @@
 //! ASR subsystem.  `AudioChunk` is the boundary type between the VAD pipeline
-//! and ASR; `whisper_server` is the concrete implementation.
+//! and ASR; `http_client` is the concrete implementation.
 
 /// A VAD-gated speech segment ready for transcription.
 /// Samples are 16 kHz mono f32 PCM, including the pre-roll.
@@ -19,4 +19,4 @@ pub struct AudioChunk {
     pub is_partial: bool,
 }
 
-pub mod whisper_server;
+pub mod http_client;

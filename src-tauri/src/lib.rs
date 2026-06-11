@@ -6,13 +6,14 @@ mod settings;
 mod state;
 mod translate;
 mod types;
+mod util;
 
 use std::sync::Mutex;
 
 use state::AppState;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Listener, Manager};
 
 /// Apply + persist a click-through change and broadcast status.
 fn apply_click_through(app: &AppHandle, enabled: bool) {
@@ -22,19 +23,11 @@ fn apply_click_through(app: &AppHandle, enabled: bool) {
             let _ = w.set_focus();
         }
     }
-    if let Some(st) = app.try_state::<Mutex<AppState>>() {
-        if let Ok(mut s) = st.lock() {
-            s.click_through = enabled;
-            let _ = app.emit("engine_status", types::EngineStatus::from_state(&s));
-        }
-    }
+    state::update_and_emit(app, |s| s.click_through = enabled);
 }
 
 fn toggle_click_through(app: &AppHandle) {
-    let cur = app
-        .try_state::<Mutex<AppState>>()
-        .and_then(|st| st.lock().ok().map(|s| s.click_through))
-        .unwrap_or(false);
+    let cur = state::read_state(app, |s| s.click_through).unwrap_or(false);
     apply_click_through(app, !cur);
 }
 
@@ -42,19 +35,11 @@ fn apply_always_on_top(app: &AppHandle, enabled: bool) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.set_always_on_top(enabled);
     }
-    if let Some(st) = app.try_state::<Mutex<AppState>>() {
-        if let Ok(mut s) = st.lock() {
-            s.always_on_top = enabled;
-            let _ = app.emit("engine_status", types::EngineStatus::from_state(&s));
-        }
-    }
+    state::update_and_emit(app, |s| s.always_on_top = enabled);
 }
 
 fn toggle_always_on_top(app: &AppHandle) {
-    let cur = app
-        .try_state::<Mutex<AppState>>()
-        .and_then(|st| st.lock().ok().map(|s| s.always_on_top))
-        .unwrap_or(true);
+    let cur = state::read_state(app, |s| s.always_on_top).unwrap_or(true);
     apply_always_on_top(app, !cur);
 }
 
@@ -62,7 +47,7 @@ fn toggle_always_on_top(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
-        .manage(Mutex::new(state::WhisperProc(None)))
+        .manage(Mutex::new(state::AsrProc(None)))
         .manage(Mutex::new(state::LlamaProc(None)))
         .manage(Mutex::new(settings::SettingsPath(std::path::PathBuf::new())))
         .invoke_handler(tauri::generate_handler![
@@ -110,6 +95,9 @@ pub fn run() {
                     s.subtitle_opacity = cfg.subtitle_opacity;
                     s.llama_gpu_layers = cfg.llama_gpu_layers;
                     s.speech_threshold = cfg.speech_threshold;
+                    s.asr_backend = cfg.asr_backend.clone();
+                    s.whisper_model = cfg.whisper_model.clone();
+                    s.sensevoice_precision = cfg.sensevoice_precision.clone();
                 }
             }
 

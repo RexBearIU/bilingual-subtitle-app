@@ -13,7 +13,7 @@ Status legend: ⬜ not started · 🟡 in progress · ✅ done
 | 6 | Subtitle state manager | ✅ |
 | 7 | Product settings | ✅ |
 | 8 | Performance optimization | ✅ |
-| 9 | Optional SenseVoice backend | ⬜ |
+| 9 | Optional SenseVoice backend | ✅ |
 
 ---
 
@@ -92,26 +92,28 @@ Keep prior context/prompt for continuity.
 **Acceptance:** ko/en/zh transcribed · lang auto-detect · source subtitle emitted
 without translation.
 
-**Implemented:** `asr/mod.rs` (`AudioChunk` type) + `asr/whisper_server.rs`
+**Implemented:** `asr/mod.rs` (`AudioChunk` type) + `asr/http_client.rs`
 (HTTP client with multipart WAV upload, verbose_json response parsing,
 `normalize_lang` mapping, `encode_wav_16bit`, `subtitle_update` emission).
-`commands.rs` launches `faster_whisper_srv.py` (Python) via `std::process::Command`
-on `start_captioning` (env-configurable: `PYTHON_BIN`, `WHISPER_SERVER_SCRIPT`,
-`WHISPER_MODEL` as HuggingFace repo ID, `WHISPER_ASR_PORT`; defaults: `python`,
-`faster_whisper_srv.py`, `Systran/faster-whisper-medium`, 9001).
-`state.rs` adds `asr_status` + `WhisperProc` managed state. ASR worker polls
+`commands.rs` launches `asr_srv.py` (Python) via `std::process::Command`
+on `start_captioning` (env-configurable: `PYTHON_BIN`, `ASR_BACKEND`,
+`ASR_SERVER_SCRIPT`, `WHISPER_MODEL`, `SENSEVOICE_MODEL`, `ASR_PORT`).
+`state.rs` adds `asr_status` + `AsrProc` managed state. ASR worker polls
 for server readiness (300 s — allows first-run model download), then streams
 chunks from VAD → WAV → POST → `subtitle_update`. `ureq` v2 used for synchronous
 HTTP (no tokio conflict).
 
-**ASR quality filters** (added post-M4, in `whisper_server.rs`):
+**ASR quality filters** (in `http_client.rs`):
 - `no_speech_prob ≥ 0.7` suppresses silence/noise chunks
 - Hallucination blocklist (YouTube credits, `[Music]`, etc.)
 - Consecutive-repeat detection (initial_prompt feedback loop guard)
 
-**To activate:** place `whisper-server.exe` on PATH (or set `WHISPER_SERVER_BIN`)
-and put a model at `models/ggml-medium.bin` (or set `WHISPER_MODEL`) relative
-to the working directory when running `npm run tauri dev`.
+**Backends** (`ASR_BACKEND` env var):
+- `whisper` (default): faster-whisper + CTranslate2, GPU via CUDA
+- `sensevoice`: SenseVoice ONNX via sherpa-onnx, better Korean accuracy (ADR-0010)
+
+**To activate:** `pip install faster-whisper fastapi uvicorn sherpa-onnx` and
+set env vars — see `docs/SETUP.md`.
 
 ## M5 — Translation (Qwen)  ✅
 
@@ -226,7 +228,13 @@ Separate worker threads + bounded channels · drop stale chunks under back-press
   faster-whisper; beam_size=5 for final chunks; language-pair-aware translation
   prompt for Korean source (English loanwords, phonetic names, register matching).
 
-## M9 — SenseVoice (optional)  ⬜
+## M9 — SenseVoice backend  ✅
 
-Add as alternative ASR backend behind `AsrBackend` trait. Settings toggle
-whisper.cpp / SenseVoice. Same downstream pipeline.
+SenseVoice via `sherpa-onnx` as an alternative ASR backend (ADR-0010).
+Selected via `ASR_BACKEND=sensevoice` env var. Same downstream pipeline.
+
+**Implemented:** `asr_srv.py` unified server with two backends behind `/inference`.
+SenseVoice INT8 ONNX (~100 MB) auto-downloaded from HuggingFace on first use.
+`result.event` field used for noise gating (BGM / Applause / Laughter → suppressed).
+Language normalization handles full English names (`"Korean"` → `"ko"`).
+~70× faster than real-time on CPU — no GPU needed. Python 3.14 compatible (no venv).

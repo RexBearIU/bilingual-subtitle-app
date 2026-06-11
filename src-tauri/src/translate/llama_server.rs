@@ -8,13 +8,13 @@
 //! and get direct translation output.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
-use crate::state::AppState;
+use crate::state;
 use crate::translate::TranslationRequest;
-use crate::types::{EngineStatus, SubtitleMode, SubtitleTexts, SubtitleUpdate};
+use crate::types::{SubtitleMode, SubtitleTexts, SubtitleUpdate};
 
 const WAIT_TIMEOUT_SECS: u64 = 30;
 
@@ -46,7 +46,7 @@ fn translate_loop(
     log::info!("TL: waiting for llama-server at {base}");
     set_tl_status(app, "loading");
 
-    if !wait_for_server(&base, WAIT_TIMEOUT_SECS) {
+    if !crate::util::wait_for_http_ok(&format!("{base}/health"), WAIT_TIMEOUT_SECS) {
         log::error!(
             "TL: llama-server did not respond within {WAIT_TIMEOUT_SECS}s \
              — check LLAMA_SERVER_BIN / LLAMA_MODEL env vars"
@@ -58,16 +58,34 @@ fn translate_loop(
     set_tl_status(app, "ready");
 
     let url = format!("{base}/v1/chat/completions");
+    // Rolling context: the last few successful (source, translated) pairs,
+    // injected as prior chat turns.  Gives the model cross-subtitle context —
+    // pronouns, names, and topic continuity — which matters a lot for Korean,
+    // where subjects are routinely omitted and must be inferred.
+    const CTX_PAIRS: usize = 3;
+    let mut history: std::collections::VecDeque<(String, String)> =
+        std::collections::VecDeque::with_capacity(CTX_PAIRS);
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let req = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+        let mut req = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        // If we fell behind, translate only the NEWEST request — the older
+        // subtitles are already scrolling away, and the visible line going
+        // untranslated is worse than an old line keeping its source text.
+        let mut skipped = 0u32;
+        while let Ok(newer) = rx.try_recv() {
+            skipped += 1;
+            req = newer;
+        }
+        if skipped > 0 {
+            log::info!("TL: backlog — skipped {skipped} stale request(s), translating newest");
+        }
 
         // "No translation" mode — just promote source text to final subtitle.
         if req.mode == SubtitleMode::NoTranslate {
@@ -100,11 +118,28 @@ fn translate_loop(
             continue;
         }
 
+        // Nothing translatable (punctuation / numbers only) — pass through
+        // without burning an LLM round-trip on "." → "。".
+        if !req.source_text.chars().any(|c| c.is_alphabetic()) {
+            emit_translated(app, &req, req.source_text.clone());
+            continue;
+        }
+
+        let music_mode = state::read_state(app, |s| s.music_mode).unwrap_or(false);
+
+        let prev: Vec<(&str, &str)> = history
+            .iter()
+            .map(|(s, t)| (s.as_str(), t.as_str()))
+            .collect();
         let t_tl = std::time::Instant::now();
-        match call_translate(&url, &req.source_lang, &req.source_text, req.mode) {
+        match call_translate(&url, &req.source_lang, &req.source_text, req.mode, &prev, music_mode) {
             Ok(translated) => {
                 let tl_ms = t_tl.elapsed().as_millis();
                 log::info!("TL [{} → {}] {tl_ms}ms → {:?}", req.source_lang, req.mode.target_lang(), translated);
+                if history.len() == CTX_PAIRS {
+                    history.pop_front();
+                }
+                history.push_back((req.source_text.clone(), translated.clone()));
                 emit_translated(app, &req, translated);
             }
             Err(e) => {
@@ -120,51 +155,78 @@ fn translate_loop(
     log::info!("translate worker exited");
 }
 
-fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
-    let base = format!(
+fn build_system_prompt(source_lang: &str, target_name: &str, music_mode: bool) -> String {
+    let mut p = format!(
         "You are a real-time subtitle translator. \
          Output ONLY the {target_name} translation — no explanations, no additions. \
-         Keep the natural spoken tone. Translate incomplete sentences as-is."
+         Keep the natural spoken tone. \
+         The input comes from live speech recognition: it may contain transcription \
+         errors, odd spacing, or be a fragment cut mid-sentence. Infer the intended \
+         words from context, translate only what is present, and never invent \
+         content to complete a fragment. \
+         The audio may contain several speakers taking turns — if the text switches \
+         speaker mid-line (often marked with a dash), translate each utterance and \
+         keep them separated with a dash; do not merge different speakers into one \
+         sentence."
     );
 
     if source_lang == "ko" {
-        format!(
-            "{base} \
-             For Korean: keep English loanwords in English, \
+        p.push_str(
+            " For Korean: keep English loanwords in English, \
              transliterate proper names phonetically, \
-             match the speaker's formal or casual register."
-        )
-    } else {
-        base
+             match the speaker's formal or casual register.",
+        );
     }
+
+    if music_mode {
+        p.push_str(
+            " The text is song lyrics — translate lyrically and concisely, \
+             preserving imagery and emotion over literal word order.",
+        );
+    }
+
+    p
 }
 
 /// Call llama-server and return the translation in the target language.
+/// `prev` holds the last few (source, translated) pairs, injected as prior
+/// chat turns to keep vocabulary, names, and topic continuity consistent.
 fn call_translate(
     url: &str,
     source_lang: &str,
     text: &str,
     mode: crate::types::SubtitleMode,
+    prev: &[(&str, &str)],
+    music_mode: bool,
 ) -> Result<String, String> {
     let source_name = match source_lang {
         "ko" => "Korean",
         "en" => "English",
         "zh" => "Chinese",
+        "ja" => "Japanese",
         other => other,
     };
     let target_name = mode.target_name();
 
-    let system = build_system_prompt(source_lang, target_name);
+    let system = build_system_prompt(source_lang, target_name, music_mode);
 
     // /no_think disables Qwen3's chain-of-thought so the first token is the answer.
     let user = format!("/no_think [{source_name}→{target_name}] {text}");
 
+    let mut messages = vec![serde_json::json!({ "role": "system", "content": &system })];
+
+    // Inject recent subtitles as prior turns so the model can maintain
+    // consistent names, loanwords, and topic context across subtitles.
+    for (prev_src, prev_tl) in prev {
+        let prev_user = format!("/no_think [{source_name}→{target_name}] {prev_src}");
+        messages.push(serde_json::json!({ "role": "user",      "content": prev_user }));
+        messages.push(serde_json::json!({ "role": "assistant", "content": prev_tl  }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": &user }));
+
     let body = serde_json::json!({
         "model": "local",
-        "messages": [
-            { "role": "system", "content": &system },
-            { "role": "user",   "content": &user   }
-        ],
+        "messages": messages,
         "max_tokens": 200,
         "temperature": 0
     });
@@ -257,27 +319,7 @@ fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
     let _ = app.emit("subtitle_update", update);
 }
 
-/// Poll `GET /health` until the server responds 200 or the timeout expires.
-fn wait_for_server(base: &str, timeout_secs: u64) -> bool {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let url = format!("{base}/health");
-    while std::time::Instant::now() < deadline {
-        if ureq::get(&url).call().is_ok() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    false
-}
-
 /// Update `AppState.translation_status` and re-broadcast `engine_status`.
 fn set_tl_status(app: &AppHandle, status: &str) {
-    if let Some(st) = app.try_state::<Mutex<AppState>>() {
-        if let Ok(mut s) = st.lock() {
-            s.translation_status = status.to_string();
-            let eng = EngineStatus::from_state(&s);
-            let _ = app.emit("engine_status", eng);
-        }
-    }
+    state::update_and_emit(app, |s| s.translation_status = status.to_string());
 }

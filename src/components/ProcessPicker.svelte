@@ -60,6 +60,10 @@
     🎧 {label}
   </button>
 
+  {#if status?.message}
+    <div class="loopback-err">⚠ {status.message}</div>
+  {/if}
+
   {#if open}
     <!-- backdrop -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -181,5 +185,22 @@
     font-size: 10px;
     color: #4a5566;
     flex-shrink: 0;
+  }
+
+  .loopback-err {
+    position: absolute;
+    bottom: calc(100% + 4px);
+    left: 0;
+    z-index: 101;
+    background: rgba(30, 10, 10, 0.97);
+    border: 1px solid #6a2a2a;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 10px;
+    color: #e08070;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-width: 380px;
+    line-height: 1.4;
   }
 </style>
