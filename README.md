@@ -1,9 +1,9 @@
 # Local Realtime Bilingual Subtitle App
 
 A Windows desktop overlay that captures **system output audio** (WASAPI loopback),
-transcribes speech **locally** (whisper.cpp), translates it **locally** (Qwen via
-llama.cpp), and renders **bilingual subtitles** in a transparent, always-on-top,
-click-through window.
+transcribes speech **locally** (faster-whisper, SenseVoice, or a Korean
+Zipformer), translates it **locally** (Qwen via llama.cpp), and renders
+**bilingual subtitles** in a transparent, always-on-top, click-through window.
 
 - **100% local.** No cloud API, no account, no network dependency at runtime
   (model/binary downloads happen once at setup).
@@ -13,7 +13,9 @@ click-through window.
 - **Per-process capture:** target a single app (e.g. a game) instead of all system audio.
 - **Music mode:** bypasses VAD for continuous lyrics captioning.
 
-> Status: **M0–M9 complete** (overlay · WASAPI capture · VAD · ASR · translation · subtitle store · settings · performance · SenseVoice backend). See [docs/MILESTONES.md](docs/MILESTONES.md).
+> Status: **feature-complete MVP** — overlay · system & per-process capture ·
+> graduated chunking · ASR (whisper/SenseVoice/Zipformer-KO) · translation · settings ·
+> backpressure-aware real-time pipeline.
 
 ## Download & install
 

@@ -119,6 +119,9 @@ fn quietest_cut(buf: &[f32], target: usize) -> usize {
     best_start + WIN / 2
 }
 
+// The chunk fields plus logging metadata (seq, tag) genuinely belong here;
+// bundling them into a struct would only move the noise around.
+#[allow(clippy::too_many_arguments)]
 fn send_chunk(
     asr_tx: &SyncSender<AudioChunk>,
     samples: Vec<f32>,
@@ -322,4 +325,43 @@ fn chunk_loop(
     }
 
     log::info!("chunker exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_silence_frames_is_stricter_for_short_buffers() {
+        // < 1.5 s buffered → demand ~800 ms of silence (4 frames).
+        assert_eq!(required_silence_frames(SAMPLE_RATE), 4); // 1.0 s
+        assert_eq!(required_silence_frames(SAMPLE_RATE * 3 / 2 - 1), 4);
+        // 1.5–2.5 s → ~400 ms (2 frames).
+        assert_eq!(required_silence_frames(SAMPLE_RATE * 3 / 2), 2);
+        assert_eq!(required_silence_frames(SAMPLE_RATE * 2), 2);
+        // ≥ 2.5 s → cut at the first ~200 ms dip (1 frame).
+        assert_eq!(required_silence_frames(SAMPLE_RATE * 5 / 2), 1);
+        assert_eq!(required_silence_frames(SAMPLE_RATE * 6), 1);
+    }
+
+    #[test]
+    fn quietest_cut_returns_end_for_tiny_buffers() {
+        // Shorter than two analysis windows → nothing to search, cut at the end.
+        let buf = vec![0.5f32; 1000];
+        assert_eq!(quietest_cut(&buf, buf.len()), buf.len());
+    }
+
+    #[test]
+    fn quietest_cut_lands_in_the_quiet_window() {
+        // Loud everywhere except one window-aligned silent stretch [2400, 3200).
+        let mut buf = vec![0.5f32; 4000];
+        for s in buf.iter_mut().take(3200).skip(2400) {
+            *s = 0.0;
+        }
+        let cut = quietest_cut(&buf, buf.len());
+        assert!(
+            (2400..=3200).contains(&cut),
+            "cut {cut} should land inside the silent window"
+        );
+    }
 }

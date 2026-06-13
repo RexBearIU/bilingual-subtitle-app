@@ -13,12 +13,16 @@ Usage:
   python asr_srv.py [--backend BACKEND] [--model MODEL] [--host HOST] [--port PORT]
 
   BACKEND  asr engine to use (env: ASR_BACKEND):
-             whisper      faster-whisper  (default)
-             sensevoice   SenseVoice ONNX via sherpa-onnx — better Korean accuracy
+             whisper       faster-whisper  (default)
+             sensevoice    SenseVoice ONNX via sherpa-onnx — multilingual, fast
+             zipformer-ko  Korean Zipformer transducer via sherpa-onnx — fast +
+                           full-length Korean; auto-downloads model on first run
+                           (env ZIPFORMER_MODEL = local model dir to override)
 
   MODEL  (whisper backend) HuggingFace repo id or local path (env: WHISPER_MODEL):
-           Systran/faster-whisper-large-v3-turbo  ← recommended
-           Systran/faster-whisper-large-v3        best quality (~3 GB VRAM)
+           deepdml/faster-whisper-large-v3-turbo-ct2  ← recommended (public mirror;
+               the original Systran/...-turbo repo is now HF-gated)
+           Systran/faster-whisper-large-v3            best quality (~3 GB VRAM)
 
          (sensevoice backend) HuggingFace repo id (env: SENSEVOICE_MODEL):
            csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17  ← default
@@ -206,6 +210,93 @@ def _infer_sensevoice(audio_bytes: bytes, language: str | None) -> tuple[str, st
     no_speech_prob = 0.9 if (event in _SV_NOISE_EVENTS or not text) else 0.1
     return text, _normalize_lang(lang), no_speech_prob
 
+# ── backend: Korean Zipformer transducer via sherpa-onnx ──────────────────────
+# Korean-only offline transducer (KsponSpeech). Streaming-fast on CPU (~0.25 s for
+# a 25 s clip), full-length transcription, natural conversational Korean. Weaker
+# than whisper large-v3 on loanwords / code-switching, but a fast, accurate option
+# for Korean-dominant content — and it reuses the sherpa-onnx backend.
+_zipformer_recognizer = None
+
+# Distributed as a tarball on the sherpa-onnx GitHub releases (not a single HF file).
+_ZIPFORMER_NAME = "sherpa-onnx-zipformer-korean-2024-06-24"
+_ZIPFORMER_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    f"{_ZIPFORMER_NAME}.tar.bz2"
+)
+
+
+def _zipformer_cache_dir() -> str:
+    """Stable cache directory for the auto-downloaded Korean model."""
+    base = os.path.join(os.path.expanduser("~"), ".cache", "bilingual-subtitle")
+    return os.path.join(base, _ZIPFORMER_NAME)
+
+
+def _resolve_zipformer_dir(model_override: str) -> str:
+    """Return a directory holding encoder/decoder/joiner/tokens, downloading the
+    default Korean model on first run. `model_override` (env ZIPFORMER_MODEL) may
+    point at a local model directory to skip the download."""
+    import tarfile
+    import urllib.request
+
+    if model_override and os.path.isdir(model_override):
+        return model_override
+
+    target = _zipformer_cache_dir()
+    enc = os.path.join(target, "encoder-epoch-99-avg-1.onnx")
+    if os.path.isfile(enc):
+        return target
+
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tar_path = target + ".tar.bz2"
+    print(f"[zipformer-ko] Downloading {_ZIPFORMER_NAME} (~110 MB) — first run only ...", flush=True)
+    urllib.request.urlretrieve(_ZIPFORMER_URL, tar_path)
+    print("[zipformer-ko] Extracting ...", flush=True)
+    with tarfile.open(tar_path, "r:bz2") as t:
+        t.extractall(os.path.dirname(target))
+    try:
+        os.remove(tar_path)
+    except OSError:
+        pass
+    return target
+
+
+def _load_zipformer(model_override: str = "") -> None:
+    global _zipformer_recognizer
+    try:
+        import sherpa_onnx
+    except ImportError as e:
+        sys.exit(
+            f"[asr-srv] Missing sherpa-onnx dependency: {e}\n"
+            "Run: pip install sherpa-onnx"
+        )
+
+    d = _resolve_zipformer_dir(model_override)
+    print(f"[zipformer-ko] Loading model from {d!r}", flush=True)
+    _zipformer_recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+        encoder=os.path.join(d, "encoder-epoch-99-avg-1.onnx"),
+        decoder=os.path.join(d, "decoder-epoch-99-avg-1.onnx"),
+        joiner=os.path.join(d, "joiner-epoch-99-avg-1.onnx"),
+        tokens=os.path.join(d, "tokens.txt"),
+        num_threads=4,
+        decoding_method="greedy_search",
+        provider="cpu",
+        debug=False,
+    )
+
+
+def _infer_zipformer(audio_bytes: bytes) -> tuple[str, str, float]:
+    samples = _wav_to_float32(audio_bytes)
+    if len(samples) == 0:
+        return "", "ko", 0.9
+
+    stream = _zipformer_recognizer.create_stream()
+    stream.accept_waveform(sample_rate=16000, waveform=samples)
+    _zipformer_recognizer.decode_stream(stream)
+
+    text = (stream.result.text or "").strip()
+    # Korean-only model: language is always Korean. Empty text → treat as non-speech.
+    return text, "ko", (0.9 if not text else 0.1)
+
 # ── FastAPI endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -227,7 +318,10 @@ async def inference(
 ):
     audio_data = await file.read()
 
-    if _sv_model_path:
+    if _zipformer_recognizer is not None:
+        # Korean Zipformer backend — language/prompt/beam_size are not used
+        text, lang, no_speech_prob = _infer_zipformer(audio_data)
+    elif _sv_model_path:
         # SenseVoice backend — initial_prompt and beam_size are not used
         text, lang, no_speech_prob = _infer_sensevoice(audio_data, language)
     else:
@@ -281,7 +375,7 @@ def main() -> None:
     parser.add_argument(
         "--backend", "-b",
         default=os.environ.get("ASR_BACKEND", "whisper"),
-        choices=["whisper", "sensevoice"],
+        choices=["whisper", "sensevoice", "zipformer-ko"],
         help="ASR backend (env: ASR_BACKEND)",
     )
     parser.add_argument(
@@ -305,7 +399,11 @@ def main() -> None:
 
     global _ready
 
-    if args.backend == "sensevoice":
+    if args.backend == "zipformer-ko":
+        model_override = args.model or os.environ.get("ZIPFORMER_MODEL", "")
+        _load_zipformer(model_override)
+        print(f"[zipformer-ko] Ready on http://{args.host}:{args.port}", flush=True)
+    elif args.backend == "sensevoice":
         model_id = (
             args.model
             or os.environ.get("SENSEVOICE_MODEL",
@@ -316,7 +414,7 @@ def main() -> None:
     else:
         model_id = (
             args.model
-            or os.environ.get("WHISPER_MODEL", "Systran/faster-whisper-large-v3-turbo")
+            or os.environ.get("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
         )
         if model_id.endswith(".bin"):
             print(
@@ -324,7 +422,7 @@ def main() -> None:
                 "faster-whisper needs a HuggingFace repo id. Falling back to large-v3-turbo.",
                 flush=True,
             )
-            model_id = "Systran/faster-whisper-large-v3-turbo"
+            model_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
         _load_whisper(model_id, compute_type_override=args.compute_type)
         print(f"[whisper] Ready on http://{args.host}:{args.port}", flush=True)
 

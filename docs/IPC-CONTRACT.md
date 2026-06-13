@@ -90,9 +90,12 @@ interface EngineStatus {
   llamaGpuLayers: number;     // 0 = CPU, 36 = full RTX 3070
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
   musicMode: boolean;
+  asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
+  whisperModel: string;       // "turbo" | "large" (large-v3 int8_float16)
+  sensevoicePrecision: string;// "int8" | "fp32"
   captureTarget?: AudioProcess; // absent/null = system-wide loopback
   rms?: number;               // present only while capturing
-  message?: string;
+  message?: string;           // last process-loopback error (shown by ProcessPicker)
 }
 ```
 
@@ -129,6 +132,9 @@ interface PersistSettings {
   llamaGpuLayers: number;     // 0 = CPU, 36 = full GPU
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)
   musicMode: boolean;
+  asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
+  whisperModel: string;       // "turbo" | "large"
+  sensevoicePrecision: string;// "int8" | "fp32"
 }
 ```
 
@@ -140,6 +146,9 @@ All fields optional — only supplied keys are updated:
 interface SettingsPatch {
   subtitleOpacity?: number;
   llamaGpuLayers?: number;
+  asrBackend?: string;        // kills idle asr-srv so next Start relaunches with the new backend
+  whisperModel?: string;      // "turbo" | "large" — same relaunch behavior
+  sensevoicePrecision?: string; // "int8" | "fp32" — same relaunch behavior
   speechThreshold?: number;   // retained for API compat — no longer used by chunker
   overlay?: { x: number; y: number; w: number; h: number };
 }

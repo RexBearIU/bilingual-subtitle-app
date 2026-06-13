@@ -174,7 +174,7 @@ pub fn run() {
                 };
 
                 let escape = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
-                let escape_for_handler = escape.clone();
+                let escape_for_handler = escape;
                 app.handle().plugin(
                     tauri_plugin_global_shortcut::Builder::new()
                         .with_handler(move |app, shortcut, event| {

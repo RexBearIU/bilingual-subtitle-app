@@ -175,12 +175,9 @@ pub fn run_process_loopback(
                     None,
                 )
             };
-            match get_ok {
-                Err(e) => {
-                    log::warn!("IAudioCaptureClient::GetBuffer: {e}");
-                    break;
-                }
-                Ok(()) => {}
+            if let Err(e) = get_ok {
+                log::warn!("IAudioCaptureClient::GetBuffer: {e}");
+                break;
             }
 
             let bytes = unsafe {
@@ -267,7 +264,7 @@ fn activate_for_process(pid: u32) -> Result<IAudioClient, String> {
             // E_NOTIMPL (0x80004001): Windows has no active render stream for
             // this PID right now — the app must be playing audio when Start is clicked.
             if e.code() == windows::core::HRESULT(0x80004001_u32 as i32) {
-                format!("process loopback: 目標應用程式目前沒有音訊輸出，請先讓它播放聲音再按 Start")
+                "process loopback: 目標應用程式目前沒有音訊輸出，請先讓它播放聲音再按 Start".to_string()
             } else {
                 format!("process loopback activation failed: {e}")
             }

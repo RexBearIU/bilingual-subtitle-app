@@ -8,13 +8,9 @@ use crate::state::AppState;
 /// `Auto` lets Whisper detect per-chunk (best for multilingual streams).
 /// A specific code locks detection and slightly improves accuracy.
 /// Serialises as `"auto"` / `"zh"` / `"ko"` / `"en"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SourceHint { Auto, Zh, Ko, En }
-
-impl Default for SourceHint {
-    fn default() -> Self { SourceHint::Auto }
-}
+pub enum SourceHint { #[default] Auto, Zh, Ko, En }
 
 impl SourceHint {
     /// Returns the ISO-639-1 code to pass to Whisper, or `None` for auto-detect.
@@ -30,22 +26,19 @@ impl SourceHint {
 
 /// Target translation language, or `None` to show source text only.
 /// Serialises as `"none"` / `"zh"` / `"ko"` / `"en"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubtitleMode {
     /// Show source text only — no translation.
     #[serde(rename = "none")]
     NoTranslate,
     /// Translate everything to Traditional Chinese (繁體中文).
+    #[default]
     Zh,
     /// Translate everything to Korean (한국어).
     Ko,
     /// Translate everything to English.
     En,
-}
-
-impl Default for SubtitleMode {
-    fn default() -> Self { SubtitleMode::Zh }
 }
 
 impl SubtitleMode {
@@ -166,5 +159,52 @@ impl EngineStatus {
             rms: if s.captioning { Some(s.rms) } else { None },
             message: s.loopback_error.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_old_hand_written_impls() {
+        // Guards the derive(Default) refactor: SubtitleMode's default is Zh even
+        // though NoTranslate is the first variant, and SourceHint's is Auto.
+        assert_eq!(SubtitleMode::default(), SubtitleMode::Zh);
+        assert_eq!(SourceHint::default(), SourceHint::Auto);
+    }
+
+    #[test]
+    fn source_hint_lang_code() {
+        assert_eq!(SourceHint::Auto.lang_code(), None);
+        assert_eq!(SourceHint::Zh.lang_code(), Some("zh"));
+        assert_eq!(SourceHint::Ko.lang_code(), Some("ko"));
+        assert_eq!(SourceHint::En.lang_code(), Some("en"));
+    }
+
+    #[test]
+    fn subtitle_mode_target_lang_and_name() {
+        assert_eq!(SubtitleMode::NoTranslate.target_lang(), "");
+        assert_eq!(SubtitleMode::Zh.target_lang(), "zh");
+        assert_eq!(SubtitleMode::Ko.target_lang(), "ko");
+        assert_eq!(SubtitleMode::En.target_lang(), "en");
+        assert_eq!(SubtitleMode::NoTranslate.target_name(), "");
+        assert!(SubtitleMode::Zh.target_name().contains("繁體中文"));
+    }
+
+    #[test]
+    fn serde_uses_the_wire_names() {
+        // The frontend/IPC contract depends on these exact strings.
+        assert_eq!(serde_json::to_string(&SubtitleMode::NoTranslate).unwrap(), "\"none\"");
+        assert_eq!(serde_json::to_string(&SubtitleMode::Zh).unwrap(), "\"zh\"");
+        assert_eq!(serde_json::to_string(&SourceHint::Auto).unwrap(), "\"auto\"");
+        assert_eq!(
+            serde_json::from_str::<SubtitleMode>("\"none\"").unwrap(),
+            SubtitleMode::NoTranslate
+        );
+        assert_eq!(
+            serde_json::from_str::<SourceHint>("\"ko\"").unwrap(),
+            SourceHint::Ko
+        );
     }
 }
