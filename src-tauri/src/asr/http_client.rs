@@ -588,3 +588,56 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
     wav
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_lang_maps_names_codes_and_unknowns() {
+        assert_eq!(normalize_lang("korean"), "ko");
+        assert_eq!(normalize_lang("kor"), "ko");
+        assert_eq!(normalize_lang("ko"), "ko");
+        assert_eq!(normalize_lang("cantonese"), "zh");
+        assert_eq!(normalize_lang("mandarin"), "zh");
+        assert_eq!(normalize_lang("japanese"), "ja");
+        // Unknown 2-letter code passes through; anything else falls back to en.
+        assert_eq!(normalize_lang("de"), "de");
+        assert_eq!(normalize_lang("klingon"), "en");
+    }
+
+    #[test]
+    fn detect_script_lang_picks_the_dominant_script() {
+        assert_eq!(detect_script_lang("안녕하세요 여러분"), Some("ko"));
+        assert_eq!(detect_script_lang("你好世界"), Some("zh"));
+        // Any kana marks Japanese even mixed with kanji.
+        assert_eq!(detect_script_lang("こんにちは"), Some("ja"));
+        assert_eq!(detect_script_lang("日本語のテスト"), Some("ja"));
+        assert_eq!(detect_script_lang("hello world"), Some("en"));
+        // Too short / no clear majority → keep whisper's own guess.
+        assert_eq!(detect_script_lang("a"), None);
+    }
+
+    #[test]
+    fn is_hallucination_catches_event_tags_and_credits() {
+        assert!(is_hallucination("[Music]"));
+        assert!(is_hallucination("[음악]"));
+        assert!(is_hallucination("請訂閱我們的頻道"));
+        assert!(is_hallucination("Thanks for watching!"));
+        // Real speech must survive.
+        assert!(!is_hallucination("안녕하세요 여러분"));
+        assert!(!is_hallucination("Hello everyone, welcome back"));
+    }
+
+    #[test]
+    fn encode_wav_16bit_writes_a_valid_44_byte_header() {
+        let wav = encode_wav_16bit(&[0.0, 1.0, -1.0]);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(wav.len(), 44 + 3 * 2); // header + 3 i16 samples
+        // Full-scale samples clamp to the i16 range.
+        let last = i16::from_le_bytes([wav[44 + 4], wav[44 + 5]]);
+        assert_eq!(last, -32_767);
+    }
+}

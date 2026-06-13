@@ -161,3 +161,50 @@ impl EngineStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_old_hand_written_impls() {
+        // Guards the derive(Default) refactor: SubtitleMode's default is Zh even
+        // though NoTranslate is the first variant, and SourceHint's is Auto.
+        assert_eq!(SubtitleMode::default(), SubtitleMode::Zh);
+        assert_eq!(SourceHint::default(), SourceHint::Auto);
+    }
+
+    #[test]
+    fn source_hint_lang_code() {
+        assert_eq!(SourceHint::Auto.lang_code(), None);
+        assert_eq!(SourceHint::Zh.lang_code(), Some("zh"));
+        assert_eq!(SourceHint::Ko.lang_code(), Some("ko"));
+        assert_eq!(SourceHint::En.lang_code(), Some("en"));
+    }
+
+    #[test]
+    fn subtitle_mode_target_lang_and_name() {
+        assert_eq!(SubtitleMode::NoTranslate.target_lang(), "");
+        assert_eq!(SubtitleMode::Zh.target_lang(), "zh");
+        assert_eq!(SubtitleMode::Ko.target_lang(), "ko");
+        assert_eq!(SubtitleMode::En.target_lang(), "en");
+        assert_eq!(SubtitleMode::NoTranslate.target_name(), "");
+        assert!(SubtitleMode::Zh.target_name().contains("繁體中文"));
+    }
+
+    #[test]
+    fn serde_uses_the_wire_names() {
+        // The frontend/IPC contract depends on these exact strings.
+        assert_eq!(serde_json::to_string(&SubtitleMode::NoTranslate).unwrap(), "\"none\"");
+        assert_eq!(serde_json::to_string(&SubtitleMode::Zh).unwrap(), "\"zh\"");
+        assert_eq!(serde_json::to_string(&SourceHint::Auto).unwrap(), "\"auto\"");
+        assert_eq!(
+            serde_json::from_str::<SubtitleMode>("\"none\"").unwrap(),
+            SubtitleMode::NoTranslate
+        );
+        assert_eq!(
+            serde_json::from_str::<SourceHint>("\"ko\"").unwrap(),
+            SourceHint::Ko
+        );
+    }
+}
