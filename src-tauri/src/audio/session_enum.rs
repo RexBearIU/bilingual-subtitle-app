@@ -91,7 +91,7 @@ pub fn list_audio_processes() -> Result<Vec<AudioProcess>, String> {
         }
 
         // Sort by name for a consistent order.
-        results.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        results.sort_by_key(|p| p.name.to_lowercase());
         Ok(results)
     }
 }

@@ -50,7 +50,7 @@ pub fn start_captioning(
     {
         let mut proc = proc_db.lock().map_err(|e| e.to_string())?;
         let alive = proc.0.as_mut()
-            .map_or(false, |c| c.try_wait().ok().flatten().is_none());
+            .is_some_and(|c| c.try_wait().ok().flatten().is_none());
         if alive {
             log::info!("asr-srv already running — reusing");
         } else {
@@ -72,7 +72,7 @@ pub fn start_captioning(
     {
         let mut llam = llam_db.lock().map_err(|e| e.to_string())?;
         let alive = llam.0.as_mut()
-            .map_or(false, |c| c.try_wait().ok().flatten().is_none());
+            .is_some_and(|c| c.try_wait().ok().flatten().is_none());
         if alive {
             log::info!("llama-server already running — reusing");
         } else {
@@ -169,8 +169,8 @@ fn resolve_resource(env_var: &str, name: &str) -> String {
 /// Find the directory that contains the sidecar DLLs (e.g. cublas64_12.dll).
 ///
 /// - Release: DLLs are bundled alongside the exe, so exe_dir() is it.
-/// - Dev:     LLAMA_SERVER_BIN points to binaries/llama-server.exe;
-///            its parent directory is the binaries/ folder with all DLLs.
+/// - Dev: LLAMA_SERVER_BIN points to binaries/llama-server.exe; its parent
+///   directory is the binaries/ folder with all DLLs.
 fn find_dll_dir() -> Option<std::path::PathBuf> {
     // Release mode: DLLs are in the same directory as the app exe.
     if let Some(dir) = exe_dir() {

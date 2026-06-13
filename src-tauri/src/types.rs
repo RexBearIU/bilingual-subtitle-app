@@ -8,13 +8,9 @@ use crate::state::AppState;
 /// `Auto` lets Whisper detect per-chunk (best for multilingual streams).
 /// A specific code locks detection and slightly improves accuracy.
 /// Serialises as `"auto"` / `"zh"` / `"ko"` / `"en"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SourceHint { Auto, Zh, Ko, En }
-
-impl Default for SourceHint {
-    fn default() -> Self { SourceHint::Auto }
-}
+pub enum SourceHint { #[default] Auto, Zh, Ko, En }
 
 impl SourceHint {
     /// Returns the ISO-639-1 code to pass to Whisper, or `None` for auto-detect.
@@ -30,22 +26,19 @@ impl SourceHint {
 
 /// Target translation language, or `None` to show source text only.
 /// Serialises as `"none"` / `"zh"` / `"ko"` / `"en"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubtitleMode {
     /// Show source text only — no translation.
     #[serde(rename = "none")]
     NoTranslate,
     /// Translate everything to Traditional Chinese (繁體中文).
+    #[default]
     Zh,
     /// Translate everything to Korean (한국어).
     Ko,
     /// Translate everything to English.
     En,
-}
-
-impl Default for SubtitleMode {
-    fn default() -> Self { SubtitleMode::Zh }
 }
 
 impl SubtitleMode {

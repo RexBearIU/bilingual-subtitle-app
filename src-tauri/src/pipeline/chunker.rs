@@ -119,6 +119,9 @@ fn quietest_cut(buf: &[f32], target: usize) -> usize {
     best_start + WIN / 2
 }
 
+// The chunk fields plus logging metadata (seq, tag) genuinely belong here;
+// bundling them into a struct would only move the noise around.
+#[allow(clippy::too_many_arguments)]
 fn send_chunk(
     asr_tx: &SyncSender<AudioChunk>,
     samples: Vec<f32>,
