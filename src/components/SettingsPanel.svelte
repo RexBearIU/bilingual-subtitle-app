@@ -21,7 +21,11 @@
     await cmd.updateSettings({ llamaGpuLayers: llamaGpu > 0 ? 0 : 36 });
   }
   async function toggleAsr() {
-    await cmd.updateSettings({ asrBackend: asrBackend === 'sensevoice' ? 'whisper' : 'sensevoice' });
+    // Cycle: Whisper → SenseVoice → Zipformer-KO → Whisper
+    const next = asrBackend === 'whisper' ? 'sensevoice'
+               : asrBackend === 'sensevoice' ? 'zipformer-ko'
+               : 'whisper';
+    await cmd.updateSettings({ asrBackend: next });
   }
   async function toggleWhisperModel() {
     await cmd.updateSettings({ whisperModel: whisperModel === 'large' ? 'turbo' : 'large' });
@@ -59,10 +63,15 @@
     <!-- row: ASR backend -->
     <div class="row">
       <span class="label">辨識引擎</span>
-      <button class="gpu-btn" class:sv={asrBackend === 'sensevoice'} onclick={toggleAsr}>
-        {asrBackend === 'sensevoice' ? 'SenseVoice' : 'Whisper'}
+      <button class="gpu-btn"
+              class:sv={asrBackend === 'sensevoice'}
+              class:zip={asrBackend === 'zipformer-ko'}
+              onclick={toggleAsr}>
+        {asrBackend === 'sensevoice' ? 'SenseVoice'
+          : asrBackend === 'zipformer-ko' ? 'Zipformer-KO' : 'Whisper'}
       </button>
-      <span class="val hint-inline">{asrBackend === 'sensevoice' ? '韓文佳' : '預設'}</span>
+      <span class="val hint-inline">{asrBackend === 'sensevoice' ? '多語'
+        : asrBackend === 'zipformer-ko' ? '韓文快' : '預設'}</span>
     </div>
 
     {#if asrBackend === 'whisper'}
@@ -87,6 +96,10 @@
       <span class="val hint-inline">{sensevoicePrecision === 'fp32' ? '更精準' : '較快'}</span>
     </div>
     <p class="hint">float32：完整精度模型 (~220 MB)，準確率更高。切換後重新 Start 生效。</p>
+    {/if}
+
+    {#if asrBackend === 'zipformer-ko'}
+    <p class="hint">韓文專用 Zipformer：CPU 即時、完整轉錄、口語自然，外來語/夾英較弱。首次自動下載 (~110 MB)。需 sherpa-onnx 環境（同 SenseVoice）。</p>
     {/if}
 
     <p class="hint">切換引擎後重新 Start 生效。</p>
@@ -201,6 +214,7 @@
   .gpu-btn:hover { background: #334880; }
   .gpu-btn.cpu { background: #3a2a2a; border-color: #6a3a3a; color: #ffb0a0; }
   .gpu-btn.sv    { background: #2a4a3a; border-color: #3a7a5a; color: #90e8b0; }
+  .gpu-btn.zip   { background: #4a3a2a; border-color: #7a5a3a; color: #e8c090; }
   .gpu-btn.large { background: #3a2a6a; border-color: #5a4aaa; color: #c0a8ff; }
 
   .sub-row { padding-left: 28px; }

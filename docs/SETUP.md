@@ -13,12 +13,12 @@ Download from [python.org](https://www.python.org/downloads/) and tick
 ### 2 — Install faster-whisper and its dependencies
 
 ```powershell
-pip install faster-whisper fastapi uvicorn ctranslate2
+pip install faster-whisper fastapi uvicorn python-multipart ctranslate2
 ```
 
-> On first launch, the Whisper medium model (~1.5 GB) downloads automatically from
-> HuggingFace. This takes a few minutes. The ASR status dot will show **loading**
-> until the download is complete.
+> On first launch, the Whisper large-v3-turbo model (~1.5 GB) downloads
+> automatically from HuggingFace. This takes a few minutes. The ASR status dot
+> will show **loading** until the download is complete.
 
 ### 3 — Download the Qwen3-4B translation model
 
@@ -107,7 +107,7 @@ The ASR backend is `asr_srv.py` — a Python HTTP server that supports two backe
 python --version   # expect 3.10+
 
 # whisper backend
-pip install faster-whisper fastapi uvicorn ctranslate2
+pip install faster-whisper fastapi uvicorn python-multipart ctranslate2
 
 # sensevoice backend (additional)
 pip install sherpa-onnx
@@ -120,7 +120,7 @@ pip install sherpa-onnx
 | `PYTHON_BIN` | `python` | Python interpreter |
 | `ASR_BACKEND` | `whisper` | `whisper` or `sensevoice` |
 | `ASR_SERVER_SCRIPT` | `asr_srv.py` | Path to the server script |
-| `WHISPER_MODEL` | `Systran/faster-whisper-large-v3-turbo` | HuggingFace repo ID (whisper backend) |
+| `WHISPER_MODEL` | `deepdml/faster-whisper-large-v3-turbo-ct2` | HuggingFace repo ID (whisper backend) |
 | `SENSEVOICE_MODEL` | `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | HuggingFace repo ID (sensevoice backend) |
 | `ASR_PORT` | `9001` | HTTP port |
 
@@ -128,7 +128,7 @@ pip install sherpa-onnx
 $proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
 
 # To use whisper backend (default):
-[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL", "Systran/faster-whisper-large-v3-turbo", "User")
+[System.Environment]::SetEnvironmentVariable("WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2", "User")
 
 # To switch to SenseVoice (better Korean):
 [System.Environment]::SetEnvironmentVariable("ASR_BACKEND", "sensevoice", "User")
@@ -146,15 +146,29 @@ Invoke-WebRequest http://127.0.0.1:9001/   # should return 200
 
 **Whisper model options:**
 
-| Model | Size | Notes |
-|-------|------|-------|
-| `Systran/faster-whisper-small` | ~500 MB | Fastest, lower accuracy |
-| `Systran/faster-whisper-large-v3-turbo` | ~1.5 GB | **Default** — good balance |
-| `Systran/faster-whisper-large-v3` | ~3 GB | Best quality |
+| Model | Download | VRAM | Notes |
+|-------|----------|------|-------|
+| `deepdml/faster-whisper-large-v3-turbo-ct2` | ~1.5 GB | ~1.6 GB fp16 | **Default ("turbo")** — public mirror (Systran turbo repo is now HF-gated) |
+| `Systran/faster-whisper-large-v3` | ~3 GB | ~1.5 GB int8_float16 | **"large" in settings** — best quality, esp. Korean |
+
+The settings panel cycles the **辨識引擎** button through **Whisper →
+SenseVoice → Zipformer-KO**, and switches **turbo / large** (whisper) and
+**int8 / fp32** (SenseVoice) without env vars — the idle asr-srv is killed and
+relaunched with the new model on the next Start. A `WHISPER_MODEL` env var
+overrides the whisper choice.
+
+**Korean Zipformer backend (`zipformer-ko`):** a Korean-only sherpa-onnx
+transducer (KsponSpeech). CPU real-time (~0.25 s for 25 s), full-length
+transcription, natural conversational Korean; weaker than whisper large-v3 on
+loanwords / code-switching. The model (~110 MB) auto-downloads on first Start to
+`~/.cache/bilingual-subtitle/`; set `ZIPFORMER_MODEL` to a local model directory
+to override. **Shares the sherpa-onnx runtime with SenseVoice**, so `PYTHON_BIN`
+must point at a Python with `sherpa-onnx`, `fastapi`, `uvicorn`, and
+`python-multipart` installed (the whisper backend instead needs `faster-whisper`).
 
 **GPU acceleration:** faster-whisper uses CTranslate2 with CUDA automatically when
-an NVIDIA GPU is present.  SenseVoice runs on CPU (INT8 ONNX) and is already ~70x
-faster than real-time, so GPU is not needed for that backend.
+an NVIDIA GPU is present.  SenseVoice and Zipformer-KO run on CPU (ONNX) and are
+already faster than real-time, so GPU is not needed for those backends.
 
 ### llama-server (translation, M5)
 

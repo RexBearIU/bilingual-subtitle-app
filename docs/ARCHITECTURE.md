@@ -6,18 +6,17 @@
 Windows default output device (or specific process via Process Loopback API)
         │  WASAPI loopback / Process Loopback (shared mode)
         ▼
-[capture thread]  f32 interleaved @ device rate / channels
+[capture thread]  AudioPump: bytes → f32 → every 200 ms RMS + resample
         ▼
 [resample]  → 16 kHz mono f32
         ▼
-[chunker worker]  fixed-size accumulator (4 s video / 10 s music mode)
-        │  emits complete chunks; no VAD gating
+[chunker worker]  graduated silence flush / 6 s cap / rolling partials
         ▼
-[ASR worker]  faster-whisper (Python HTTP sidecar)
-        │  → { text, lang(ko|en|zh), no_speech_prob }
-        │  filters: no_speech_prob ≥ 0.7, hallucination blocklist, consecutive-repeat
+[ASR worker]  faster-whisper (Python HTTP sidecar); coalesces stale partials
+        │  → { text, lang(ko|en|zh|ja), no_speech_prob }
+        │  filters: no_speech_prob ≥ 0.7, blocklist, repeat-loop, script-based lang fix
         ▼
-[Translation worker]  llama-server (Qwen3-4B, Vulkan GPU)
+[Translation worker]  llama-server (Qwen3-4B, Vulkan GPU); newest-first under backlog
         │  → target-language subtitle text (single language per mode)
         ▼
 [Subtitle state manager]  dedup by id / partial→final merge / expiry pruning
@@ -31,19 +30,22 @@ Svelte transparent overlay (render-only)
 ## Thread / channel model
 
 Each stage is its own worker, connected by **bounded channels**. Back-pressure
-policy: **drop stale chunks** rather than block, so realtime latency is preserved
-when a stage falls behind.
+policy — when a stage falls behind, sacrifice the right thing:
 
 ```text
-capture(thread) ──► chunker(worker) ──►[sync_channel(4)]──► asr(worker)
-   ──►[sync_channel(2)]──► translate(worker) ──► state mgr ──► emit
+capture(thread) ──► chunker(worker) ──►[sync_channel(8)]──► asr(worker)
+   ──►[sync_channel(4)]──► translate(worker) ──► state mgr ──► emit
 ```
 
 - Models (whisper, llama) are **loaded once** and kept resident for the whole
   session. Sidecars stay alive across Stop/Start cycles — no model reload.
 - Capture→chunker is an unbounded `mpsc::channel` (chunker is fast — pure accumulation).
-- Chunker→ASR is `sync_channel(4)` — drops audio chunks if ASR is saturated.
-- ASR→translate is `sync_channel(2)` — drops translation requests if LLM is busy.
+- Chunker→ASR: **partials** use `try_send` and are dropped when full (disposable
+  previews); **finals** use blocking `send` — a lost final is a lost subtitle.
+- ASR worker **coalesces its backlog**: any partial with a newer chunk queued
+  behind it is skipped without inference.
+- Translation worker under backlog **skips to the newest request** — the visible
+  line going untranslated is worse than an old line keeping its source text.
 - No unbounded queues anywhere → no memory growth over long sessions.
 
 ## Process topology
@@ -75,54 +77,61 @@ mode = "none" → source text only, no translation call
 If the detected source language already matches the target, the translation worker
 emits the source text as-is (no LLM call needed).
 
-## Fixed-chunk audio pipeline
+## Chunking (graduated silence flush + rolling partials)
 
-The chunker (`pipeline/chunker.rs`) accumulates resampled 16 kHz mono samples and
-emits two-phase chunks per utterance — no RMS-based VAD gating.
+The chunker (`pipeline/chunker.rs`) accumulates resampled 16 kHz mono samples.
 
 **Video / stream mode (default):**
-1. **Partial flush** — after 1 s (16 000 samples) a partial chunk (`is_partial=true`,
-   beam_size=1) is sent immediately. ASR starts while the speaker is still talking,
-   showing a preliminary subtitle ~1.5 s from speech start.
-2. **Final flush** — triggered by silence (≥ 400 ms of RMS < 0.005) or the 4 s cap.
-   Sends remaining samples (`is_partial=false`, beam_size=5). ASR updates the
-   subtitle with the accurate result and triggers translation.
+1. **Rolling partial flush** — after 1 s a copy of the buffer is sent
+   (`is_partial=true`, beam_size=1), then an updated copy every further 1.5 s
+   while the utterance continues. On-screen text keeps refreshing during long
+   utterances; the buffer is never drained by a partial.
+2. **Final flush** — triggered by the **graduated silence rule** or the 6 s cap.
+   The more audio buffered, the shorter the pause needed to cut:
+
+   | buffered audio | silence required |
+   |---|---|
+   | < 1.5 s | 800 ms (no micro-fragments from a breath) |
+   | 1.5 – 2.5 s | 400 ms |
+   | ≥ 2.5 s | 200 ms (cut at the first real dip) |
+
+   The 6 s cap is only reached by pause-less speech (fast talkers), where the
+   longer Whisper context helps most. A cap cut lands on the **quietest 50 ms
+   window** in the last 1.5 s (not mid-word); the remainder seeds the next
+   utterance.
 
 **Music mode:** fixed 10 s chunks, no partial flush, beam_size=3 + "Song lyrics:" prompt.
 
-**Silence detection:** RMS below `SILENCE_RMS = 0.005` (≈ −46 dBFS) for
-`SILENCE_FRAMES = 2` consecutive ~200 ms input blocks. Falls back to 4 s cap
-when background music prevents the threshold from being reached.
-
-**Whisper-level silence filter:** chunks where `no_speech_prob ≥ 0.7` are dropped
-by the ASR worker — more reliable than RMS for video/stream content (see ADR-0009).
-
-A stop-flush sends any accumulator ≥ 0.5 s to ASR when `stop_captioning` is called.
-
-The `speech_threshold` setting is retained in `AppState` / `PersistSettings` /
-`EngineStatus` for API compatibility but is no longer read by the chunker.
+Pure-silence buffers are discarded without an ASR call. A stop-flush sends any
+accumulator ≥ 0.5 s when `stop_captioning` is called. The `speech_threshold`
+setting is retained in IPC types for API compatibility but is no longer read.
 
 ## ASR worker
 
-Uses `Systran/faster-whisper-large-v3-turbo` by default (configurable via
-`WHISPER_MODEL` env var). Runs on CUDA float16 when a GPU is detected.
+Default model `deepdml/faster-whisper-large-v3-turbo-ct2` (public ct2 mirror; the
+original `Systran/faster-whisper-large-v3-turbo` repo is now HF-gated); the settings UI can switch
+to `large-v3` (quantised `int8_float16`, ~1.5 GB VRAM). Env `WHISPER_MODEL`
+overrides both. Runs on CUDA float16 when a GPU is detected; `without_timestamps`
+is enabled (timestamps unused downstream, fewer hallucinations).
 
 **beam_size strategy:**
 - Partial chunks → beam_size=1 (greedy, fast preview)
 - Final chunks (video) → beam_size=5 (accurate)
 - Music mode → beam_size=3
 
-**Consecutive-repeat filter:** suppresses exact repetition of the previous valid
-segment (short texts < 60 chars) to prevent `initial_prompt` feedback loops.
-Exception: a final chunk that completes a partial of the same utterance is exempt
-— the partial and final naturally produce the same text for short sentences.
+**Script-based language correction:** Whisper's per-chunk language claim is
+unreliable on short audio (Korean text labeled "en"). The dominant script of the
+*output text* (Hangul/Han/Kana/Latin) overrides the claimed language when they
+disagree, so translation prompts always carry the right source language.
 
 ## Translation worker
 
-Uses Qwen3-4B via `llama-server` (Vulkan GPU). Prompt is language-pair aware:
-Korean source adds brief rules (keep English loanwords, phonetic name
-transliteration, match formal/casual register). All modes use `/no_think` to
-suppress chain-of-thought and output the translation directly.
+Uses Qwen3-4B via `llama-server` (Vulkan GPU, `-c 2048`). The last **3
+(source → translation) pairs** are replayed as chat turns for cross-subtitle
+continuity (names, loanwords, omitted Korean subjects). The system prompt covers
+ASR-error tolerance (no fragment completion), multi-speaker dash separation, and
+a lyric register in music mode. Korean source adds loanword/name/register rules.
+All modes use `/no_think`. Punctuation-only inputs skip the LLM round-trip.
 
 ## Per-process capture
 
@@ -132,16 +141,24 @@ the Windows **Process Loopback API** (`ActivateAudioInterfaceAsync` +
 process tree. Falls back to system-wide WASAPI loopback when no target is set.
 Requires Windows 10 Build 20348 or Windows 11.
 
+Chromium browsers recycle the audio-renderer subprocess that owns the WASAPI
+session, so the picked PID can go stale; activating a dead PID fails with
+`E_NOTIMPL`. Defences (in order): session enumeration lists **active** sessions
+only; the PID is **re-resolved at Start**; one recovery retry re-enumerates; then
+system loopback with the error stored in `AppState.loopback_error` for the UI.
+
 ## Hallucination filtering
 
-The ASR worker applies two layers before emitting any subtitle:
+The ASR worker applies three layers before emitting any subtitle:
 
 1. **`no_speech_prob` filter** — faster-whisper returns a per-segment probability
    that the audio contains no speech. Segments with mean ≥ 0.7 are dropped.
 2. **Blocklist filter** — known hallucination phrases (YouTube credits, `[Music]`,
    `[BLANK_AUDIO]`, etc.) are blocked by substring match.
-3. **Consecutive-repeat filter** — exact repetition of the last valid segment
-   (for short texts < 60 chars) indicates a `initial_prompt` feedback loop.
+3. **Repeat-loop filter** — *one* consecutive exact repeat is allowed (real
+   echoed replies like "네." / "네." between speakers); the second consecutive
+   repeat (< 60 chars) marks an `initial_prompt` feedback loop and is suppressed.
+   Finals completing a partial of the same utterance are exempt.
 
 ## Backend module layout
 
@@ -150,22 +167,23 @@ src-tauri/src/
 ├─ main.rs                    # Tauri builder entry point
 ├─ lib.rs                     # setup: managed state, tray, shortcuts, log filters
 ├─ commands.rs                # #[tauri::command] handlers; sidecar launch + kill_port()
-├─ state.rs                   # AppState + AsrProc + LlamaProc managed state
+├─ state.rs                   # AppState + update_and_emit/read_state helpers + AsrProc/LlamaProc
 ├─ types.rs                   # Shared IPC types (SubtitleMode, EngineStatus, …)
 ├─ settings.rs                # PersistSettings + OverlayRect; JSON file I/O
+├─ util.rs                    # wait_for_http_ok (sidecar readiness polling)
 ├─ pipeline/
 │  ├─ mod.rs                  # pub mod chunker
-│  └─ chunker.rs              # Fixed-chunk accumulator (4 s video / 10 s music)
+│  └─ chunker.rs              # Graduated silence flush / 6 s cap / rolling partials
 ├─ audio/
 │  ├─ mod.rs
-│  ├─ capture.rs              # WASAPI system-wide loopback (wasapi crate)
+│  ├─ capture.rs              # System loopback + AudioPump (shared capture plumbing)
 │  ├─ process_loopback.rs     # Per-process loopback (Windows Process Loopback API)
-│  ├─ session_enum.rs         # List active audio sessions (for process picker)
+│  ├─ session_enum.rs         # List ACTIVE audio sessions (for process picker)
 │  ├─ resample.rs             # → 16 kHz mono (rubato SincFixedIn)
 │  └─ meter.rs                # RMS helper (used for UI level meter)
 ├─ asr/
 │  ├─ mod.rs                  # AudioChunk type
-│  └─ http_client.rs          # ASR HTTP client; hallucination filters
+│  └─ http_client.rs          # ASR HTTP client; filters; backlog coalescing
 └─ translate/
    ├─ mod.rs                  # TranslationRequest type
    └─ llama_server.rs         # llama-server HTTP client (OpenAI-compatible)

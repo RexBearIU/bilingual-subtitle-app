@@ -243,7 +243,7 @@ fn kill_port(port: u16) {
 /// Script path: env `ASR_SERVER_SCRIPT`   → exe-dir/asr_srv.py → cwd.
 ///              (also accepts legacy `WHISPER_SERVER_SCRIPT`)
 /// Backend:     `backend_override` (from AppState/settings) → env `ASR_BACKEND` → `whisper`.
-/// Model:       env `WHISPER_MODEL`       → `Systran/faster-whisper-large-v3-turbo`
+/// Model:       env `WHISPER_MODEL`       → `deepdml/faster-whisper-large-v3-turbo-ct2`
 ///              env `SENSEVOICE_MODEL`    → sherpa-onnx SenseVoice HF repo id
 /// Port:        env `ASR_PORT`            → 9001  (also accepts legacy `WHISPER_ASR_PORT`).
 fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precision: &str) -> Result<std::process::Child, String> {
@@ -268,10 +268,10 @@ fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precis
     };
     // Resolve model and optional extra CLI args (compute-type, sv-precision).
     // WHISPER_MODEL / SENSEVOICE_MODEL env vars override the UI setting.
-    let env_model = if backend == "sensevoice" {
-        std::env::var("SENSEVOICE_MODEL").unwrap_or_default()
-    } else {
-        std::env::var("WHISPER_MODEL").unwrap_or_default()
+    let env_model = match backend.as_str() {
+        "sensevoice" => std::env::var("SENSEVOICE_MODEL").unwrap_or_default(),
+        "zipformer-ko" => std::env::var("ZIPFORMER_MODEL").unwrap_or_default(),
+        _ => std::env::var("WHISPER_MODEL").unwrap_or_default(),
     };
 
     let (model, apply_size_setting) = if backend == "sensevoice" {
@@ -281,6 +281,11 @@ fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precis
             env_model.clone()
         };
         (m, env_model.is_empty())
+    } else if backend == "zipformer-ko" {
+        // Korean Zipformer transducer (sherpa-onnx). Empty model => the Python
+        // server auto-downloads the default model; ZIPFORMER_MODEL may point at a
+        // local model directory to override.
+        (env_model.clone(), false)
     } else {
         if env_model.is_empty() || env_model.ends_with(".bin") {
             if !env_model.is_empty() {
@@ -290,7 +295,10 @@ fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precis
             let repo = if whisper_model_size == "large" {
                 "Systran/faster-whisper-large-v3"
             } else {
-                "Systran/faster-whisper-large-v3-turbo"
+                // Public ct2 mirror of large-v3-turbo. The original
+                // Systran/faster-whisper-large-v3-turbo repo is now HF-gated
+                // (returns 401 on fresh download); this mirror is the same model.
+                "deepdml/faster-whisper-large-v3-turbo-ct2"
             };
             (repo.to_string(), true)
         } else {
@@ -304,13 +312,13 @@ fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precis
     log::info!("launching asr-srv: python={python}  script={script}  backend={backend}  model={model}  port={port}");
 
     let mut cmd = std::process::Command::new(&python);
-    cmd.args([
-        script.as_str(),
-        "--backend", &backend,
-        "--model", &model,
-        "--host", "127.0.0.1",
-        "--port", &port,
-    ]);
+    cmd.args([script.as_str(), "--backend", &backend]);
+    // Pass --model only when we have one. zipformer-ko with an empty model lets
+    // the Python server auto-download its default Korean model.
+    if !model.is_empty() {
+        cmd.args(["--model", &model]);
+    }
+    cmd.args(["--host", "127.0.0.1", "--port", &port]);
 
     // Quantize large-v3 to int8_float16 on GPU to keep VRAM ~1.5 GB instead of ~3 GB.
     if backend != "sensevoice" && apply_size_setting && whisper_model_size == "large" {
@@ -587,7 +595,11 @@ pub fn update_settings(
         }
         if let Some(ref backend) = patch.asr_backend {
             let backend = backend.trim().to_lowercase();
-            let backend = if backend == "sensevoice" { "sensevoice" } else { "whisper" };
+            let backend = match backend.as_str() {
+                "sensevoice" => "sensevoice",
+                "zipformer-ko" => "zipformer-ko",
+                _ => "whisper",
+            };
             if s.asr_backend != backend {
                 log::info!("settings: asr_backend → {backend}");
                 s.asr_backend = backend.into();

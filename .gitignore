@@ -20,6 +20,15 @@ dist-ssr
 # SenseVoice funasr venv (replaced by sherpa-onnx, no longer needed)
 .venv-sensevoice/
 
+# Phase-2 benchmark artifacts (keep the .py scripts + README, ignore data/models)
+bench/models/
+bench/out*/
+bench/*.wav
+bench/*.txt
+bench/*.json
+bench/*.log
+bench/_*
+
 # Local dev launcher (personal convenience script)
 dev.bat
 
