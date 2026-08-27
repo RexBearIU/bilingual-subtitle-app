@@ -57,6 +57,10 @@ fn apply_dotenv(contents: &str) {
 /// mutating the process environment.
 fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    // PowerShell's `Set-Content -Encoding utf8` writes a BOM on some versions,
+    // and U+FEFF is not whitespace, so it would otherwise glue itself to the
+    // first key and silently break that one variable.
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -121,6 +125,12 @@ mod tests {
                 ("SPACED".into(), "value".into()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_dotenv_ignores_a_leading_bom() {
+        let pairs = parse_dotenv("\u{feff}TRANSLATE_AISTUDIO_API_KEY=abc\n");
+        assert_eq!(pairs, vec![("TRANSLATE_AISTUDIO_API_KEY".into(), "abc".into())]);
     }
 
     #[test]

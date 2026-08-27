@@ -153,7 +153,7 @@ impl EngineStatus {
             always_on_top: s.always_on_top,
             subtitle_opacity: s.subtitle_opacity,
             openrouter_model: if s.openrouter_model.is_empty() {
-                crate::translate::DEFAULT_MODEL.to_string()
+                crate::translate::default_model().to_string()
             } else {
                 s.openrouter_model.clone()
             },

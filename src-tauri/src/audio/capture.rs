@@ -62,7 +62,7 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     // back to when an individual translation call fails.
     match translate::RemoteConfig::resolve(&app) {
         Ok(cfg) => {
-            translate::openrouter::start_translate_worker(
+            translate::remote::start_translate_worker(
                 tl_rx, app.clone(), cfg, Arc::clone(&stop),
             );
         }

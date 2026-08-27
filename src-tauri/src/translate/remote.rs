@@ -1,11 +1,16 @@
-//! OpenRouter chat-completions client.
+//! Hosted chat-completions client for any OpenAI-compatible endpoint.
 //!
-//! Receives `TranslationRequest`s from the ASR worker, calls OpenRouter's
-//! /v1/chat/completions endpoint with a subtitle-style prompt, and emits
+//! Receives `TranslationRequest`s from the ASR worker, calls
+//! `/chat/completions` with a subtitle-style prompt, and emits
 //! `subtitle_update` events with the translated text.
 //!
 //! Replaces the former local llama-server sidecar (ADR-0011): no model weights,
 //! no GPU offload, no child process — just an HTTP call to a hosted model.
+//!
+//! The provider is configuration, not code (see `translate::RemoteConfig`).
+//! Several can be listed; the worker falls forward to the next one when the
+//! active endpoint keeps failing, so one provider's outage or rate limit does
+//! not take subtitles down with it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,7 +18,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
 use crate::state;
-use crate::translate::{RemoteConfig, TranslationRequest};
+use crate::translate::{Provider, RemoteConfig, TranslationRequest};
 use crate::types::{SubtitleMode, SubtitleTexts, SubtitleUpdate};
 
 /// Per-request ceiling.  Subtitles are short; anything slower than this has
@@ -45,7 +50,7 @@ fn translate_loop(
     cfg: &RemoteConfig,
     stop: &Arc<AtomicBool>,
 ) {
-    log::info!("TL: OpenRouter model={} base={}", cfg.model, cfg.base_url);
+    log::info!("TL: providers {}", cfg.names());
     set_tl_status(app, "loading");
 
     let agent = ureq::AgentBuilder::new()
@@ -53,27 +58,44 @@ fn translate_loop(
         .timeout_read(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build();
 
-    // Validate the key up front so a bad/missing key surfaces as an engine
-    // error immediately, instead of every subtitle silently failing later.
-    match check_credentials(&agent, cfg) {
-        Ok(()) => log::info!("TL: OpenRouter key OK"),
-        Err(CredError::Unauthorized) => {
-            log::error!(
-                "TL: OpenRouter rejected the API key (401) \
-                 — set OPENROUTER_API_KEY or openrouterApiKey in settings.json"
-            );
-            set_tl_status(app, "error");
-            return;
+    // Start on the first provider whose key is accepted, so a stale key in the
+    // first slot costs one startup check rather than every subtitle.
+    let mut active = 0usize;
+    let mut rejected = 0usize;
+    for (i, p) in cfg.providers.iter().enumerate() {
+        match check_credentials(&agent, p) {
+            Ok(()) => {
+                log::info!("TL: {} key OK", p.name);
+                active = i;
+                break;
+            }
+            Err(CredError::Unauthorized) => {
+                log::error!("TL: {} rejected the API key (401)", p.name);
+                rejected += 1;
+            }
+            // A transient network failure at startup should not disable
+            // translation — carry on and let per-request retries handle it.
+            Err(CredError::Other(e)) => {
+                log::warn!("TL: {} key check inconclusive ({e}) — using it anyway", p.name);
+                active = i;
+                break;
+            }
         }
-        // A transient network failure at startup should not disable translation
-        // for the whole session — carry on and let per-request retries handle it.
-        Err(CredError::Other(e)) => {
-            log::warn!("TL: key check inconclusive ({e}) — continuing anyway");
-        }
+    }
+    if rejected == cfg.providers.len() {
+        log::error!(
+            "TL: every provider rejected its key — check TRANSLATE_<NAME>_API_KEY / \
+             OPENROUTER_API_KEY, or the key in Settings"
+        );
+        set_tl_status(app, "error");
+        return;
     }
     set_tl_status(app, "ready");
 
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    /// Consecutive failures on the active provider before falling forward.
+    /// Two, not one: a single 429 or blip is what the per-request retry is for.
+    const FAILOVER_AFTER: u32 = 2;
+    let mut consecutive_failures = 0u32;
     // Rolling context: the last few successful (source, translated) pairs,
     // injected as prior chat turns.  Gives the model cross-subtitle context —
     // pronouns, names, and topic continuity — which matters a lot for Korean,
@@ -151,10 +173,12 @@ fn translate_loop(
             .map(|(s, t)| (s.as_str(), t.as_str()))
             .collect();
         let t_tl = std::time::Instant::now();
+        let provider = &cfg.providers[active];
         match call_translate(
-            &agent, &url, cfg, &req.source_lang, &req.source_text, req.mode, &prev, music_mode,
+            &agent, provider, cfg, &req.source_lang, &req.source_text, req.mode, &prev, music_mode,
         ) {
             Ok(translated) => {
+                consecutive_failures = 0;
                 let tl_ms = t_tl.elapsed().as_millis();
                 log::info!("TL [{} → {}] {tl_ms}ms → {:?}", req.source_lang, req.mode.target_lang(), translated);
                 if history.len() == CTX_PAIRS {
@@ -168,6 +192,22 @@ fn translate_loop(
                 log::warn!("TL [{} {tl_ms}ms] error: {e}", req.source_lang);
                 // Don't emit — the source-only subtitle (emitted by ASR worker)
                 // stays on screen.
+
+                // Fall forward once the active provider looks genuinely down
+                // rather than briefly unlucky. Cheap and stateless: the next
+                // success on the new provider resets the counter, and nothing
+                // pins us there, so a later rotation can come back around.
+                consecutive_failures += 1;
+                if consecutive_failures >= FAILOVER_AFTER && cfg.providers.len() > 1 {
+                    let next = (active + 1) % cfg.providers.len();
+                    log::warn!(
+                        "TL: {} failed {consecutive_failures}x — switching to {}",
+                        cfg.providers[active].name,
+                        cfg.providers[next].name,
+                    );
+                    active = next;
+                    consecutive_failures = 0;
+                }
             }
         }
     }
@@ -183,16 +223,21 @@ enum CredError {
     Other(String),
 }
 
-/// GET /key — confirms the key is valid before the first subtitle arrives.
-fn check_credentials(agent: &ureq::Agent, cfg: &RemoteConfig) -> Result<(), CredError> {
-    let url = format!("{}/key", cfg.base_url.trim_end_matches('/'));
+/// Authenticated GET /models — catches a bad key before the first subtitle.
+///
+/// `/models` rather than OpenRouter's `/key`, because it is the one listing
+/// endpoint every OpenAI-compatible provider exposes. The trade-off: OpenRouter
+/// serves `/models` unauthenticated, so a bad key there passes this check and
+/// surfaces on the first real request instead. Google's endpoint does reject it.
+fn check_credentials(agent: &ureq::Agent, provider: &Provider) -> Result<(), CredError> {
     match agent
-        .get(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.api_key))
+        .get(&provider.key_url())
+        .set("Authorization", &format!("Bearer {}", provider.api_key))
         .call()
     {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(401, _)) => Err(CredError::Unauthorized),
+        // 403 as well as 401: Google answers an invalid key with PERMISSION_DENIED.
+        Err(ureq::Error::Status(401 | 403, _)) => Err(CredError::Unauthorized),
         Err(e) => Err(CredError::Other(e.to_string())),
     }
 }
@@ -238,7 +283,7 @@ fn build_system_prompt(source_lang: &str, target_name: &str, music_mode: bool) -
 #[allow(clippy::too_many_arguments)]
 fn call_translate(
     agent: &ureq::Agent,
-    url: &str,
+    provider: &Provider,
     cfg: &RemoteConfig,
     source_lang: &str,
     text: &str,
@@ -270,23 +315,26 @@ fn call_translate(
     messages.push(serde_json::json!({ "role": "user", "content": &user }));
 
     let mut body = serde_json::json!({
-        "model": cfg.model,
+        "model": provider.model,
         "messages": messages,
         "max_tokens": 200,
         "temperature": 0,
-        // Subtitles must not wait on a reasoning preamble.  Models that ignore
-        // this are handled by strip_think_tags below; models that REFUSE it
-        // (400 "Reasoning is mandatory") are retried without the field by
-        // post_with_retry.
-        "reasoning": { "enabled": false },
     });
+    // Subtitles must not wait on a reasoning preamble.  Models that ignore this
+    // are handled by strip_think_tags below.  Endpoints that REFUSE the field
+    // (400 "Reasoning is mandatory", and Google's compat layer, which rejects it
+    // outright) get it dropped by post_with_retry — and remembered, so only the
+    // first subtitle of the session pays for that discovery.
+    if !provider.reasoning_unsupported.load(Ordering::Relaxed) {
+        body["reasoning"] = serde_json::json!({ "enabled": false });
+    }
     // Let the user pin specific upstream providers (e.g. to force a low-latency
-    // one) without a code change.
-    if let Some(order) = &cfg.provider_order {
+    // one) without a code change.  OpenRouter-specific; ignored elsewhere.
+    if let Some(order) = &provider.provider_order {
         body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": true });
     }
 
-    let json = post_with_retry(agent, url, cfg, &body)?;
+    let json = post_with_retry(agent, provider, cfg, &body)?;
 
     let raw = json
         .pointer("/choices/0/message/content")
@@ -312,7 +360,7 @@ fn call_translate(
                 "TL empty content for [{source_lang}] {text:?}: {} spent the token budget on \
                  {reasoning_len} chars of reasoning. Switch to a non-reasoning model — \
                  subtitles cannot afford it.",
-                cfg.model
+                provider.model
             );
         } else {
             // Dump full response to help diagnose empty-translation bugs.
@@ -336,19 +384,21 @@ fn call_translate(
 /// through so the error reaches the log instead of being retried pointlessly.
 fn post_with_retry(
     agent: &ureq::Agent,
-    url: &str,
+    provider: &Provider,
     cfg: &RemoteConfig,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     const RETRY_DELAY_MS: u64 = 250;
+    let url = provider.completions_url();
+    let reasoning_unsupported = &provider.reasoning_unsupported;
     let mut body = body.clone();
     let mut dropped_reasoning = false;
     let mut attempt = 0;
     loop {
         let mut req = agent
-            .post(url)
+            .post(&url)
             .set("Content-Type", "application/json")
-            .set("Authorization", &format!("Bearer {}", cfg.api_key));
+            .set("Authorization", &format!("Bearer {}", provider.api_key));
         // Optional attribution headers — they place the app on OpenRouter's
         // leaderboards and are ignored when absent.
         if let Some(r) = &cfg.referer {
@@ -377,12 +427,19 @@ fn post_with_retry(
                     if let Some(obj) = body.as_object_mut() {
                         obj.remove("reasoning");
                     }
-                    log::warn!(
-                        "TL: {} rejects reasoning.enabled=false — retrying without it. \
-                         Note it will spend max_tokens on reasoning, which can leave the \
-                         translation empty; prefer a non-reasoning model for subtitles.",
-                        cfg.model
-                    );
+                    // Remember it for the rest of the session. Google's
+                    // OpenAI-compatible endpoint rejects the field on EVERY
+                    // call, so without this every subtitle would pay two round
+                    // trips instead of one.
+                    if !reasoning_unsupported.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "TL: {} ({}) rejects reasoning.enabled=false — dropping it for the \
+                             rest of this session. If the model reasons anyway it will spend \
+                             max_tokens thinking, which can leave the translation empty.",
+                            provider.name,
+                            provider.model
+                        );
+                    }
                     continue;
                 }
 
