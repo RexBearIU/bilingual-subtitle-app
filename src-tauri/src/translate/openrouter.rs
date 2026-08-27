@@ -1,11 +1,11 @@
-//! llama-server HTTP client (OpenAI-compatible API).
+//! OpenRouter chat-completions client.
 //!
-//! Receives `TranslationRequest`s from the ASR worker, calls the
+//! Receives `TranslationRequest`s from the ASR worker, calls OpenRouter's
 //! /v1/chat/completions endpoint with a subtitle-style prompt, and emits
-//! `subtitle_update` events with the translated Chinese text.
+//! `subtitle_update` events with the translated text.
 //!
-//! Uses Qwen3's `/no_think` directive to suppress chain-of-thought reasoning
-//! and get direct translation output.
+//! Replaces the former local llama-server sidecar (ADR-0011): no model weights,
+//! no GPU offload, no child process — just an HTTP call to a hosted model.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,10 +13,13 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
 use crate::state;
-use crate::translate::TranslationRequest;
+use crate::translate::{RemoteConfig, TranslationRequest};
 use crate::types::{SubtitleMode, SubtitleTexts, SubtitleUpdate};
 
-const WAIT_TIMEOUT_SECS: u64 = 30;
+/// Per-request ceiling.  Subtitles are short; anything slower than this has
+/// already scrolled off screen, so failing fast beats waiting.
+const REQUEST_TIMEOUT_SECS: u64 = 12;
+const CONNECT_TIMEOUT_SECS: u64 = 5;
 
 // ── public API ──────────────────────────────────────────────────────────────
 
@@ -25,12 +28,12 @@ const WAIT_TIMEOUT_SECS: u64 = 30;
 pub fn start_translate_worker(
     rx: std::sync::mpsc::Receiver<TranslationRequest>,
     app: AppHandle,
-    port: u16,
+    cfg: RemoteConfig,
     stop: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("translate-worker".into())
-        .spawn(move || translate_loop(rx, &app, port, &stop))
+        .spawn(move || translate_loop(rx, &app, &cfg, &stop))
         .expect("spawn translate-worker thread");
 }
 
@@ -39,25 +42,38 @@ pub fn start_translate_worker(
 fn translate_loop(
     rx: std::sync::mpsc::Receiver<TranslationRequest>,
     app: &AppHandle,
-    port: u16,
+    cfg: &RemoteConfig,
     stop: &Arc<AtomicBool>,
 ) {
-    let base = format!("http://127.0.0.1:{port}");
-    log::info!("TL: waiting for llama-server at {base}");
+    log::info!("TL: OpenRouter model={} base={}", cfg.model, cfg.base_url);
     set_tl_status(app, "loading");
 
-    if !crate::util::wait_for_http_ok(&format!("{base}/health"), WAIT_TIMEOUT_SECS) {
-        log::error!(
-            "TL: llama-server did not respond within {WAIT_TIMEOUT_SECS}s \
-             — check LLAMA_SERVER_BIN / LLAMA_MODEL env vars"
-        );
-        set_tl_status(app, "error");
-        return;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout_read(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build();
+
+    // Validate the key up front so a bad/missing key surfaces as an engine
+    // error immediately, instead of every subtitle silently failing later.
+    match check_credentials(&agent, cfg) {
+        Ok(()) => log::info!("TL: OpenRouter key OK"),
+        Err(CredError::Unauthorized) => {
+            log::error!(
+                "TL: OpenRouter rejected the API key (401) \
+                 — set OPENROUTER_API_KEY or openrouterApiKey in settings.json"
+            );
+            set_tl_status(app, "error");
+            return;
+        }
+        // A transient network failure at startup should not disable translation
+        // for the whole session — carry on and let per-request retries handle it.
+        Err(CredError::Other(e)) => {
+            log::warn!("TL: key check inconclusive ({e}) — continuing anyway");
+        }
     }
-    log::info!("TL: llama-server ready");
     set_tl_status(app, "ready");
 
-    let url = format!("{base}/v1/chat/completions");
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     // Rolling context: the last few successful (source, translated) pairs,
     // injected as prior chat turns.  Gives the model cross-subtitle context —
     // pronouns, names, and topic continuity — which matters a lot for Korean,
@@ -78,6 +94,8 @@ fn translate_loop(
         // If we fell behind, translate only the NEWEST request — the older
         // subtitles are already scrolling away, and the visible line going
         // untranslated is worse than an old line keeping its source text.
+        // This matters more with a hosted model than it did locally: network
+        // latency is spikier than a warm GPU, so backlogs form more often.
         let mut skipped = 0u32;
         while let Ok(newer) = rx.try_recv() {
             skipped += 1;
@@ -119,7 +137,8 @@ fn translate_loop(
         }
 
         // Nothing translatable (punctuation / numbers only) — pass through
-        // without burning an LLM round-trip on "." → "。".
+        // without burning a paid round-trip on "." → "。".  Cheap locally,
+        // but every skipped call is real money against a hosted model.
         if !req.source_text.chars().any(|c| c.is_alphabetic()) {
             emit_translated(app, &req, req.source_text.clone());
             continue;
@@ -132,7 +151,9 @@ fn translate_loop(
             .map(|(s, t)| (s.as_str(), t.as_str()))
             .collect();
         let t_tl = std::time::Instant::now();
-        match call_translate(&url, &req.source_lang, &req.source_text, req.mode, &prev, music_mode) {
+        match call_translate(
+            &agent, &url, cfg, &req.source_lang, &req.source_text, req.mode, &prev, music_mode,
+        ) {
             Ok(translated) => {
                 let tl_ms = t_tl.elapsed().as_millis();
                 log::info!("TL [{} → {}] {tl_ms}ms → {:?}", req.source_lang, req.mode.target_lang(), translated);
@@ -154,6 +175,29 @@ fn translate_loop(
     set_tl_status(app, "unloaded");
     log::info!("translate worker exited");
 }
+
+// ── credential check ────────────────────────────────────────────────────────
+
+enum CredError {
+    Unauthorized,
+    Other(String),
+}
+
+/// GET /key — confirms the key is valid before the first subtitle arrives.
+fn check_credentials(agent: &ureq::Agent, cfg: &RemoteConfig) -> Result<(), CredError> {
+    let url = format!("{}/key", cfg.base_url.trim_end_matches('/'));
+    match agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {}", cfg.api_key))
+        .call()
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(401, _)) => Err(CredError::Unauthorized),
+        Err(e) => Err(CredError::Other(e.to_string())),
+    }
+}
+
+// ── prompting ───────────────────────────────────────────────────────────────
 
 fn build_system_prompt(source_lang: &str, target_name: &str, music_mode: bool) -> String {
     let mut p = format!(
@@ -188,11 +232,14 @@ fn build_system_prompt(source_lang: &str, target_name: &str, music_mode: bool) -
     p
 }
 
-/// Call llama-server and return the translation in the target language.
+/// Call OpenRouter and return the translation in the target language.
 /// `prev` holds the last few (source, translated) pairs, injected as prior
 /// chat turns to keep vocabulary, names, and topic continuity consistent.
+#[allow(clippy::too_many_arguments)]
 fn call_translate(
+    agent: &ureq::Agent,
     url: &str,
+    cfg: &RemoteConfig,
     source_lang: &str,
     text: &str,
     mode: crate::types::SubtitleMode,
@@ -209,34 +256,35 @@ fn call_translate(
     let target_name = mode.target_name();
 
     let system = build_system_prompt(source_lang, target_name, music_mode);
-
-    // /no_think disables Qwen3's chain-of-thought so the first token is the answer.
-    let user = format!("/no_think [{source_name}→{target_name}] {text}");
+    let user = format!("[{source_name}→{target_name}] {text}");
 
     let mut messages = vec![serde_json::json!({ "role": "system", "content": &system })];
 
     // Inject recent subtitles as prior turns so the model can maintain
     // consistent names, loanwords, and topic context across subtitles.
     for (prev_src, prev_tl) in prev {
-        let prev_user = format!("/no_think [{source_name}→{target_name}] {prev_src}");
+        let prev_user = format!("[{source_name}→{target_name}] {prev_src}");
         messages.push(serde_json::json!({ "role": "user",      "content": prev_user }));
         messages.push(serde_json::json!({ "role": "assistant", "content": prev_tl  }));
     }
     messages.push(serde_json::json!({ "role": "user", "content": &user }));
 
-    let body = serde_json::json!({
-        "model": "local",
+    let mut body = serde_json::json!({
+        "model": cfg.model,
         "messages": messages,
         "max_tokens": 200,
-        "temperature": 0
+        "temperature": 0,
+        // Subtitles must not wait on a reasoning preamble.  Models that ignore
+        // this are handled by strip_think_tags below.
+        "reasoning": { "enabled": false },
     });
+    // Let the user pin specific upstream providers (e.g. to force a low-latency
+    // one) without a code change.
+    if let Some(order) = &cfg.provider_order {
+        body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": true });
+    }
 
-    let resp = ureq::post(url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-        .map_err(|e| e.to_string())?;
-
-    let json: serde_json::Value = resp.into_json().map_err(|e| e.to_string())?;
+    let json = post_with_retry(agent, url, cfg, &body)?;
 
     let raw = json
         .pointer("/choices/0/message/content")
@@ -244,8 +292,8 @@ fn call_translate(
         .unwrap_or("")
         .to_string();
 
-    // Safety-net: strip any residual <think>…</think> tags.
-    // With /no_think these should never appear, but guard anyway.
+    // Safety-net: strip any residual <think>…</think> tags.  Hosted reasoning
+    // models sometimes emit them even with reasoning disabled.
     let content = strip_think_tags(&raw);
 
     if content.is_empty() {
@@ -261,6 +309,62 @@ fn call_translate(
     }
 }
 
+/// POST the request, retrying once on a transient failure.
+///
+/// Rate limits and upstream 5xx are common on a shared hosted endpoint and
+/// usually clear immediately; one fast retry recovers the subtitle without
+/// stalling the pipeline.  4xx other than 429 are permanent — fail straight
+/// through so the error reaches the log instead of being retried pointlessly.
+fn post_with_retry(
+    agent: &ureq::Agent,
+    url: &str,
+    cfg: &RemoteConfig,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    const RETRY_DELAY_MS: u64 = 250;
+    let mut attempt = 0;
+    loop {
+        let mut req = agent
+            .post(url)
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {}", cfg.api_key));
+        // Optional attribution headers — they place the app on OpenRouter's
+        // leaderboards and are ignored when absent.
+        if let Some(r) = &cfg.referer {
+            req = req.set("HTTP-Referer", r);
+        }
+        if let Some(t) = &cfg.title {
+            req = req.set("X-Title", t);
+        }
+
+        let result = req.send_string(&body.to_string());
+
+        match result {
+            Ok(resp) => return resp.into_json().map_err(|e| e.to_string()),
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = resp.into_string().unwrap_or_default();
+                let transient = code == 429 || (500..600).contains(&code);
+                if transient && attempt == 0 {
+                    attempt += 1;
+                    log::warn!("TL: HTTP {code} — retrying once");
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(format!("HTTP {code}: {}", detail.trim()));
+            }
+            Err(e) => {
+                if attempt == 0 {
+                    attempt += 1;
+                    log::warn!("TL: transport error ({e}) — retrying once");
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                    continue;
+                }
+                return Err(e.to_string());
+            }
+        }
+    }
+}
+
 /// Remove `<think>…</think>` blocks; take everything after the last `</think>`.
 fn strip_think_tags(s: &str) -> String {
     if let Some(pos) = s.rfind("</think>") {
@@ -269,7 +373,7 @@ fn strip_think_tags(s: &str) -> String {
     s.trim().to_string()
 }
 
-/// Emit a `subtitle_update` event with the Chinese translation filled in.
+/// Emit a `subtitle_update` event with the translation filled in.
 fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
     let mode = req.mode;
     let mut subtitles = SubtitleTexts::default();
@@ -294,7 +398,6 @@ fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
             other => log::debug!("TL emit: unhandled source_lang {other:?}"),
         }
     }
-
 
     log::debug!(
         "TL emit [mode={mode:?} src={src}]: zh={zh_ok} ko={ko_ok} en={en_ok}",
@@ -322,4 +425,17 @@ fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
 /// Update `AppState.translation_status` and re-broadcast `engine_status`.
 fn set_tl_status(app: &AppHandle, status: &str) {
     state::update_and_emit(app, |s| s.translation_status = status.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_think_tags_removes_reasoning_preamble() {
+        assert_eq!(strip_think_tags("<think>hmm</think>你好"), "你好");
+        assert_eq!(strip_think_tags("  你好  "), "你好");
+        // Only the text after the LAST closing tag survives.
+        assert_eq!(strip_think_tags("<think>a</think>x<think>b</think>y"), "y");
+    }
 }

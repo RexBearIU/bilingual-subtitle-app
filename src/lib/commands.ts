@@ -36,7 +36,9 @@ export const getSettings = () => invoke<PersistSettings>("get_settings");
 
 export interface SettingsPatch {
   subtitleOpacity?: number;
-  llamaGpuLayers?: number;
+  /** Write-only. Empty string clears the stored key. */
+  openrouterApiKey?: string;
+  openrouterModel?: string;
   asrBackend?: string;
   whisperModel?: string;
   sensevoicePrecision?: string;

@@ -20,8 +20,6 @@ use crate::types::AudioProcess;
 
 /// Port asr-srv listens on.  Configurable via env `ASR_PORT` (or legacy `WHISPER_ASR_PORT`).
 const DEFAULT_ASR_PORT: u16 = 9001;
-/// Port llama-server listens on.  Configurable via env `LLAMA_PORT`.
-const DEFAULT_LLAMA_PORT: u16 = 9002;
 
 /// Spawn the full audio pipeline: WASAPI capture → VAD → ASR → Translation.
 /// All workers exit cleanly when `stop` is set to `true`.
@@ -31,11 +29,6 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ASR_PORT);
-
-    let llama_port = std::env::var("LLAMA_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_LLAMA_PORT);
 
     // ASR → Translation: the worker drains the backlog and translates only the
     // newest request, so a slightly larger buffer just smooths bursts.
@@ -64,7 +57,21 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
         music_mode_flag.load(Ordering::Relaxed),
     );
 
-    translate::llama_server::start_translate_worker(tl_rx, app.clone(), llama_port, Arc::clone(&stop));
+    // A missing API key must not take the whole pipeline down: ASR still runs
+    // and emits source-only subtitles, which is the same degraded mode we fall
+    // back to when an individual translation call fails.
+    match translate::RemoteConfig::resolve(&app) {
+        Ok(cfg) => {
+            translate::openrouter::start_translate_worker(
+                tl_rx, app.clone(), cfg, Arc::clone(&stop),
+            );
+        }
+        Err(e) => {
+            log::error!("TL disabled: {e}");
+            state::update_and_emit(&app, |s| s.translation_status = "error".into());
+            drop(tl_rx);
+        }
+    }
     asr::http_client::start_asr_worker(asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx);
     pipeline::chunker::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop), speech_threshold, music_mode_flag);
 

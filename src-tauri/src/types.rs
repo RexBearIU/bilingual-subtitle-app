@@ -117,8 +117,11 @@ pub struct EngineStatus {
     pub always_on_top: bool,
     /// Subtitle background opacity (0.0–1.0).
     pub subtitle_opacity: f64,
-    /// GPU layers for llama-server (0 = CPU, 36 = all GPU).
-    pub llama_gpu_layers: u32,
+    /// OpenRouter model slug in use for translation.
+    pub openrouter_model: String,
+    /// Whether an API key is available (env var or settings file).
+    /// The key itself is never sent to the frontend.
+    pub openrouter_key_set: bool,
     /// VAD speech threshold (linear RMS, 0.0–1.0).
     pub speech_threshold: f32,
     pub music_mode: bool,
@@ -149,7 +152,12 @@ impl EngineStatus {
             click_through: s.click_through,
             always_on_top: s.always_on_top,
             subtitle_opacity: s.subtitle_opacity,
-            llama_gpu_layers: s.llama_gpu_layers,
+            openrouter_model: if s.openrouter_model.is_empty() {
+                crate::translate::DEFAULT_MODEL.to_string()
+            } else {
+                s.openrouter_model.clone()
+            },
+            openrouter_key_set: s.openrouter_key_set,
             speech_threshold: s.speech_threshold,
             music_mode: s.music_mode,
             asr_backend: s.asr_backend.clone(),

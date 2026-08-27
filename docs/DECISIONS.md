@@ -221,3 +221,41 @@ Backend selected via `ASR_BACKEND=sensevoice`; whisper remains the default.
 `/inference` HTTP endpoint — Rust side unchanged. The `_sv_parse()` tag-stripping
 logic from the funasr approach is replaced by reading `result.event` directly
 to determine `no_speech_prob`.
+
+---
+
+## ADR-0011 — Hosted translation via OpenRouter, replacing local llama-server
+
+**Date:** 2026-08-27 · **Status:** Accepted · **Supersedes:** ADR-0001 (translation half only)
+
+**Context.** ADR-0001 chose a sidecar-first design and ran translation on a local
+`llama-server` with `Qwen3-4B-Q4_K_M.gguf`. That worked, but carried real cost:
+a 2.5 GB model file and ~200 MB of llama.cpp/ggml DLLs in the installer, GPU VRAM
+contention with whatever the user was actually watching or playing, a CPU/GPU
+offload toggle in the UI to manage that contention, and a 10–30 s model load on
+first Start. The translation call itself was already OpenAI-compatible
+`/v1/chat/completions`, so the local server was doing nothing that a hosted
+endpoint could not.
+
+**Decision.** Call OpenRouter's `/v1/chat/completions` directly. No child process,
+no weights, no GPU offload setting. Config resolves env-var-first
+(`OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_BASE_URL`) then falls back
+to `settings.json`. Default model is a small fast instruct model — subtitles are
+one or two sentences and latency is the binding constraint, so a larger model is
+the wrong trade.
+
+**Consequence.**
+- Installer drops from ~200 MB to ~10 MB; `binaries/` and `models/` are no longer
+  needed for translation.
+- Translation now requires network access and an API key, and costs money per
+  subtitle. The existing backlog-skipping in the translate worker matters more,
+  not less: network latency is spikier than a warm local GPU.
+- `LlamaProc`, `launch_llama_server`, `llama_gpu_layers` and the CPU/GPU toggle
+  are all removed.
+- A missing key degrades gracefully — ASR still runs and emits source-only
+  subtitles, the same fallback used when an individual translation call fails.
+- The API key lives in plaintext in the app data dir alongside other settings.
+  It is never returned to the webview and never logged; the UI shows only a
+  set/unset indicator.
+- **ASR is unaffected and stays local** — OpenRouter has no speech-to-text API,
+  so `asr_srv.py` and its models remain a hard requirement.

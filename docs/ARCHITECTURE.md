@@ -16,7 +16,7 @@ Windows default output device (or specific process via Process Loopback API)
         │  → { text, lang(ko|en|zh|ja), no_speech_prob }
         │  filters: no_speech_prob ≥ 0.7, blocklist, repeat-loop, script-based lang fix
         ▼
-[Translation worker]  llama-server (Qwen3-4B, Vulkan GPU); newest-first under backlog
+[Translation worker]  OpenRouter chat-completions (HTTPS); newest-first under backlog
         │  → target-language subtitle text (single language per mode)
         ▼
 [Subtitle state manager]  dedup by id / partial→final merge / expiry pruning
@@ -37,8 +37,9 @@ capture(thread) ──► chunker(worker) ──►[sync_channel(8)]──► as
    ──►[sync_channel(4)]──► translate(worker) ──► state mgr ──► emit
 ```
 
-- Models (whisper, llama) are **loaded once** and kept resident for the whole
-  session. Sidecars stay alive across Stop/Start cycles — no model reload.
+- The ASR model is **loaded once** and kept resident for the whole session; the
+  sidecar stays alive across Stop/Start cycles — no model reload. Translation
+  holds no local state, just a `ureq` agent with a 12 s read timeout.
 - Capture→chunker is an unbounded `mpsc::channel` (chunker is fast — pure accumulation).
 - Chunker→ASR: **partials** use `try_send` and are dropped when full (disposable
   previews); **finals** use blocking `send` — a lost final is a lost subtitle.
@@ -54,7 +55,7 @@ capture(thread) ──► chunker(worker) ──►[sync_channel(8)]──► as
 Tauri app (Rust)
  ├─ owns: WASAPI/process capture, chunker, state manager, UI events
  ├─ spawns: python asr_srv.py             (HTTP :9001)  ── ASR (whisper or sensevoice backend)
- └─ spawns: llama-server.exe             (HTTP :9002)  ── translation (Vulkan GPU)
+ └─ calls:  openrouter.ai/api/v1          (HTTPS)       ── translation (no local process)
 ```
 
 Sidecars are launched on the first `start_captioning` call and stay alive until
@@ -126,12 +127,23 @@ disagree, so translation prompts always carry the right source language.
 
 ## Translation worker
 
-Uses Qwen3-4B via `llama-server` (Vulkan GPU, `-c 2048`). The last **3
+Calls OpenRouter's `/v1/chat/completions` (ADR-0011). The last **3
 (source → translation) pairs** are replayed as chat turns for cross-subtitle
 continuity (names, loanwords, omitted Korean subjects). The system prompt covers
 ASR-error tolerance (no fragment completion), multi-speaker dash separation, and
 a lyric register in music mode. Korean source adds loanword/name/register rules.
-All modes use `/no_think`. Punctuation-only inputs skip the LLM round-trip.
+Requests set `reasoning.enabled = false`; `strip_think_tags` is kept as a
+safety net for models that emit a `<think>` block anyway.
+
+Failure handling, in order of cheapness:
+- Punctuation-only input, or source language == target → no request at all.
+- 429 / 5xx / transport error → **one** 250 ms retry, then give up for that line.
+- Give-up and missing-key both leave the source-only subtitle on screen; they
+  never block the pipeline.
+
+Config resolves env-first (`OPENROUTER_API_KEY` / `_MODEL` / `_BASE_URL` /
+`_PROVIDER_ORDER`), then `settings.json`. The key is held only in `RemoteConfig`,
+never in `AppState` — `AppState` derives `Debug` and is logged on every change.
 
 ## Per-process capture
 
@@ -185,8 +197,8 @@ src-tauri/src/
 │  ├─ mod.rs                  # AudioChunk type
 │  └─ http_client.rs          # ASR HTTP client; filters; backlog coalescing
 └─ translate/
-   ├─ mod.rs                  # TranslationRequest type
-   └─ llama_server.rs         # llama-server HTTP client (OpenAI-compatible)
+   ├─ mod.rs                  # TranslationRequest + RemoteConfig resolution
+   └─ openrouter.rs           # OpenRouter chat-completions client + retry
 ```
 
 ## Frontend layout

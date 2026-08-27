@@ -48,7 +48,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
         .manage(Mutex::new(state::AsrProc(None)))
-        .manage(Mutex::new(state::LlamaProc(None)))
         .manage(Mutex::new(settings::SettingsPath(std::path::PathBuf::new())))
         .invoke_handler(tauri::generate_handler![
             commands::start_captioning,
@@ -93,7 +92,12 @@ pub fn run() {
                     s.music_mode_flag.store(cfg.music_mode, std::sync::atomic::Ordering::Relaxed);
                     s.font_size = cfg.font_size;
                     s.subtitle_opacity = cfg.subtitle_opacity;
-                    s.llama_gpu_layers = cfg.llama_gpu_layers;
+                    s.openrouter_model = cfg.openrouter_model.clone();
+                    // Env var wins over the settings file, mirroring
+                    // RemoteConfig::resolve — so the hint the UI shows matches
+                    // what the translate worker will actually find.
+                    s.openrouter_key_set = !cfg.openrouter_api_key.trim().is_empty()
+                        || std::env::var("OPENROUTER_API_KEY").is_ok_and(|v| !v.trim().is_empty());
                     s.speech_threshold = cfg.speech_threshold;
                     s.asr_backend = cfg.asr_backend.clone();
                     s.whisper_model = cfg.whisper_model.clone();

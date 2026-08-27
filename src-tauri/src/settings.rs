@@ -42,9 +42,18 @@ pub struct PersistSettings {
     pub subtitle_opacity: f64,
     /// Overlay window geometry (physical pixels).
     pub overlay: OverlayRect,
-    /// GPU offload layers for llama-server (0 = CPU only, 36 = full RTX 3070).
-    /// Overrides the `LLAMA_GPU_LAYERS` env var when set via the UI.
-    pub llama_gpu_layers: u32,
+    /// OpenRouter API key.  Empty = fall back to the `OPENROUTER_API_KEY`
+    /// environment variable; translation is disabled if neither is set.
+    ///
+    /// Stored in plaintext in the app data dir, same as any other setting —
+    /// treat it as a scoped key and revoke it at openrouter.ai if the machine
+    /// is shared.
+    #[serde(default)]
+    pub openrouter_api_key: String,
+    /// OpenRouter model slug (e.g. `google/gemini-2.5-flash-lite`).
+    /// Empty = use the built-in default.
+    #[serde(default)]
+    pub openrouter_model: String,
     /// VAD speech threshold override.
     /// `0.0` (default) = fully automatic (adaptive noise-floor EMA).
     /// Set to a linear RMS value (e.g. 0.032 = −30 dBFS) to hard-override.
@@ -75,7 +84,8 @@ impl Default for PersistSettings {
             font_size: 28,
             subtitle_opacity: 0.55,
             overlay: OverlayRect::default(),
-            llama_gpu_layers: 36,
+            openrouter_api_key: String::new(),
+            openrouter_model: String::new(),
             speech_threshold: 0.0,
             music_mode: false,
             asr_backend: default_asr_backend(),

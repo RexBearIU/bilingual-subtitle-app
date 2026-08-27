@@ -87,7 +87,8 @@ interface EngineStatus {
   clickThrough: boolean;
   alwaysOnTop: boolean;
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
-  llamaGpuLayers: number;     // 0 = CPU, 36 = full RTX 3070
+  openrouterModel: string;    // model slug in use (resolved default if unset)
+  openrouterKeySet: boolean;  // key present in env or settings; the key itself is never sent
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
   musicMode: boolean;
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
@@ -129,7 +130,8 @@ interface PersistSettings {
   fontSize: number;
   subtitleOpacity: number;    // 0.0–1.0
   overlay: { x: number; y: number; w: number; h: number };
-  llamaGpuLayers: number;     // 0 = CPU, 36 = full GPU
+  openrouterApiKey: string;   // ALWAYS returned as "" — get_settings never echoes the stored key
+  openrouterModel: string;    // "" = use the built-in default
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)
   musicMode: boolean;
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
@@ -145,7 +147,8 @@ All fields optional — only supplied keys are updated:
 ```ts
 interface SettingsPatch {
   subtitleOpacity?: number;
-  llamaGpuLayers?: number;
+  openrouterApiKey?: string;  // write-only; "" clears the stored key (env var then takes over)
+  openrouterModel?: string;   // takes effect on the next Start
   asrBackend?: string;        // kills idle asr-srv so next Start relaunches with the new backend
   whisperModel?: string;      // "turbo" | "large" — same relaunch behavior
   sensevoicePrecision?: string; // "int8" | "fp32" — same relaunch behavior

@@ -7,12 +7,11 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::audio;
 use crate::settings::{PersistSettings, SettingsPath};
-use crate::state::{AppState, AsrProc, LlamaProc};
+use crate::state::{AppState, AsrProc};
 use crate::types::{AudioProcess, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate};
 
 type Db<'a>      = State<'a, Mutex<AppState>>;
 type ProcDb<'a>  = State<'a, Mutex<AsrProc>>;
-type LlamDb<'a>  = State<'a, Mutex<LlamaProc>>;
 type SpDb<'a>    = State<'a, Mutex<SettingsPath>>;
 
 fn emit_status(app: &AppHandle, s: &AppState) {
@@ -25,11 +24,10 @@ fn emit_status(app: &AppHandle, s: &AppState) {
 pub fn start_captioning(
     state: Db,
     proc_db: ProcDb,
-    llam_db: LlamDb,
     app: AppHandle,
 ) -> Result<(), String> {
     // Set state and build stop flag while holding the AppState lock.
-    let (stop, ngl, asr_backend, whisper_model, sv_precision) = {
+    let (stop, asr_backend, whisper_model, sv_precision) = {
         let mut s = state.lock().map_err(|e| e.to_string())?;
         if s.captioning {
             return Ok(());
@@ -41,7 +39,7 @@ pub fn start_captioning(
         s.asr_status = "loading".into();
         s.translation_status = "loading".into();
         emit_status(&app, &s);
-        (stop, s.llama_gpu_layers, s.asr_backend.clone(),
+        (stop, s.asr_backend.clone(),
          s.whisper_model.clone(), s.sensevoice_precision.clone())
     }; // AppState lock released
 
@@ -68,27 +66,8 @@ pub fn start_captioning(
         }
     }
 
-    // Launch llama-server only if not already running.
-    {
-        let mut llam = llam_db.lock().map_err(|e| e.to_string())?;
-        let alive = llam.0.as_mut()
-            .is_some_and(|c| c.try_wait().ok().flatten().is_none());
-        if alive {
-            log::info!("llama-server already running — reusing");
-        } else {
-            llam.0 = None;
-            match launch_llama_server(ngl) {
-                Ok(child) => {
-                    log::info!("llama-server started (pid {})", child.id());
-                    llam.0 = Some(child);
-                }
-                Err(e) => {
-                    log::warn!("could not start llama-server: {e}");
-                    log::warn!("  → set LLAMA_SERVER_BIN / LLAMA_MODEL env vars or place binary on PATH");
-                }
-            }
-        }
-    }
+    // Translation needs no local process any more — the worker talks straight
+    // to OpenRouter and resolves its own config inside the pipeline.
 
     audio::capture::start_loopback_capture(app, stop);
     log::info!("start_captioning: pipeline started");
@@ -113,10 +92,10 @@ pub fn stop_captioning(
         emit_status(&app, &s);
     }
 
-    // NOTE: asr-srv and llama-server are intentionally kept alive here.
-    // Killing and restarting them on every Stop/Start cycle reloads the models
-    // from disk (~10-30 s).  Instead they stay resident until the app exits,
-    // at which point AsrProc / LlamaProc Drop impls kill them automatically.
+    // NOTE: asr-srv is intentionally kept alive here.  Killing and restarting
+    // it on every Stop/Start cycle reloads the model from disk (~10-30 s).
+    // Instead it stays resident until the app exits, at which point the
+    // AsrProc Drop impl kills it automatically.
 
     log::info!("stop_captioning");
     Ok(())
@@ -129,26 +108,6 @@ pub fn stop_captioning(
 fn exe_dir() -> Option<std::path::PathBuf> {
     std::env::current_exe().ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-}
-
-/// Resolve a sidecar executable path.
-/// Priority: (1) env var override → (2) exe dir → (3) PATH.
-fn resolve_bin(env_var: &str, stem: &str) -> String {
-    if let Ok(v) = std::env::var(env_var) {
-        if !v.is_empty() { return v; }
-    }
-    if let Some(dir) = exe_dir() {
-        // Try with .exe suffix (Windows) then without (PATH fallback handles it).
-        #[cfg(target_os = "windows")]
-        let name = format!("{stem}.exe");
-        #[cfg(not(target_os = "windows"))]
-        let name = stem.to_string();
-        let candidate = dir.join(&name);
-        if candidate.exists() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-    stem.to_string()
 }
 
 /// Resolve a resource file path (e.g. a Python script bundled alongside the exe).
@@ -166,25 +125,30 @@ fn resolve_resource(env_var: &str, name: &str) -> String {
     name.to_string()
 }
 
-/// Find the directory that contains the sidecar DLLs (e.g. cublas64_12.dll).
+/// Find the directory holding the CUDA DLLs that faster-whisper's CTranslate2
+/// backend needs (cublas64_12.dll and friends).
 ///
-/// - Release: DLLs are bundled alongside the exe, so exe_dir() is it.
-/// - Dev: LLAMA_SERVER_BIN points to binaries/llama-server.exe; its parent
-///   directory is the binaries/ folder with all DLLs.
+/// - Release: bundled alongside the exe, so exe_dir() is it.
+/// - Dev: `ASR_DLL_DIR`, else the repo's `binaries/` folder.
 fn find_dll_dir() -> Option<std::path::PathBuf> {
+    const PROBE: &str = "cublas64_12.dll";
+
     // Release mode: DLLs are in the same directory as the app exe.
     if let Some(dir) = exe_dir() {
-        if dir.join("cublas64_12.dll").exists() {
+        if dir.join(PROBE).exists() {
             return Some(dir);
         }
     }
-    // Dev mode: derive from LLAMA_SERVER_BIN env var.
-    if let Ok(llama_bin) = std::env::var("LLAMA_SERVER_BIN") {
-        if let Some(parent) = std::path::Path::new(&llama_bin).parent() {
-            if parent.join("cublas64_12.dll").exists() {
-                return Some(parent.to_path_buf());
-            }
+    // Dev mode: explicit override first, then the conventional repo location.
+    if let Ok(dir) = std::env::var("ASR_DLL_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        if dir.join(PROBE).exists() {
+            return Some(dir);
         }
+    }
+    let repo_binaries = std::path::PathBuf::from("binaries");
+    if repo_binaries.join(PROBE).exists() {
+        return Some(repo_binaries);
     }
     None
 }
@@ -349,51 +313,6 @@ fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precis
     cmd.spawn().map_err(|e| format!("spawn {python} {script}: {e}"))
 }
 
-/// Spawn llama-server as a child process.
-///
-/// Binary path:  env `LLAMA_SERVER_BIN`  → exe-dir/llama-server.exe → PATH.
-/// Model path:   env `LLAMA_MODEL`       → `models/Qwen3-4B-Q4_K_M.gguf`.
-/// Port:         env `LLAMA_PORT`        → 9002.
-/// GPU layers:   AppState.llama_gpu_layers (UI toggle) → env `LLAMA_GPU_LAYERS` → 36.
-fn launch_llama_server(ngl_override: u32) -> Result<std::process::Child, String> {
-    let bin = resolve_bin("LLAMA_SERVER_BIN", "llama-server");
-    let model = std::env::var("LLAMA_MODEL")
-        .unwrap_or_else(|_| "models/Qwen3-4B-Q4_K_M.gguf".to_string());
-    let port = std::env::var("LLAMA_PORT")
-        .unwrap_or_else(|_| "9002".to_string());
-    let ngl = ngl_override.to_string();
-
-    // Evict any zombie from a previous session before binding.
-    kill_port(port.parse().unwrap_or(9002));
-
-    log::info!("launching llama-server: bin={bin}  model={model}  port={port}  ngl={ngl}");
-
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args([
-        "-m", &model,
-        "--host", "127.0.0.1",
-        "--port", &port,
-        "-ngl", &ngl,
-        // 2048: system prompt + one-shot example + input + 200-token output can
-        // exceed 512, and llama-server silently truncates the prompt when it
-        // does — which degrades translation quality mid-session.
-        "-c", "2048",
-        "--no-webui",
-    ]);
-    // CUDA graphs cause 10× decode regression for batch=1 small contexts on some
-    // driver/build combinations (measured: 1.28 tok/s with graphs vs 87 tok/s without).
-    cmd.env("GGML_CUDA_NO_GRAPHS", "1");
-
-    // Suppress the console window on Windows.
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-
-    cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))
-}
-
 // ── other commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -545,7 +464,7 @@ pub fn dev_inject_subtitle(payload: SubtitleUpdate, app: AppHandle) -> Result<()
 pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     let sp = sp.lock().map_err(|e| e.to_string())?;
-    // Rebuild from live AppState (mode/font/opacity/gpu come from there);
+    // Rebuild from live AppState (mode/font/opacity/model come from there);
     // overlay rect is read fresh from the file (window position is managed by JS).
     let saved = PersistSettings::load(&sp.0);
     Ok(PersistSettings {
@@ -554,7 +473,10 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
         font_size: s.font_size,
         subtitle_opacity: s.subtitle_opacity,
         overlay: saved.overlay,
-        llama_gpu_layers: s.llama_gpu_layers,
+        // Never hand the API key back to the webview — the UI shows
+        // `openrouterKeySet` from EngineStatus instead, and writes are one-way.
+        openrouter_api_key: String::new(),
+        openrouter_model: s.openrouter_model.clone(),
         speech_threshold: s.speech_threshold,
         music_mode: s.music_mode,
         asr_backend: s.asr_backend.clone(),
@@ -567,7 +489,7 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
 ///
 /// The frontend calls this:
 ///  - on window move / resize (to update `overlay`)
-///  - when the user changes opacity or GPU layers from the ControlBar
+///  - when the user changes opacity, or the OpenRouter key/model, from the UI
 ///  - (font_size and mode are handled by their own existing commands)
 #[tauri::command]
 pub fn update_settings(
@@ -588,10 +510,23 @@ pub fn update_settings(
             s.subtitle_opacity = clamped;
             saved.subtitle_opacity = clamped;
         }
-        if let Some(ngl) = patch.llama_gpu_layers {
-            s.llama_gpu_layers = ngl;
-            saved.llama_gpu_layers = ngl;
-            log::info!("settings: llama_gpu_layers → {ngl}");
+        if let Some(ref key) = patch.openrouter_api_key {
+            // Empty string is a deliberate "clear the stored key" — after which
+            // the env var (if any) takes over again.
+            let key = key.trim().to_string();
+            s.openrouter_key_set =
+                !key.is_empty() || std::env::var("OPENROUTER_API_KEY").is_ok_and(|v| !v.trim().is_empty());
+            saved.openrouter_api_key = key;
+            // Never log the value.
+            log::info!("settings: openrouter_api_key updated (set={})", s.openrouter_key_set);
+        }
+        if let Some(ref model) = patch.openrouter_model {
+            let model = model.trim().to_string();
+            if s.openrouter_model != model {
+                log::info!("settings: openrouter_model → {model:?}");
+                s.openrouter_model = model.clone();
+                saved.openrouter_model = model;
+            }
         }
         if let Some(ref backend) = patch.asr_backend {
             let backend = backend.trim().to_lowercase();
@@ -679,7 +614,9 @@ pub fn update_settings(
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub subtitle_opacity: Option<f64>,
-    pub llama_gpu_layers: Option<u32>,
+    /// Write-only: the key is stored but never read back to the frontend.
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_model: Option<String>,
     pub asr_backend: Option<String>,
     pub whisper_model: Option<String>,
     pub sensevoice_precision: Option<String>,
@@ -704,7 +641,9 @@ pub fn save_current_settings(app: &AppHandle) {
     cfg.music_mode = s.music_mode;
     cfg.font_size = s.font_size;
     cfg.subtitle_opacity = s.subtitle_opacity;
-    cfg.llama_gpu_layers = s.llama_gpu_layers;
+    // `cfg` was loaded from disk, so the stored API key is carried through
+    // untouched — AppState never holds it.
+    cfg.openrouter_model = s.openrouter_model.clone();
     cfg.speech_threshold = s.speech_threshold;
     cfg.asr_backend = s.asr_backend.clone();
     cfg.whisper_model = s.whisper_model.clone();

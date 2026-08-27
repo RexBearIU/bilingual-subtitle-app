@@ -6,10 +6,16 @@
 
   let fontSize          = $derived(status?.fontSize             ?? 28);
   let opacity           = $derived(status?.subtitleOpacity      ?? 0.55);
-  let llamaGpu          = $derived(status?.llamaGpuLayers       ?? 36);
   let asrBackend        = $derived(status?.asrBackend           ?? 'whisper');
   let whisperModel      = $derived(status?.whisperModel         ?? 'turbo');
   let sensevoicePrecision = $derived(status?.sensevoicePrecision ?? 'int8');
+  let keySet            = $derived(status?.openrouterKeySet     ?? false);
+  let model             = $derived(status?.openrouterModel      ?? '');
+
+  // The key is never sent back from Rust, so this input is a write-only draft:
+  // empty means "leave whatever is stored alone".
+  let keyDraft = $state('');
+  let keySaving = $state(false);
 
   async function onFont(e: Event) {
     await cmd.setFontSize(Number((e.target as HTMLInputElement).value));
@@ -17,8 +23,22 @@
   async function onOpacity(e: Event) {
     await cmd.updateSettings({ subtitleOpacity: Number((e.target as HTMLInputElement).value) });
   }
-  async function toggleGpu() {
-    await cmd.updateSettings({ llamaGpuLayers: llamaGpu > 0 ? 0 : 36 });
+  async function saveKey() {
+    keySaving = true;
+    try {
+      await cmd.updateSettings({ openrouterApiKey: keyDraft.trim() });
+      keyDraft = '';
+    } finally {
+      keySaving = false;
+    }
+  }
+  async function clearKey() {
+    keyDraft = '';
+    await cmd.updateSettings({ openrouterApiKey: '' });
+  }
+  async function onModel(e: Event) {
+    const v = (e.target as HTMLInputElement).value.trim();
+    if (v !== model) await cmd.updateSettings({ openrouterModel: v });
   }
   async function toggleAsr() {
     // Cycle: Whisper → SenseVoice → Zipformer-KO → Whisper
@@ -104,15 +124,34 @@
 
     <p class="hint">切換引擎後重新 Start 生效。</p>
 
-    <!-- row: GPU -->
+    <!-- row: OpenRouter key -->
     <div class="row">
-      <span class="label">翻譯引擎</span>
-      <button class="gpu-btn" class:cpu={llamaGpu === 0} onclick={toggleGpu}>
-        {llamaGpu > 0 ? `GPU（${llamaGpu} layers）` : 'CPU only'}
+      <span class="label">OpenRouter 金鑰</span>
+      <input class="text-in" type="password" autocomplete="off" spellcheck="false"
+             placeholder={keySet ? '已設定（輸入以更換）' : 'sk-or-v1-…'}
+             bind:value={keyDraft} />
+      <button class="gpu-btn" disabled={keySaving || !keyDraft.trim()} onclick={saveKey}>
+        {keySaving ? '儲存中' : '儲存'}
       </button>
-      <span class="val hint-inline">{llamaGpu > 0 ? '~150ms' : '~1.3s'}</span>
     </div>
-    <p class="hint">打遊戲時用 CPU 避免 GPU 搶佔。</p>
+    <div class="row sub-row">
+      <span class="label"></span>
+      <span class="key-status" class:ok={keySet}>{keySet ? '✓ 金鑰已設定' : '✕ 尚未設定'}</span>
+      {#if keySet}
+        <button class="gpu-btn cpu" onclick={clearKey}>清除</button>
+      {/if}
+    </div>
+    <p class="hint">
+      金鑰存在本機 settings.json，不會顯示回畫面。也可改用 OPENROUTER_API_KEY 環境變數（環境變數優先）。
+    </p>
+
+    <!-- row: translation model -->
+    <div class="row">
+      <span class="label">翻譯模型</span>
+      <input class="text-in" type="text" autocomplete="off" spellcheck="false"
+             value={model} onchange={onModel} placeholder="google/gemini-2.5-flash-lite" />
+    </div>
+    <p class="hint">OpenRouter 模型代號。字幕短、講求延遲，小型快模型通常比大模型好用。改完重新 Start 生效。</p>
   </div>
 </div>
 
@@ -212,10 +251,42 @@
     white-space: nowrap;
   }
   .gpu-btn:hover { background: #334880; }
+  .gpu-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+    background: #2a3d6a;
+  }
   .gpu-btn.cpu { background: #3a2a2a; border-color: #6a3a3a; color: #ffb0a0; }
   .gpu-btn.sv    { background: #2a4a3a; border-color: #3a7a5a; color: #90e8b0; }
   .gpu-btn.zip   { background: #4a3a2a; border-color: #7a5a3a; color: #e8c090; }
   .gpu-btn.large { background: #3a2a6a; border-color: #5a4aaa; color: #c0a8ff; }
 
   .sub-row { padding-left: 28px; }
+
+  .text-in {
+    flex: 1;
+    min-width: 0;
+    background: #16202c;
+    border: 1px solid #2c3a4a;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #cfd8e3;
+    font-size: 11px;
+    font-family: inherit;
+  }
+  .text-in:focus {
+    outline: none;
+    border-color: #3a5591;
+  }
+  .text-in::placeholder { color: #4e5a65; }
+
+  /* Longer than the numeric readouts `.val` is sized for, so it gets its own
+     rule rather than widening every status cell in the panel. */
+  .key-status {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    color: #a08a6a;
+  }
+  .key-status.ok { color: #7bcfa0; }
 </style>

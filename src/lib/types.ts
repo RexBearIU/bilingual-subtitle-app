@@ -40,7 +40,8 @@ export interface EngineStatus {
   clickThrough: boolean;
   alwaysOnTop: boolean;
   subtitleOpacity: number;   // 0.0–1.0, controls subtitle box background alpha
-  llamaGpuLayers: number;    // 0 = CPU only, 36 = full GPU
+  openrouterModel: string;   // model slug used for translation
+  openrouterKeySet: boolean; // whether a key is available; the key is never sent here
   speechThreshold: number;   // VAD RMS threshold, linear 0–1 (~0.032 = −30 dBFS)
   musicMode: boolean;
   asrBackend: string;        // "whisper" | "sensevoice" | "zipformer-ko"
@@ -64,6 +65,8 @@ export interface PersistSettings {
   fontSize: number;
   subtitleOpacity: number;
   overlay: OverlayRect;
-  llamaGpuLayers: number;
+  /** Always returned empty — the backend never sends the stored key back. */
+  openrouterApiKey: string;
+  openrouterModel: string;
   speechThreshold: number;
 }

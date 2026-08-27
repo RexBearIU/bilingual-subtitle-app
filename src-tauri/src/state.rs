@@ -43,8 +43,13 @@ pub struct AppState {
     /// Subtitle background opacity (0.0–1.0).  Sent in EngineStatus so the
     /// frontend can apply it as a CSS custom property.
     pub subtitle_opacity: f64,
-    /// GPU layers for llama-server (0 = CPU, 36 = full GPU).
-    pub llama_gpu_layers: u32,
+    /// OpenRouter model slug in use (empty = built-in default).
+    /// The API key is deliberately kept out of `AppState` — this struct derives
+    /// `Debug` and is logged on state changes.
+    pub openrouter_model: String,
+    /// Whether an API key was found (env var or settings file) at the last
+    /// check.  Mirrored to the UI so it can show a "key missing" hint.
+    pub openrouter_key_set: bool,
     /// VAD speech threshold override. 0 = adaptive auto-mode (recommended).
     /// > 0 = fixed RMS threshold (manual override).
     pub speech_threshold: f32,
@@ -79,7 +84,8 @@ impl Default for AppState {
             asr_status: "unloaded".into(),
             translation_status: "unloaded".into(),
             subtitle_opacity: 0.55,
-            llama_gpu_layers: 36,
+            openrouter_model: String::new(),
+            openrouter_key_set: false,
             speech_threshold: 0.0, // 0 = adaptive auto-mode
             music_mode: false,
             music_mode_flag: Arc::new(AtomicBool::new(false)),
@@ -103,20 +109,6 @@ impl Drop for AsrProc {
         if let Some(mut c) = self.0.take() {
             let _ = c.kill();
             log::info!("AsrProc: asr-srv killed on exit");
-        }
-    }
-}
-
-/// Wrapper around the llama-server child process.
-/// Stored as separate managed state so `AppState` stays `Debug`-derivable.
-/// Same keep-alive policy as `AsrProc`.
-pub struct LlamaProc(pub Option<std::process::Child>);
-
-impl Drop for LlamaProc {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            let _ = c.kill();
-            log::info!("LlamaProc: server killed on exit");
         }
     }
 }
