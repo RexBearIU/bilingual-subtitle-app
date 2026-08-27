@@ -275,7 +275,9 @@ fn call_translate(
         "max_tokens": 200,
         "temperature": 0,
         // Subtitles must not wait on a reasoning preamble.  Models that ignore
-        // this are handled by strip_think_tags below.
+        // this are handled by strip_think_tags below; models that REFUSE it
+        // (400 "Reasoning is mandatory") are retried without the field by
+        // post_with_retry.
         "reasoning": { "enabled": false },
     });
     // Let the user pin specific upstream providers (e.g. to force a low-latency
@@ -297,11 +299,28 @@ fn call_translate(
     let content = strip_think_tags(&raw);
 
     if content.is_empty() {
-        // Dump full response to help diagnose empty-translation bugs.
-        log::warn!(
-            "TL empty content for [{source_lang}] {:?} — full response:\n{json}",
-            text
-        );
+        // A reasoning model can burn the whole max_tokens budget before it
+        // emits any content, which looks identical to a broken model unless
+        // the cause is named.
+        let reasoning_len = json
+            .pointer("/choices/0/message/reasoning")
+            .and_then(|v| v.as_str())
+            .map(str::len)
+            .unwrap_or(0);
+        if reasoning_len > 0 {
+            log::warn!(
+                "TL empty content for [{source_lang}] {text:?}: {} spent the token budget on \
+                 {reasoning_len} chars of reasoning. Switch to a non-reasoning model — \
+                 subtitles cannot afford it.",
+                cfg.model
+            );
+        } else {
+            // Dump full response to help diagnose empty-translation bugs.
+            log::warn!(
+                "TL empty content for [{source_lang}] {:?} — full response:\n{json}",
+                text
+            );
+        }
         Err(format!("empty translation for: {text}"))
     } else {
         log::info!("TL raw={raw:?}  stripped={content:?}");
@@ -322,6 +341,8 @@ fn post_with_retry(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     const RETRY_DELAY_MS: u64 = 250;
+    let mut body = body.clone();
+    let mut dropped_reasoning = false;
     let mut attempt = 0;
     loop {
         let mut req = agent
@@ -343,6 +364,28 @@ fn post_with_retry(
             Ok(resp) => return resp.into_json().map_err(|e| e.to_string()),
             Err(ureq::Error::Status(code, resp)) => {
                 let detail = resp.into_string().unwrap_or_default();
+
+                // Some endpoints make reasoning mandatory and reject the
+                // disable flag outright ("Reasoning is mandatory for this
+                // endpoint and cannot be disabled"). Retry once without it so
+                // picking such a model fails soft instead of on every line.
+                if code == 400
+                    && !dropped_reasoning
+                    && detail.to_lowercase().contains("reasoning")
+                {
+                    dropped_reasoning = true;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove("reasoning");
+                    }
+                    log::warn!(
+                        "TL: {} rejects reasoning.enabled=false — retrying without it. \
+                         Note it will spend max_tokens on reasoning, which can leave the \
+                         translation empty; prefer a non-reasoning model for subtitles.",
+                        cfg.model
+                    );
+                    continue;
+                }
+
                 let transient = code == 429 || (500..600).contains(&code);
                 if transient && attempt == 0 {
                     attempt += 1;
