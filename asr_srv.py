@@ -34,14 +34,44 @@ import sys
 import tempfile
 
 # ── DLL search path (Windows) ────────────────────────────────────────────────
+# ctranslate2 bundles cudnn64_9.dll but not cuBLAS. Without cublas64_12.dll the
+# model loads on CUDA without complaint and then fails EVERY inference with a
+# 500 — so find it before anything imports faster-whisper.
 if sys.platform == "win32":
-    for _p in os.environ.get("PATH", "").split(os.pathsep):
+
+    def _cublas_dirs():
+        """Yield candidate directories holding cublas64_12.dll, best first."""
+        # 1. The nvidia-cublas-cu12 wheel declared in pyproject.toml. This is
+        #    the reproducible location: `uv sync` puts it here every time.
+        try:
+            import nvidia  # noqa: F401  (namespace package from the wheel)
+
+            for base in nvidia.__path__:
+                yield os.path.join(base, "cublas", "bin")
+        except ImportError:
+            pass
+        # 2. PATH — a CUDA Toolkit install, or the legacy binaries/ folder the
+        #    Rust side used to prepend.
+        yield from os.environ.get("PATH", "").split(os.pathsep)
+
+    for _p in _cublas_dirs():
         if _p and os.path.exists(os.path.join(_p, "cublas64_12.dll")):
+            # BOTH are needed, and PATH is the one that actually matters:
+            # ctranslate2 loads cuBLAS itself with a plain LoadLibrary, which
+            # searches PATH and ignores directories registered through
+            # add_dll_directory (those only apply to LOAD_LIBRARY_SEARCH_USER_DIRS
+            # callers). add_dll_directory still helps anything that does use the
+            # newer search flags.
             os.add_dll_directory(_p)
+            os.environ["PATH"] = _p + os.pathsep + os.environ.get("PATH", "")
             print(f"[asr-srv] DLL path: {_p}", flush=True)
             break
     else:
-        print("[asr-srv] WARN: cublas64_12.dll not found in PATH — GPU may not work", flush=True)
+        print(
+            "[asr-srv] WARN: cublas64_12.dll not found — GPU inference will fail.\n"
+            "[asr-srv]       fix: uv sync   (installs nvidia-cublas-cu12)",
+            flush=True,
+        )
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 try:

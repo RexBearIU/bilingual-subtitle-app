@@ -110,6 +110,50 @@ fn exe_dir() -> Option<std::path::PathBuf> {
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
 }
 
+/// Pick the interpreter that runs `asr_srv.py`.
+///
+/// Priority: (1) `PYTHON_BIN` → (2) a `uv sync`-created `.venv` next to the
+/// script or the working directory → (3) `python` from PATH.
+///
+/// The `.venv` step matters: the sidecar's CUDA dependency (nvidia-cublas-cu12)
+/// is declared in pyproject.toml and lands inside that venv, so a system
+/// interpreter would load the model and then fail every inference.
+fn resolve_python(script: &str) -> String {
+    if let Ok(v) = std::env::var("PYTHON_BIN") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    const VENV_PYTHON: &str = ".venv/Scripts/python.exe";
+    #[cfg(not(target_os = "windows"))]
+    const VENV_PYTHON: &str = ".venv/bin/python";
+
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = std::path::Path::new(script).parent() {
+        if !dir.as_os_str().is_empty() {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        // `cargo tauri dev` runs from src-tauri/; the venv lives one level up.
+        if let Some(parent) = cwd.parent() {
+            roots.push(parent.to_path_buf());
+        }
+        roots.push(cwd);
+    }
+
+    for root in roots {
+        let candidate = root.join(VENV_PYTHON);
+        if candidate.exists() {
+            log::info!("asr-srv: using venv interpreter {}", candidate.display());
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "python".to_string()
+}
+
 /// Resolve a resource file path (e.g. a Python script bundled alongside the exe).
 /// Priority: (1) env var override → (2) exe dir → (3) cwd (dev mode).
 fn resolve_resource(env_var: &str, name: &str) -> String {
@@ -221,8 +265,7 @@ fn launch_asr_server(backend_override: &str, whisper_model_size: &str, sv_precis
         .or_else(|_| std::env::var("WHISPER_ASR_PORT")) // legacy compat
         .unwrap_or_else(|_| "9001".to_string());
 
-    let python = std::env::var("PYTHON_BIN")
-        .unwrap_or_else(|_| "python".to_string());
+    let python = resolve_python(&script);
 
     // Resolve backend: in-app setting takes priority over ASR_BACKEND env var.
     let backend = if !backend_override.is_empty() {

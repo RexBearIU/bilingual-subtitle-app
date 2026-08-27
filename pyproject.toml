@@ -1,0 +1,59 @@
+[project]
+name = "bilingual-subtitle-asr"
+version = "0.1.0"
+description = "ASR sidecar for the Bilingual Subtitles overlay (see asr_srv.py)"
+readme = "docs/SETUP.md"
+requires-python = ">=3.12,<3.15"
+license = { file = "LICENSE" }
+
+# This project is a Rust/Tauri app; Python covers only the ASR sidecar
+# (ADR-0001 sidecar-first, ADR-0006 faster-whisper). Everything here exists so
+# `uv sync` can rebuild that sidecar's environment from a lockfile instead of
+# the loose `pip install` line SETUP.md used to carry.
+dependencies = [
+    # HTTP surface — asr_srv.py serves POST /inference as multipart form data,
+    # which needs python-multipart.
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "python-multipart>=0.0.20",
+
+    # Whisper backend (default). ctranslate2 is faster-whisper's inference
+    # engine; pinned explicitly because the CUDA DLL situation below is tied
+    # to its major version.
+    "faster-whisper>=1.1",
+    "ctranslate2>=4.5,<5",
+
+    # SenseVoice and Korean Zipformer backends. Pure ONNX on CPU, and the only
+    # backends that work without any CUDA setup.
+    #
+    # `sherpa-onnx` is only the Python binding (_sherpa_onnx.pyd). The native
+    # libraries — including the ONNX Runtime build it was compiled against —
+    # live in `sherpa-onnx-core`, and pip does NOT pull it in automatically.
+    #
+    # Without it the .pyd falls back to plain LoadLibrary("onnxruntime.dll"),
+    # which finds C:\Windows\System32\onnxruntime.dll (ORT 1.17.1, shipped by
+    # Windows itself) and hard-crashes at model load with 0xC0000005:
+    # "requested API version [24] is not available, only [1, 17] supported".
+    #
+    # Both pinned to the same version, and they must stay in lockstep.
+    "sherpa-onnx==1.13.2",
+    "sherpa-onnx-core==1.13.2",
+
+    # ctranslate2 ships cudnn64_9.dll but NOT cublas64_12.dll. Without it,
+    # faster-whisper loads on CUDA perfectly happily and then fails every
+    # single inference with a 500 — a trap that costs an hour to diagnose.
+    # Declared as a hard dependency rather than an extra for exactly that
+    # reason: the default backend is whisper on CUDA, and a default that
+    # silently half-works is worse than a 553 MB download.
+    # Drop this if you only ever use the CPU (sherpa-onnx) backends.
+    "nvidia-cublas-cu12>=12.6",
+]
+
+[dependency-groups]
+# `uv sync --group bench` — bench/compare_backends.py itself needs only numpy;
+# its HTTP is stdlib so the benchmark adds nothing else.
+bench = ["numpy>=1.26"]
+
+[tool.uv]
+# faster-whisper pulls large CUDA wheels; keep resolution reproducible.
+package = false

@@ -5,20 +5,38 @@
 If you installed from the **release `.exe`**, skip the dev-build prerequisites below
 and follow these steps instead.
 
-### 1 — Install Python 3.10+
-
-Download from [python.org](https://www.python.org/downloads/) and tick
-**"Add Python to PATH"** during install.
-
-### 2 — Install faster-whisper and its dependencies
+### 1 — Install uv
 
 ```powershell
-pip install faster-whisper fastapi uvicorn python-multipart ctranslate2
+winget install astral-sh.uv
 ```
+
+uv fetches its own Python, so there is nothing else to install first.
+
+### 2 — Create the ASR sidecar environment
+
+From the repo root:
+
+```powershell
+uv sync
+```
+
+That builds `.venv` from `pyproject.toml` + `uv.lock`. The app finds this venv
+automatically — `resolve_python()` in `commands.rs` prefers it over any
+system interpreter, so you do not need to set `PYTHON_BIN`.
+
+Roughly 700 MB, most of it `nvidia-cublas-cu12`. That wheel is a hard
+dependency rather than an optional extra on purpose: `ctranslate2` ships
+`cudnn64_9.dll` but not cuBLAS, and without it faster-whisper loads on CUDA
+without complaint and then fails **every** inference with a 500.
 
 > On first launch, the Whisper large-v3-turbo model (~1.5 GB) downloads
 > automatically from HuggingFace. This takes a few minutes. The ASR status dot
 > will show **loading** until the download is complete.
+
+> **Do not loosen the `sherpa-onnx==1.13.2` pin without testing.** 1.13.6
+> resolves without its companion `sherpa-onnx-core` wheel and then hard-crashes
+> (0xC0000005) at model load with an ONNX Runtime API-version mismatch.
 
 ### 3 — Set an OpenRouter API key
 
@@ -108,17 +126,18 @@ The ASR backend is `asr_srv.py` — a Python HTTP server that supports two backe
 | `whisper` (default) | faster-whisper (CTranslate2) | moderate | yes, via CUDA |
 | `sensevoice` | SenseVoice ONNX (sherpa-onnx) | excellent | CPU only (fast enough) |
 
-**Step 1 — Install Python 3.10+ and dependencies:**
+**Step 1 — Create the sidecar environment:**
 
 ```powershell
-python --version   # expect 3.10+
-
-# whisper backend
-pip install faster-whisper fastapi uvicorn python-multipart ctranslate2
-
-# sensevoice backend (additional)
-pip install sherpa-onnx
+uv sync
 ```
+
+One command covers every backend — `pyproject.toml` declares the whisper stack
+(faster-whisper, ctranslate2, nvidia-cublas-cu12) and the sherpa-onnx stack
+(SenseVoice, Zipformer-KO) together, and `uv.lock` pins them.
+
+`uv sync --group bench` additionally installs numpy for
+[bench/compare_backends.py](../bench/README.md).
 
 **Step 2 — Set env vars** (user-level, persists across terminals):
 
@@ -169,9 +188,15 @@ transducer (KsponSpeech). CPU real-time (~0.25 s for 25 s), full-length
 transcription, natural conversational Korean; weaker than whisper large-v3 on
 loanwords / code-switching. The model (~110 MB) auto-downloads on first Start to
 `~/.cache/bilingual-subtitle/`; set `ZIPFORMER_MODEL` to a local model directory
-to override. **Shares the sherpa-onnx runtime with SenseVoice**, so `PYTHON_BIN`
-must point at a Python with `sherpa-onnx`, `fastapi`, `uvicorn`, and
-`python-multipart` installed (the whisper backend instead needs `faster-whisper`).
+to override. **Shares the sherpa-onnx runtime with SenseVoice** — `uv sync`
+installs it, so no interpreter juggling is needed.
+
+> The sherpa backends need **both** `sherpa-onnx` and `sherpa-onnx-core` at the
+> same version. `sherpa-onnx` alone is just the Python binding; without the
+> `-core` wheel's native libraries the extension falls back to
+> `C:\Windows\System32\onnxruntime.dll` — ORT 1.17.1, shipped by Windows — and
+> hard-crashes (0xC0000005) at model load on an API-version mismatch.
+> `pyproject.toml` pins both; do not drop one.
 
 **GPU acceleration:** faster-whisper uses CTranslate2 with CUDA automatically when
 an NVIDIA GPU is present.  SenseVoice and Zipformer-KO run on CPU (ONNX) and are
