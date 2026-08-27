@@ -1,5 +1,87 @@
 //! Small shared helpers.
 
+use std::path::{Path, PathBuf};
+
+/// Load `KEY=VALUE` pairs from a `.env` file into the process environment.
+///
+/// Exists so secrets (`OPENROUTER_API_KEY`) can live in a gitignored file next
+/// to the project instead of the machine-wide environment or `settings.json`.
+/// Hand-rolled rather than pulling in a crate — the format we need is a dozen
+/// lines of parsing.
+///
+/// A variable already present in the real environment is never overwritten, so
+/// `OPENROUTER_API_KEY=... cargo tauri dev` still wins over the file.
+///
+/// Returns the file that was loaded, if any.
+pub fn load_dotenv() -> Option<PathBuf> {
+    for path in dotenv_candidates() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            apply_dotenv(&contents);
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Search order: explicit override → cwd → repo root (dev) → exe dir (bundled).
+fn dotenv_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(explicit) = std::env::var("BILINGSUBS_ENV_FILE") {
+        if !explicit.is_empty() {
+            out.push(PathBuf::from(explicit));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        out.push(cwd.join(".env"));
+        // `cargo tauri dev` runs from src-tauri/; the file lives one level up.
+        if let Some(parent) = cwd.parent() {
+            out.push(parent.join(".env"));
+        }
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        out.push(dir.join(".env"));
+    }
+    out
+}
+
+fn apply_dotenv(contents: &str) {
+    for (key, value) in parse_dotenv(contents) {
+        if std::env::var_os(&key).is_none() {
+            // Real environment wins; the file only fills gaps.
+            std::env::set_var(&key, &value);
+        }
+    }
+}
+
+/// Pure parser, split out from `apply_dotenv` so it can be tested without
+/// mutating the process environment.
+fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        // Strip one layer of matching quotes, if present.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
+}
+
 /// Poll `url` with GET until it returns 200 or `timeout_secs` expires.
 /// Used to wait for the asr-srv sidecar to come up.
 pub fn wait_for_http_ok(url: &str, timeout_secs: u64) -> bool {
@@ -12,4 +94,44 @@ pub fn wait_for_http_ok(url: &str, timeout_secs: u64) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_dotenv;
+
+    #[test]
+    fn parse_dotenv_handles_comments_quotes_and_export() {
+        let pairs = parse_dotenv(
+            "# a comment\n\
+             \n\
+             OPENROUTER_API_KEY=sk-or-v1-abc\n\
+             export OPENROUTER_MODEL=\"google/gemini-2.5-flash-lite\"\n\
+             QUOTED='single'\n\
+               SPACED  =  value  \n\
+             not_a_pair\n\
+             =novalue\n",
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("OPENROUTER_API_KEY".into(), "sk-or-v1-abc".into()),
+                ("OPENROUTER_MODEL".into(), "google/gemini-2.5-flash-lite".into()),
+                ("QUOTED".into(), "single".into()),
+                ("SPACED".into(), "value".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_dotenv_keeps_inner_equals_and_urls() {
+        let pairs = parse_dotenv("OPENROUTER_BASE_URL=https://openrouter.ai/api/v1\nA=b=c\n");
+        assert_eq!(
+            pairs,
+            vec![
+                ("OPENROUTER_BASE_URL".into(), "https://openrouter.ai/api/v1".into()),
+                ("A".into(), "b=c".into()),
+            ]
+        );
+    }
 }

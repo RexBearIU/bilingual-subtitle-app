@@ -45,6 +45,11 @@ fn toggle_always_on_top(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything reads the environment: a gitignored `.env` next to the
+    // project (or the exe) can supply OPENROUTER_API_KEY and friends. Real
+    // environment variables still take priority.
+    let dotenv_path = util::load_dotenv();
+
     tauri::Builder::default()
         .manage(Mutex::new(AppState::default()))
         .manage(Mutex::new(state::AsrProc(None)))
@@ -65,7 +70,13 @@ pub fn run() {
             commands::list_audio_processes,
             commands::set_capture_process,
         ])
-        .setup(|app| {
+        .setup(move |app| {
+            match &dotenv_path {
+                // Path only — never the contents, which hold the API key.
+                Some(p) => log::info!("loaded .env from {p:?}"),
+                None => log::debug!("no .env file found"),
+            }
+
             // ── Load persistent settings ────────────────────────────────────
             let settings_path = app
                 .path()

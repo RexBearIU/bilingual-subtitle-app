@@ -28,11 +28,22 @@ Translation calls a hosted model, so it needs a key from
 Easiest: launch the app, open **Settings ⚙️**, paste the key, press 儲存. It is
 stored in `%APPDATA%\com.bilingualsubtitle.app\settings.json`.
 
-Or set it as an environment variable (this takes priority over the stored key):
+Or put it in a gitignored `.env` at the repo root — copy the template and fill
+in the blank:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Or set it as a real environment variable, which takes priority over both `.env`
+and the stored key:
 
 ```powershell
 [System.Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "sk-or-v1-...", "User")
 ```
+
+Resolution order is: real environment → `.env` → `settings.json`.
 
 Without a key the app still runs — ASR works and subtitles show the source text
 only, with the translation status dot red.
