@@ -1,5 +1,7 @@
 mod asr;
-mod audio;
+// Public so `src/bin/record_loopback.rs` can reuse the WASAPI capture and
+// resampling primitives instead of reimplementing them.
+pub mod audio;
 mod commands;
 mod pipeline;
 mod settings;
