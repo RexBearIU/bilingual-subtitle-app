@@ -49,5 +49,13 @@ Zipformer), translates it via **OpenRouter**, and renders
 
 ## Out of scope (MVP)
 
-Chrome extension · mobile · cloud API · accounts · payment · OBS plugin ·
+Chrome extension · mobile · accounts · payment · OBS plugin ·
 speech-to-speech · recording · subtitle export.
+
+Cloud was out of scope until [ADR-0011](docs/DECISIONS.md) moved translation to
+OpenRouter. ASR stays local — no speech-to-text API is involved, and captured
+audio never leaves the machine.
+
+## License
+
+[MIT](LICENSE) © RexBearIU
