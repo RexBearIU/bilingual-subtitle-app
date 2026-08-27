@@ -30,9 +30,13 @@ const PRESETS: &[(&str, &str, &str)] = &[
         "google/gemini-3.5-flash-lite",
     ),
     (
+        // Measured on this account: 500 ms median, no empty responses — faster
+        // than either Gemini route. The alternatives are worse for subtitles:
+        // qwen3.6 emits a <think> preamble every call, and both gpt-oss sizes
+        // returned empty content on 1 line in 4.
         "groq",
         "https://api.groq.com/openai/v1",
-        "llama-3.3-70b-versatile",
+        "qwen/qwen3.8-27b",
     ),
 ];
 

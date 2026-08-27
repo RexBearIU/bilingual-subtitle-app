@@ -21,6 +21,13 @@ use crate::state;
 use crate::translate::{Provider, RemoteConfig, TranslationRequest};
 use crate::types::{SubtitleMode, SubtitleTexts, SubtitleUpdate};
 
+/// Sent on every request.  Providers sit behind bots-and-abuse filters that
+/// judge the client by its User-Agent — Groq's Cloudflare rules reject the
+/// stock `Python-urllib` one with a 403 that looks nothing like an auth error.
+/// `ureq`'s default passes today; naming the app makes that independent of the
+/// HTTP crate's version.
+const USER_AGENT: &str = concat!("BilingualSubtitles/", env!("CARGO_PKG_VERSION"));
+
 /// Per-request ceiling.  Subtitles are short; anything slower than this has
 /// already scrolled off screen, so failing fast beats waiting.
 const REQUEST_TIMEOUT_SECS: u64 = 12;
@@ -233,6 +240,7 @@ fn check_credentials(agent: &ureq::Agent, provider: &Provider) -> Result<(), Cre
     match agent
         .get(&provider.key_url())
         .set("Authorization", &format!("Bearer {}", provider.api_key))
+        .set("User-Agent", USER_AGENT)
         .call()
     {
         Ok(_) => Ok(()),
@@ -398,6 +406,7 @@ fn post_with_retry(
         let mut req = agent
             .post(&url)
             .set("Content-Type", "application/json")
+            .set("User-Agent", USER_AGENT)
             .set("Authorization", &format!("Bearer {}", provider.api_key));
         // Optional attribution headers — they place the app on OpenRouter's
         // leaderboards and are ignored when absent.

@@ -41,6 +41,12 @@ from pathlib import Path
 
 API_ROOT = "https://openrouter.ai/api/v1"
 
+# Providers sit behind bots-and-abuse filters that judge the client by its
+# User-Agent. Groq's Cloudflare rules reject the stock `Python-urllib/3.x` with
+# a 403 "error code: 1010" that looks nothing like an auth failure — so always
+# send something. Matches what the app sends.
+USER_AGENT = "BilingualSubtitles/0.1.0"
+
 # Mirrors build_system_prompt() in translate/openrouter.rs for source_lang="ko".
 SYSTEM_PROMPT = (
     "You are a real-time subtitle translator. "
@@ -95,6 +101,7 @@ def api_key(repo_root: Path) -> str:
 
 def get_json(url: str, key: str | None = None, timeout: float = 30) -> dict:
     req = urllib.request.Request(url)
+    req.add_header("User-Agent", USER_AGENT)
     if key:
         req.add_header("Authorization", f"Bearer {key}")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -142,6 +149,7 @@ def translate_once(
         req = urllib.request.Request(f"{API_ROOT}/chat/completions", data=payload, method="POST")
         req.add_header("Authorization", f"Bearer {key}")
         req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", USER_AGENT)
         req.add_header("HTTP-Referer", "https://github.com/RexBearIU/bilingual-subtitle-app")
         req.add_header("X-Title", "Bilingual Subtitles")
 
