@@ -238,6 +238,8 @@ class BackendResult:
     latencies_ms: list[float] = field(default_factory=list)
     load_s: float = 0.0
     error: str | None = None
+    # Kept only on failure, so the report can point at the traceback.
+    server_log: Path | None = None
 
 
 def _encode_multipart(fields: dict[str, str], wav: bytes) -> tuple[bytes, str]:
@@ -297,6 +299,7 @@ def run_backend(
     port: int,
     lang: str | None,
     load_timeout_s: float,
+    log_dir: Path,
 ) -> BackendResult:
     if alias in BACKEND_ALIASES:
         backend, model, extra = BACKEND_ALIASES[alias]
@@ -314,7 +317,12 @@ def run_backend(
     cmd += ["--host", "127.0.0.1", "--port", str(port)] + extra
 
     print(f"\n── {alias} ──  {' '.join(cmd[1:])}", flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    # Keep the server's output: an HTTP 500 from /inference is meaningless
+    # without the traceback behind it (missing CUDA DLLs, OOM, bad model id).
+    log_dir.mkdir(parents=True, exist_ok=True)
+    server_log = log_dir / f"{alias.replace(':', '_')}.server.log"
+    log_handle = server_log.open("wb")
+    proc = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
     try:
         t0 = time.monotonic()
         wait_for_ready(port, proc, load_timeout_s)
@@ -344,7 +352,26 @@ def run_backend(
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             proc.kill()
+        log_handle.close()
+
+    if result.error:
+        result.server_log = server_log
+        # Surface the tail inline — the whole point of keeping it is to avoid
+        # a second run just to find out why the first one failed.
+        tail = _log_tail(server_log)
+        if tail:
+            print("   server log tail:", flush=True)
+            for line in tail:
+                print(f"     | {line}", flush=True)
     return result
+
+
+def _log_tail(path: Path, lines: int = 12) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [ln for ln in text.splitlines() if ln.strip()][-lines:]
 
 
 # ── reporting ────────────────────────────────────────────────────────────────
@@ -372,7 +399,10 @@ def write_report(
     ]
     for r in results:
         if r.error:
-            lines.append(f"| {r.name} | {r.model} | — | — | — | FAILED: {r.error} |")
+            log_hint = f" (see `{r.server_log.name}`)" if r.server_log else ""
+            lines.append(
+                f"| {r.name} | {r.model} | — | — | — | FAILED: {r.error}{log_hint} |"
+            )
             continue
         lat = sorted(r.latencies_ms)
         p90 = lat[min(len(lat) - 1, int(len(lat) * 0.9))] if lat else 0
@@ -431,7 +461,22 @@ def write_report(
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
+def force_utf8_console() -> None:
+    """Print Korean/Chinese transcripts on a legacy-codepage console.
+
+    A Windows console inherits the system ANSI codepage (cp950 on a Traditional
+    Chinese install), and printing Hangul raises UnicodeEncodeError — which
+    would abort a backend AFTER its inference already succeeded.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass  # already UTF-8, or redirected somewhere that cannot reconfigure
+
+
 def main() -> int:
+    force_utf8_console()
     repo_root = Path(__file__).resolve().parent.parent
 
     ap = argparse.ArgumentParser(
@@ -477,7 +522,7 @@ def main() -> int:
         run_backend(
             alias.strip(), segments,
             script=args.script, python_bin=args.python, port=args.port,
-            lang=args.lang, load_timeout_s=args.load_timeout,
+            lang=args.lang, load_timeout_s=args.load_timeout, log_dir=args.out,
         )
         for alias in args.backends.split(",") if alias.strip()
     ]
