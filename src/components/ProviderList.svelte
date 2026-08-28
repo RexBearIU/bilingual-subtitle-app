@@ -4,10 +4,6 @@
 
   let { providers, activeIdx }: { providers: ProviderInfo[]; activeIdx: number } = $props();
 
-  // The list the panel edits. Rebuilt from `providers` whenever the backend
-  // publishes a new one, except while a form is open — otherwise a status
-  // broadcast (they arrive on every RMS update) would wipe what is being typed.
-  let draft = $state<ProviderDraft[]>([]);
   let editing = $state<number | null>(null);
   let adding = $state(false);
   let error = $state("");
@@ -15,17 +11,26 @@
 
   /** Key input for the row being edited or added; never pre-filled. */
   let keyDraft = $state("");
-  let form = $state({ name: "", baseUrl: "", model: "" });
+  let form = $state({ name: "", label: "", baseUrl: "", model: "" });
 
-  let presets = $state<string[]>([]);
+  let presets = $state<{ name: string; label: string }[]>([]);
   cmd.translatePresetNames().then((n) => (presets = n)).catch(() => {});
 
-  $effect(() => {
-    // Read `providers` so this re-runs when the backend list changes.
-    const incoming = providers;
-    if (editing !== null || adding) return;
-    draft = incoming.map((p) => ({ name: p.name, baseUrl: p.baseUrl, model: p.model }));
-  });
+  /** The current list as drafts — every edit is "here is the whole list". */
+  function snapshot(): ProviderDraft[] {
+    return providers.map((p) => ({
+      name: p.name,
+      // `label` is already resolved, so sending it back would freeze the
+      // preset's label into settings.json. Only send one the user typed.
+      label: presetLabel(p.name) === p.label ? "" : p.label,
+      baseUrl: p.baseUrl,
+      model: p.model,
+    }));
+  }
+
+  function presetLabel(name: string): string {
+    return presets.find((q) => q.name === name)?.label ?? name;
+  }
 
   async function commit(next: ProviderDraft[]) {
     busy = true;
@@ -43,7 +48,7 @@
   }
 
   function openAdd() {
-    form = { name: "", baseUrl: "", model: "" };
+    form = { name: "", label: "", baseUrl: "", model: "" };
     keyDraft = "";
     error = "";
     adding = true;
@@ -52,7 +57,12 @@
 
   function openEdit(i: number) {
     const p = providers[i];
-    form = { name: p.name, baseUrl: p.baseUrl, model: p.model };
+    form = {
+      name: p.name,
+      label: presetLabel(p.name) === p.label ? "" : p.label,
+      baseUrl: p.baseUrl,
+      model: p.model,
+    };
     keyDraft = "";
     error = "";
     editing = i;
@@ -64,22 +74,17 @@
     editing = null;
     keyDraft = "";
     error = "";
-    draft = providers.map((p) => ({ name: p.name, baseUrl: p.baseUrl, model: p.model }));
-  }
-
-  /** A preset name fills its own URL and model in, so only a key is needed. */
-  function onNameInput(v: string) {
-    form.name = v;
   }
 
   async function submit() {
     const name = form.name.trim();
     if (!name) {
-      error = "請填名稱";
+      error = "請填供應商代號";
       return;
     }
     const entry: ProviderDraft = {
       name,
+      label: form.label.trim(),
       baseUrl: form.baseUrl.trim(),
       model: form.model.trim(),
     };
@@ -87,17 +92,18 @@
     // which is what an edit that does not touch the key should do.
     if (keyDraft.trim()) entry.apiKey = keyDraft.trim();
 
-    const next = providers.map((p) => ({ name: p.name, baseUrl: p.baseUrl, model: p.model }));
+    const next = snapshot();
     if (editing !== null) {
-      // A rename loses the stored key, since keys are carried forward by name.
+      // Changing the identity loses the stored key, which is carried forward by
+      // name. Changing only the display name is free — that is why it exists.
       if (entry.name !== providers[editing].name && !entry.apiKey) {
-        error = "改名後要重新輸入金鑰";
+        error = "改代號等於換一個供應商，要重新輸入金鑰（只想改稱呼請改「顯示名稱」）";
         return;
       }
       next[editing] = entry;
     } else {
       if (next.some((p) => p.name === entry.name)) {
-        error = `已經有一個叫 ${entry.name} 的供應商`;
+        error = `已經有一個代號叫 ${entry.name} 的供應商`;
         return;
       }
       if (!entry.apiKey) {
@@ -110,21 +116,12 @@
   }
 
   async function remove(i: number) {
-    const next = providers
-      .filter((_, j) => j !== i)
-      .map((p) => ({ name: p.name, baseUrl: p.baseUrl, model: p.model }));
-    await commit(next);
+    await commit(snapshot().filter((_, j) => j !== i));
   }
 
   async function clearKey(i: number) {
-    const next = providers.map((p, j) => ({
-      name: p.name,
-      baseUrl: p.baseUrl,
-      model: p.model,
-      // "" clears it; the environment then takes over again if it has one.
-      ...(j === i ? { apiKey: "" } : {}),
-    }));
-    await commit(next);
+    // "" clears it; the environment then takes over again if it has one.
+    await commit(snapshot().map((p, j) => (j === i ? { ...p, apiKey: "" } : p)));
   }
 
   // ── drag to reorder ────────────────────────────────────────────────────────
@@ -149,7 +146,7 @@
     dragFrom = null;
     dragOver = null;
     if (from === null || from === to) return;
-    const next = providers.map((p) => ({ name: p.name, baseUrl: p.baseUrl, model: p.model }));
+    const next = snapshot();
     const [moved] = next.splice(from, 1);
     next.splice(to, 0, moved);
     await commit(next);
@@ -176,9 +173,13 @@
           ondragend={onDragEnd}
         >
           <span class="handle" title="拖曳調整順序">⠿</span>
-          <button class="pick" onclick={() => cmd.setTranslateProvider(i)} title="改用這一個">
+          <button
+            class="pick"
+            onclick={() => cmd.setTranslateProvider(i)}
+            title={`改用這一個（代號 ${p.name}）`}
+          >
             <span class="name">
-              {p.name}
+              {p.label}
               {#if p.keySource === "env"}<span class="tag" title=".env 提供金鑰">env</span>{/if}
             </span>
             <span class="model">{p.model}</span>
@@ -190,7 +191,7 @@
       {/each}
     </ul>
   {:else}
-    <p class="hint warn">尚未設定任何翻譯供應商。按下方「新增」填入名稱與 API 金鑰。</p>
+    <p class="hint warn">尚未設定任何翻譯供應商。按下方「新增」挑一個並貼上 API 金鑰。</p>
   {/if}
 
   {#if !adding && editing === null}
@@ -203,14 +204,23 @@
   {#if adding || editing !== null}
     <div class="form">
       <div class="frow">
-        <span class="flabel">名稱</span>
+        <span class="flabel">供應商</span>
         <input
           class="fin" list="tl-presets" spellcheck="false" placeholder="groq"
-          value={form.name} oninput={(e) => onNameInput(e.currentTarget.value)} />
+          bind:value={form.name} />
       </div>
       <datalist id="tl-presets">
-        {#each presets as name (name)}<option value={name}></option>{/each}
+        {#each presets as q (q.name)}<option value={q.name}>{q.label}</option>{/each}
       </datalist>
+      <p class="hint sub">代號用來對應金鑰與 .env，選內建的就只要填金鑰</p>
+
+      <div class="frow">
+        <span class="flabel">顯示名稱</span>
+        <input
+          class="fin" spellcheck="false"
+          placeholder={form.name.trim() ? `留空＝${presetLabel(form.name.trim())}` : "留空＝用代號"}
+          bind:value={form.label} />
+      </div>
 
       <div class="frow">
         <span class="flabel">Base URL</span>
@@ -418,6 +428,7 @@
     line-height: 1.45;
   }
   .hint.inline { flex: 1; min-width: 0; }
+  .hint.sub { margin: -2px 0 1px 70px; color: #4a555f; }
   .hint.warn { color: #a8705a; padding: 2px 0 4px; }
   .hint.err { color: #e08070; }
 </style>

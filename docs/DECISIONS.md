@@ -485,3 +485,27 @@ no secret is copied into a second file.
   otherwise swallows HTML5 drag events. The overlay accepts no file drops.
 - Every tab in the panel is now the same height, so switching one does not
   resize the panel under the cursor.
+
+## ADR-0018 — A provider's display name is not its identity
+
+`SavedProvider.name` does three jobs at once: it keys the stored API key, it
+keys `TRANSLATE_<NAME>_API_KEY`, and it is what the list shows. That makes the
+obvious gesture — renaming a row because `aistudio31` reads badly — silently
+orphan the key, and the panel cannot even warn usefully, because it never
+receives the key it is about to lose.
+
+So `label` was split out. `name` stays the identity and is the only thing any
+lookup uses; `label` is free text with no consequences, resolved as
+*typed label → preset's label → the name itself*. Presets carry a written-out
+label (`groq` → `Groq`, `aistudio` → `Google AI Studio`), so an existing setup
+gets readable rows without anyone editing anything.
+
+The resolved label is what crosses IPC, so the panel has nothing to resolve.
+The cost is that it must not echo a resolved label straight back on the next
+edit — that would freeze today's preset text into `settings.json` and stop
+future corrections from reaching an old install. `snapshot()` therefore sends
+`""` whenever the label still matches the preset's.
+
+Logs use the label too. A line reading `groq failed 2x` while the row on screen
+says `Groq` is a small thing, but it is the kind of small thing that makes a
+user doubt they are looking at the same provider.

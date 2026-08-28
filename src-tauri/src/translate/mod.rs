@@ -23,15 +23,23 @@ use crate::settings::{PersistSettings, SavedProvider, SettingsPath};
 use crate::types::SubtitleMode;
 
 /// Built-in presets, so a well-known provider needs only a name and a key.
-/// `(name, base_url, default_model)`
-const PRESETS: &[(&str, &str, &str)] = &[
+///
+/// `label` is what the UI shows. It is separate from `name` because `name` is
+/// an identity: it keys the stored API key and `TRANSLATE_<NAME>_API_KEY`, and
+/// it is what the logs say. Tying the display text to that would mean a
+/// cosmetic rename silently orphans a key.
+///
+/// `(name, label, base_url, default_model)`
+const PRESETS: &[(&str, &str, &str, &str)] = &[
     (
         "aistudio",
+        "Google AI Studio",
         "https://generativelanguage.googleapis.com/v1beta/openai/",
         "gemini-3.5-flash-lite",
     ),
     (
         "openrouter",
+        "OpenRouter",
         "https://openrouter.ai/api/v1",
         "google/gemini-3.5-flash-lite",
     ),
@@ -41,6 +49,7 @@ const PRESETS: &[(&str, &str, &str)] = &[
         // qwen3.6 emits a <think> preamble every call, and both gpt-oss sizes
         // returned empty content on 1 line in 4.
         "groq",
+        "Groq",
         "https://api.groq.com/openai/v1",
         "qwen/qwen3.8-27b",
     ),
@@ -49,16 +58,39 @@ const PRESETS: &[(&str, &str, &str)] = &[
 /// Used when nothing is configured at all.
 pub const DEFAULT_PROVIDER: &str = "openrouter";
 
-/// Names with a built-in preset, offered by the Settings panel's add form.
-pub fn preset_names() -> Vec<&'static str> {
-    PRESETS.iter().map(|(n, _, _)| *n).collect()
+/// A built-in preset as the Settings panel's add form sees it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetInfo {
+    pub name: String,
+    pub label: String,
+}
+
+/// Presets offered by the add form: pick one and only a key is needed.
+pub fn preset_list() -> Vec<PresetInfo> {
+    PRESETS
+        .iter()
+        .map(|(n, label, _, _)| PresetInfo { name: (*n).into(), label: (*label).into() })
+        .collect()
 }
 
 fn preset(name: &str) -> Option<(&'static str, &'static str)> {
     PRESETS
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, base, model)| (*base, *model))
+        .find(|(n, _, _, _)| *n == name)
+        .map(|(_, _, base, model)| (*base, *model))
+}
+
+/// The display text for a name with no label of its own.
+///
+/// Falls back to the name itself, so a hand-rolled entry still reads as
+/// something rather than as a blank row.
+fn default_label(name: &str) -> String {
+    PRESETS
+        .iter()
+        .find(|(n, _, _, _)| *n == name)
+        .map(|(_, label, _, _)| (*label).to_string())
+        .unwrap_or_else(|| name.to_string())
 }
 
 // ── the live provider list ──────────────────────────────────────────────────
@@ -68,8 +100,10 @@ fn preset(name: &str) -> Option<(&'static str, &'static str)> {
 /// Deliberately NOT stored in `AppState`: that derives `Debug` and is logged on
 /// state changes, which would print the API key.
 pub struct Provider {
-    /// Config key and log label (`aistudio`, `openrouter`, …).
+    /// Config key (`aistudio`, `openrouter`, …).
     pub name: String,
+    /// What the UI and the logs show. Never used to look anything up.
+    pub label: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -108,6 +142,7 @@ impl Provider {
     fn info(&self) -> ProviderInfo {
         ProviderInfo {
             name: self.name.clone(),
+            label: self.label.clone(),
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             key_source: self.key_source,
@@ -124,6 +159,8 @@ impl Provider {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInfo {
     pub name: String,
+    /// Display text; falls back to the preset's label, then to `name`.
+    pub label: String,
     pub model: String,
     pub base_url: String,
     pub key_source: KeySource,
@@ -180,7 +217,7 @@ pub fn describe(infos: &[ProviderInfo]) -> String {
     }
     infos
         .iter()
-        .map(|p| format!("{}({})", p.name, p.model))
+        .map(|p| format!("{}({})", p.label, p.model))
         .collect::<Vec<_>>()
         .join(" → ")
 }
@@ -245,6 +282,9 @@ fn seed_from_env() -> Vec<SavedProvider> {
             let upper = env_prefix(name);
             SavedProvider {
                 name: name.to_string(),
+                // Left empty so the preset's label applies, and keeps applying
+                // if it is ever improved.
+                label: String::new(),
                 // Left empty when a preset covers it, so the preset stays
                 // authoritative if it is ever corrected.
                 base_url: non_empty_env(&format!("TRANSLATE_{upper}_BASE_URL")).unwrap_or_default(),
@@ -276,6 +316,7 @@ fn build_one(s: &SavedProvider) -> Option<Provider> {
 
     Some(Provider {
         name: s.name.clone(),
+        label: non_empty(s.label.clone()).unwrap_or_else(|| default_label(&s.name)),
         base_url,
         api_key,
         model,
@@ -328,14 +369,15 @@ fn seed_from_legacy(app: &AppHandle) -> Option<SavedProvider> {
     // say "openrouter" while pointing at Google.
     let name = PRESETS
         .iter()
-        .find(|(_, base, _)| {
+        .find(|(_, _, base, _)| {
             !base_url.is_empty() && base_url.trim_end_matches('/') == base.trim_end_matches('/')
         })
-        .map(|(n, _, _)| (*n).to_string())
+        .map(|(n, _, _, _)| (*n).to_string())
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
 
     Some(SavedProvider {
         name,
+        label: String::new(),
         base_url: if preset_covers(&base_url) { String::new() } else { base_url },
         api_key: stored.unwrap_or_default(),
         model: non_empty_env("OPENROUTER_MODEL")
@@ -348,7 +390,7 @@ fn seed_from_legacy(app: &AppHandle) -> Option<SavedProvider> {
 fn preset_covers(base_url: &str) -> bool {
     PRESETS
         .iter()
-        .any(|(_, base, _)| base_url.trim_end_matches('/') == base.trim_end_matches('/'))
+        .any(|(_, _, base, _)| base_url.trim_end_matches('/') == base.trim_end_matches('/'))
 }
 
 // ── editing ─────────────────────────────────────────────────────────────────
@@ -362,6 +404,9 @@ fn preset_covers(base_url: &str) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderDraft {
     pub name: String,
+    /// Display text. Empty = the preset's label, else the name.
+    #[serde(default)]
+    pub label: String,
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]
@@ -398,6 +443,7 @@ pub fn set_list(app: &AppHandle, drafts: Vec<ProviderDraft>) -> Result<Vec<Provi
         };
         out.push(SavedProvider {
             name,
+            label: d.label.trim().to_string(),
             base_url: d.base_url.trim().to_string(),
             api_key,
             model: d.model.trim().to_string(),
@@ -465,10 +511,33 @@ mod tests {
     fn saved(name: &str, base: &str, key: &str, model: &str) -> SavedProvider {
         SavedProvider {
             name: name.into(),
+            label: String::new(),
             base_url: base.into(),
             api_key: key.into(),
             model: model.into(),
         }
+    }
+
+    #[test]
+    fn a_preset_name_gets_the_presets_display_label() {
+        let p = build_one(&saved("groq", "", "k", "")).expect("built");
+        assert_eq!(p.label, "Groq");
+        assert_eq!(p.name, "groq", "the identity is untouched by the label");
+    }
+
+    #[test]
+    fn an_unknown_name_is_its_own_label() {
+        let p = build_one(&saved("mine", "https://x.test/v1", "k", "m")).expect("built");
+        assert_eq!(p.label, "mine");
+    }
+
+    #[test]
+    fn a_typed_label_wins_over_the_preset() {
+        let mut s = saved("groq", "", "k", "");
+        s.label = "  快的那個  ".into();
+        // Trimmed on the way in by `set_list`; untrimmed input still resolves.
+        let p = build_one(&s).expect("built");
+        assert_eq!(p.label.trim(), "快的那個");
     }
 
     #[test]
@@ -486,6 +555,7 @@ mod tests {
         // Google's documented base URL ends in '/', OpenRouter's does not.
         let mk = |base: &str| Provider {
             name: "t".into(),
+            label: "t".into(),
             base_url: base.into(),
             api_key: "k".into(),
             model: "m".into(),

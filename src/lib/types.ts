@@ -43,7 +43,10 @@ export type KeySource = "settings" | "env";
 
 /** A configured translation endpoint. Never carries the API key. */
 export interface ProviderInfo {
+  /** The identity: keys the stored API key and TRANSLATE_<NAME>_API_KEY. */
   name: string;
+  /** What to show. Already resolved: the preset's label, else the name. */
+  label: string;
   model: string;
   baseUrl: string;
   /** `env` = supplied by TRANSLATE_<NAME>_API_KEY rather than typed in Settings. */
@@ -59,6 +62,8 @@ export interface ProviderInfo {
  */
 export interface ProviderDraft {
   name: string;
+  /** "" = use the preset's label, else the name. */
+  label: string;
   baseUrl: string;
   model: string;
   apiKey?: string;

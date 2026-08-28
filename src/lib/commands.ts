@@ -39,7 +39,7 @@ export const setTranslateProviders = (providers: ProviderDraft[]) =>
 
 /** Names with a built-in base URL and model, so the add form can ask only for a key. */
 export const translatePresetNames = () =>
-  invoke<string[]>("translate_preset_names");
+  invoke<{ name: string; label: string }[]>("translate_preset_names");
 
 /** Re-pin the overlay to the top of the always-on-top band. */
 export const setAlwaysOnTop = (enabled: boolean) =>

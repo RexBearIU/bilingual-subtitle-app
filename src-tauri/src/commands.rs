@@ -464,8 +464,8 @@ pub fn set_translate_providers(
 /// Provider names with a built-in base URL and model, so the add form can offer
 /// them and ask only for a key.
 #[tauri::command]
-pub fn translate_preset_names() -> Vec<&'static str> {
-    crate::translate::preset_names()
+pub fn translate_preset_names() -> Vec<crate::translate::PresetInfo> {
+    crate::translate::preset_list()
 }
 
 #[tauri::command]

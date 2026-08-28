@@ -33,8 +33,13 @@ impl Default for OverlayRect {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedProvider {
-    /// Label, and the identity used to remove it again. Unique within the list.
+    /// The identity: keys the stored API key, `TRANSLATE_<NAME>_API_KEY` and
+    /// the removal. Unique within the list. Not what the UI shows — see
+    /// `label`, which exists so a cosmetic rename cannot orphan a key.
     pub name: String,
+    /// What the UI shows. Empty = the built-in preset's label, else `name`.
+    #[serde(default)]
+    pub label: String,
     /// OpenAI-compatible root, e.g. `https://api.groq.com/openai/v1`.
     /// Empty means "use the built-in preset for this name".
     #[serde(default)]

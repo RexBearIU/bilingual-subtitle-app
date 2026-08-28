@@ -101,18 +101,18 @@ fn translate_loop(
         let p = &startup[i];
         match check_credentials(&agent, p) {
             Ok(()) => {
-                log::info!("TL: {} key OK", p.name);
+                log::info!("TL: {} key OK", p.label);
                 active.store(i, Ordering::Relaxed);
                 break;
             }
             Err(CredError::Unauthorized) => {
-                log::error!("TL: {} rejected the API key (401)", p.name);
+                log::error!("TL: {} rejected the API key (401)", p.label);
                 rejected += 1;
             }
             // A transient network failure at startup should not disable
             // translation — carry on and let per-request retries handle it.
             Err(CredError::Other(e)) => {
-                log::warn!("TL: {} key check inconclusive ({e}) — using it anyway", p.name);
+                log::warn!("TL: {} key check inconclusive ({e}) — using it anyway", p.label);
                 active.store(i, Ordering::Relaxed);
                 break;
             }
@@ -254,7 +254,7 @@ fn translate_loop(
                     let next = idx + 1;
                     log::warn!(
                         "TL: {} failed {consecutive_failures}x — falling forward",
-                        provider.name,
+                        provider.label,
                     );
                     active.store(next, Ordering::Relaxed);
                     counting_for = next;
@@ -476,7 +476,7 @@ fn post_with_retry(
                             "TL: {} ({}) rejects reasoning.enabled=false — dropping it for the \
                              rest of this session. If the model reasons anyway it will spend \
                              max_tokens thinking, which can leave the translation empty.",
-                            provider.name,
+                            provider.label,
                             provider.model
                         );
                     }

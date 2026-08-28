@@ -17,7 +17,7 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `set_hit_regions` | `{ regions: HitRect[] }` | `Result<()>` | Rectangles that stay clickable in `"auto"`. CSS px relative to the client area; replaces the previous set |
 | `set_translate_provider` | `{ index: number }` | `Result<()>` | Switch the active provider; takes effect on the next subtitle. Index into `EngineStatus.translateProviders` |
 | `set_translate_providers` | `{ providers: ProviderDraft[] }` | `Result<()>` | Replace the whole list — add, remove, edit and reorder in one call. Persisted to `settings.json` |
-| `translate_preset_names` | — | `string[]` | Names with a built-in base URL and model, so the add form can ask only for a key |
+| `translate_preset_names` | — | `{ name, label }[]` | Providers with a built-in base URL, model and display label, so the add form can ask only for a key |
 | `set_always_on_top` | `{ enabled: bool }` | `Result<()>` | Re-asserts topmost; re-stacks above other topmost windows |
 | `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120) |
 | `list_audio_processes` | — | `AudioProcess[]` | Windows processes with active audio sessions (for process picker) |
@@ -121,7 +121,10 @@ interface HitRect { x: number; y: number; w: number; h: number }
 
 /** A configured translation endpoint. Never carries the API key. */
 interface ProviderInfo {
+  /** The identity: keys the stored API key and TRANSLATE_<NAME>_API_KEY. */
   name: string;
+  /** Display text, already resolved: the preset's label, else `name`. */
+  label: string;
   model: string;
   baseUrl: string;
   /** `env` = the key came from TRANSLATE_<NAME>_API_KEY, not from Settings. */
@@ -137,6 +140,7 @@ interface ProviderInfo {
  */
 interface ProviderDraft {
   name: string;
+  label: string;     // "" = use the built-in preset's label, else `name`
   baseUrl: string;   // "" = use the built-in preset for this name
   model: string;     // "" = use the built-in preset for this name
   apiKey?: string;
@@ -176,7 +180,7 @@ interface PersistSettings {
   overlay: { x: number; y: number; w: number; h: number };
   clickThrough: ClickThroughMode;
   /** The ordered provider list. Every `apiKey` is ALWAYS returned as "". */
-  providers: { name: string; baseUrl: string; apiKey: string; model: string }[];
+  providers: { name: string; label: string; baseUrl: string; apiKey: string; model: string }[];
   openrouterApiKey: string;   // legacy, ALWAYS ""; migrated into `providers` on first launch
   openrouterModel: string;    // legacy, superseded by `providers`
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)
