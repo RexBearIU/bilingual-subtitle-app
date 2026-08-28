@@ -11,6 +11,7 @@ pub mod remote;
 
 use std::sync::atomic::AtomicBool;
 
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::settings::{PersistSettings, SettingsPath};
@@ -86,6 +87,18 @@ impl Provider {
     }
 }
 
+/// A provider as the UI sees it — identity only.
+///
+/// Separate from `Provider` because this one crosses the IPC boundary and is
+/// stored in `AppState`, which derives `Debug` and is logged. Carrying the key
+/// in a type used that way is how keys end up in log files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInfo {
+    pub name: String,
+    pub model: String,
+}
+
 /// Everything the translate worker needs, in preference order.
 pub struct RemoteConfig {
     /// At least one; tried in order, later entries are fallbacks.
@@ -93,6 +106,11 @@ pub struct RemoteConfig {
     /// Optional attribution headers (OpenRouter leaderboards; ignored elsewhere).
     pub referer: Option<String>,
     pub title: Option<String>,
+    /// True when `TRANSLATE_PROVIDERS` produced this list, which means the
+    /// Settings panel's key and model fields are inert — the legacy path that
+    /// reads them never ran. The UI needs to say so rather than accept edits
+    /// that go nowhere.
+    pub env_managed: bool,
 }
 
 impl RemoteConfig {
@@ -111,13 +129,18 @@ impl RemoteConfig {
     ///
     /// Returns `Err` only when no usable provider has a key.
     pub fn resolve(app: &AppHandle) -> Result<Self, String> {
+        // `Mutex<SettingsPath>`, not `SettingsPath`: that is how lib.rs manages
+        // it. Asking for the bare type always missed, which silently made the
+        // key stored by the Settings panel unreadable — the legacy branch saw
+        // `PersistSettings::default()` every time.
         let saved = app
-            .try_state::<SettingsPath>()
-            .map(|p| PersistSettings::load(&p.0))
+            .try_state::<std::sync::Mutex<SettingsPath>>()
+            .and_then(|p| p.lock().ok().map(|p| PersistSettings::load(&p.0)))
             .unwrap_or_default();
 
         let mut providers = Vec::new();
         let mut skipped: Vec<String> = Vec::new();
+        let mut env_managed = false;
 
         if let Some(list) = non_empty_env("TRANSLATE_PROVIDERS") {
             for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -126,6 +149,7 @@ impl RemoteConfig {
                     None => skipped.push(name.to_string()),
                 }
             }
+            env_managed = !providers.is_empty();
         }
 
         // Legacy single-provider config. Also the path the Settings panel writes.
@@ -154,6 +178,7 @@ impl RemoteConfig {
             providers,
             referer: Some("https://github.com/RexBearIU/bilingual-subtitle-app".into()),
             title: Some("Bilingual Subtitles".into()),
+            env_managed,
         })
     }
 
@@ -164,6 +189,14 @@ impl RemoteConfig {
             .map(|p| format!("{}({})", p.name, p.model))
             .collect::<Vec<_>>()
             .join(" → ")
+    }
+
+    /// Key-free view of the provider list, for `EngineStatus` and the UI.
+    pub fn infos(&self) -> Vec<ProviderInfo> {
+        self.providers
+            .iter()
+            .map(|p| ProviderInfo { name: p.name.clone(), model: p.model.clone() })
+            .collect()
     }
 }
 

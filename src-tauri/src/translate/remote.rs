@@ -12,7 +12,7 @@
 //! active endpoint keeps failing, so one provider's outage or rate limit does
 //! not take subtitles down with it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter};
@@ -37,15 +37,18 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// Spawn the translation worker thread (detached).
 /// Exits when `stop` is set or the sender side of `rx` is dropped.
+/// `active` is shared with `AppState` so the UI can switch provider mid-session
+/// and can see the failovers the worker performs on its own.
 pub fn start_translate_worker(
     rx: std::sync::mpsc::Receiver<TranslationRequest>,
     app: AppHandle,
     cfg: RemoteConfig,
     stop: Arc<AtomicBool>,
+    active: Arc<AtomicUsize>,
 ) {
     std::thread::Builder::new()
         .name("translate-worker".into())
-        .spawn(move || translate_loop(rx, &app, &cfg, &stop))
+        .spawn(move || translate_loop(rx, &app, &cfg, &stop, &active))
         .expect("spawn translate-worker thread");
 }
 
@@ -56,6 +59,7 @@ fn translate_loop(
     app: &AppHandle,
     cfg: &RemoteConfig,
     stop: &Arc<AtomicBool>,
+    active: &Arc<AtomicUsize>,
 ) {
     log::info!("TL: providers {}", cfg.names());
     set_tl_status(app, "loading");
@@ -67,13 +71,20 @@ fn translate_loop(
 
     // Start on the first provider whose key is accepted, so a stale key in the
     // first slot costs one startup check rather than every subtitle.
-    let mut active = 0usize;
+    //
+    // The scan begins at whatever the UI last selected rather than at 0, so a
+    // provider the user pinned in an earlier session is not silently undone by
+    // a restart.
+    let n = cfg.providers.len();
+    let first = active.load(Ordering::Relaxed).min(n - 1);
     let mut rejected = 0usize;
-    for (i, p) in cfg.providers.iter().enumerate() {
+    for step in 0..n {
+        let i = (first + step) % n;
+        let p = &cfg.providers[i];
         match check_credentials(&agent, p) {
             Ok(()) => {
                 log::info!("TL: {} key OK", p.name);
-                active = i;
+                active.store(i, Ordering::Relaxed);
                 break;
             }
             Err(CredError::Unauthorized) => {
@@ -84,12 +95,12 @@ fn translate_loop(
             // translation — carry on and let per-request retries handle it.
             Err(CredError::Other(e)) => {
                 log::warn!("TL: {} key check inconclusive ({e}) — using it anyway", p.name);
-                active = i;
+                active.store(i, Ordering::Relaxed);
                 break;
             }
         }
     }
-    if rejected == cfg.providers.len() {
+    if rejected == n {
         log::error!(
             "TL: every provider rejected its key — check TRANSLATE_<NAME>_API_KEY / \
              OPENROUTER_API_KEY, or the key in Settings"
@@ -103,6 +114,10 @@ fn translate_loop(
     /// Two, not one: a single 429 or blip is what the per-request retry is for.
     const FAILOVER_AFTER: u32 = 2;
     let mut consecutive_failures = 0u32;
+    // Tracks which provider the failure counter belongs to. A switch from the
+    // UI must not inherit the outgoing provider's strikes, or the new one can
+    // be failed over on its very first error.
+    let mut counting_for = active.load(Ordering::Relaxed);
     // Rolling context: the last few successful (source, translated) pairs,
     // injected as prior chat turns.  Gives the model cross-subtitle context —
     // pronouns, names, and topic continuity — which matters a lot for Korean,
@@ -180,7 +195,15 @@ fn translate_loop(
             .map(|(s, t)| (s.as_str(), t.as_str()))
             .collect();
         let t_tl = std::time::Instant::now();
-        let provider = &cfg.providers[active];
+        // Re-read every request: the UI can have switched provider since the
+        // last one. `% n` because the list is rebuilt on each pipeline start
+        // and may have shrunk under a stale index.
+        let idx = active.load(Ordering::Relaxed) % n;
+        if idx != counting_for {
+            consecutive_failures = 0;
+            counting_for = idx;
+        }
+        let provider = &cfg.providers[idx];
         match call_translate(
             &agent, provider, cfg, &req.source_lang, &req.source_text, req.mode, &prev, music_mode,
         ) {
@@ -205,15 +228,19 @@ fn translate_loop(
                 // success on the new provider resets the counter, and nothing
                 // pins us there, so a later rotation can come back around.
                 consecutive_failures += 1;
-                if consecutive_failures >= FAILOVER_AFTER && cfg.providers.len() > 1 {
-                    let next = (active + 1) % cfg.providers.len();
+                if consecutive_failures >= FAILOVER_AFTER && n > 1 {
+                    let next = (idx + 1) % n;
                     log::warn!(
                         "TL: {} failed {consecutive_failures}x — switching to {}",
-                        cfg.providers[active].name,
+                        cfg.providers[idx].name,
                         cfg.providers[next].name,
                     );
-                    active = next;
+                    active.store(next, Ordering::Relaxed);
+                    counting_for = next;
                     consecutive_failures = 0;
+                    // Let the UI show which provider is live now, not the one
+                    // that was picked at startup.
+                    state::update_and_emit(app, |_| {});
                 }
             }
         }

@@ -259,3 +259,118 @@ the wrong trade.
   set/unset indicator.
 - **ASR is unaffected and stays local** — OpenRouter has no speech-to-text API,
   so `asr_srv.py` and its models remain a hard requirement.
+
+---
+
+## ADR-0012 — Cursor-driven click-through, replacing the on/off toggle
+
+**Date:** 2026-08-28 · **Status:** Accepted
+
+**Context.** The overlay is a transparent, decoration-less, always-on-top window
+spanning the bottom of the screen. To Windows it is a solid hit target across its
+whole rectangle, so every click inside it was swallowed — including the majority
+that land on empty space with no subtitle drawn under the cursor. The window
+spent most of its life blocking the video it was captioning.
+
+CSS `pointer-events: none` does not help. It decides which element inside the
+page receives an event, not whether the OS delivers one to the window at all; by
+the time the page could opt out, the click has already been consumed.
+
+The existing escape valve was a manual on/off toggle backed by
+`set_ignore_cursor_events`. Both of its states are wrong most of the time: "off"
+blocks clicks meant for the app underneath, and "on" makes the overlay's own
+controls unreachable. Users were toggling it constantly.
+
+**Decision.** Make the policy tri-state (`off` / `auto` / `on`) and default to
+`auto`, in which the flag is driven by where the cursor is. The frontend
+publishes the rectangles it wants to keep clickable — the control bar, and the
+settings backdrop while it is open — via `set_hit_regions`, in CSS pixels
+relative to the client area. A background thread samples the global cursor every
+50 ms and flips `set_ignore_cursor_events` as it crosses them.
+
+Polling, not events: while the window is ignoring the cursor it receives no mouse
+events at all, so there is no event that could tell us to turn interaction back
+on. The thread is the only code allowed to call `set_ignore_cursor_events`;
+commands and the tray record intent and ask for an immediate re-evaluation,
+rather than writing the flag themselves and racing the poll.
+
+**Consequence.**
+- Subtitles no longer intercept clicks, which also means they can no longer be
+  dragged. The control bar becomes the window's drag handle instead.
+- Two failure modes are deliberately asymmetric. Reading the cursor or the
+  window geometry can fail; when it does we report "over a region", leaving the
+  window interactive. A window that wrongly keeps the mouse is recoverable by
+  the user; one that wrongly passes it through hides its own controls.
+- The flag is never flipped while the left button is down, so dragging a slider
+  or the window itself cannot be dropped mid-gesture by the cursor wandering
+  outside every region.
+- The mode persists to `settings.json`. `Ctrl+Alt+P` still forces `off`, and the
+  tray now offers all three states rather than a checkbox.
+- Windows-only, like the rest of the overlay's window handling: `cursor_pos` and
+  `left_button_down` are stubs elsewhere, which degrades `auto` to "always
+  interactive".
+
+---
+
+## ADR-0013 — Provider switching from the UI
+
+**Date:** 2026-08-28 · **Status:** Accepted · **Extends:** ADR-0011
+
+**Context.** ADR-0011 made the translation endpoint configuration rather than
+code, and that grew into an ordered list with automatic failover. But the active
+index was a local variable inside the translate worker: invisible to the UI, and
+changeable only by restarting the pipeline. Meanwhile the Settings panel still
+offered a single key and model field that the multi-provider path never reads —
+typing into them did nothing, silently.
+
+**Decision.** Move the active index into `AppState` as a shared
+`Arc<AtomicUsize>` that the worker reads before every request and writes on
+failover. A `set_translate_provider` command stores into the same atomic, so a
+switch from the UI lands on the next subtitle without disturbing the request in
+flight. `EngineStatus` carries the key-free provider list, the active index, and
+whether `TRANSLATE_PROVIDERS` built the list; the panel renders the list, marks
+the live entry, and disables the key and model fields with an explanation when
+they are inert.
+
+**Consequence.**
+- Failover is now visible: the UI moves its marker when the worker rotates.
+- The failure counter is keyed to the provider it belongs to, so a manual switch
+  does not hand the incoming provider the outgoing one's strikes.
+- The list is resolved once at startup as well as per pipeline start, so
+  Settings shows something useful before the first Start.
+- A stale index (the list shrank between resolves) is taken modulo the length
+  rather than panicking.
+- Fixed alongside: `RemoteConfig::resolve` asked for `State<SettingsPath>` while
+  `lib.rs` manages `State<Mutex<SettingsPath>>`. The lookup always missed, so
+  the legacy branch read `PersistSettings::default()` and the key stored by the
+  Settings panel was never usable at all.
+
+---
+
+## ADR-0014 — Settings paginates; the window tops up, it does not grow to fit
+
+**Date:** 2026-08-28 · **Status:** Accepted
+
+**Context.** Settings is a panel inside the subtitle overlay, not its own window.
+The overlay is sized for subtitles — a couple hundred px tall by default — and
+the panel had outgrown that, so it opened clipped and the user had to drag the
+overlay bigger every single time to read it.
+
+The obvious fix, growing the window to fit the panel, is the wrong one: it makes
+the settings dialog's height a function of how many settings exist, so every
+option added enlarges it, and it ends up swallowing the screen.
+
+**Decision.** Paginate the panel into tabs (翻譯 / 辨識 / 外觀) so its height is
+bounded by the tallest single page rather than the total. The window still tops
+up on open — to a fixed 480 CSS px, once, restoring the previous geometry on
+close — because the default overlay is shorter than even one page. `max-height:
+calc(100vh - 60px)` with `overflow-y: auto` remains as the floor, for the cases
+where the top-up cannot happen (a short screen, the clamp at the top edge).
+
+**Consequence.**
+- Adding a setting no longer changes the window size; it lands on a tab.
+- The top-up grows upward so the control bar stays under the cursor that opened
+  it, clamped at `y = 0`.
+- The temporary geometry is not persisted: overlay move/resize saving is
+  suppressed between open and close, or the overlay would come back oversized
+  on the next launch.

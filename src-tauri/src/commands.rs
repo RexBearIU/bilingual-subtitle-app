@@ -6,9 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 use crate::audio;
+use crate::hittest;
 use crate::settings::{PersistSettings, SettingsPath};
-use crate::state::{AppState, AsrProc};
-use crate::types::{AudioProcess, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate};
+use crate::state::{AppState, AsrProc, HitRect};
+use crate::types::{
+    AudioProcess, ClickThrough, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate,
+};
 
 type Db<'a>      = State<'a, Mutex<AppState>>;
 type ProcDb<'a>  = State<'a, Mutex<AsrProc>>;
@@ -395,19 +398,49 @@ pub fn set_source_hint(hint: SourceHint, state: Db, app: AppHandle) -> Result<()
     Ok(())
 }
 
+/// Set the window's mouse policy. The hit-test thread owns the actual
+/// `set_ignore_cursor_events` call — this only records the intent, then asks
+/// for it to be applied straight away rather than on the next poll.
 #[tauri::command]
-pub fn set_click_through(
-    enabled: bool,
-    window: WebviewWindow,
-    state: Db,
-    app: AppHandle,
-) -> Result<(), String> {
-    window
-        .set_ignore_cursor_events(enabled)
-        .map_err(|e| e.to_string())?;
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    s.click_through = enabled;
-    log::info!("click-through → {}", enabled);
+pub fn set_click_through(mode: ClickThrough, state: Db, app: AppHandle) -> Result<(), String> {
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.click_through = mode;
+        log::info!("click-through → {mode:?}");
+        emit_status(&app, &s);
+    }
+    hittest::apply_now(&app);
+    save_current_settings(&app);
+    Ok(())
+}
+
+/// Publish the rectangles that must stay clickable in `Auto` mode.
+///
+/// Called by the frontend whenever its layout changes. In CSS pixels relative
+/// to the window's client area; the hit-test thread converts to screen
+/// coordinates, since it is the side that knows the position and DPI scale.
+#[tauri::command]
+pub fn set_hit_regions(regions: Vec<HitRect>, app: AppHandle) -> Result<(), String> {
+    hittest::set_regions(&app, regions);
+    Ok(())
+}
+
+/// Switch the translation provider mid-session.
+///
+/// Writes into the same atomic the translate worker reads before every call,
+/// so the change lands on the next subtitle — no restart, and no dropping the
+/// request currently in flight.
+#[tauri::command]
+pub fn set_translate_provider(index: usize, state: Db, app: AppHandle) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let Some(p) = s.translate_providers.get(index) else {
+        return Err(format!(
+            "provider index {index} out of range (have {})",
+            s.translate_providers.len()
+        ));
+    };
+    log::info!("TL: provider → {} ({})", p.name, p.model);
+    s.translate_active.store(index, Ordering::Relaxed);
     emit_status(&app, &s);
     Ok(())
 }
@@ -516,6 +549,7 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
         font_size: s.font_size,
         subtitle_opacity: s.subtitle_opacity,
         overlay: saved.overlay,
+        click_through: s.click_through,
         // Never hand the API key back to the webview — the UI shows
         // `openrouterKeySet` from EngineStatus instead, and writes are one-way.
         openrouter_api_key: String::new(),
@@ -684,6 +718,7 @@ pub fn save_current_settings(app: &AppHandle) {
     cfg.music_mode = s.music_mode;
     cfg.font_size = s.font_size;
     cfg.subtitle_opacity = s.subtitle_opacity;
+    cfg.click_through = s.click_through;
     // `cfg` was loaded from disk, so the stored API key is carried through
     // untouched — AppState never holds it.
     cfg.openrouter_model = s.openrouter_model.clone();

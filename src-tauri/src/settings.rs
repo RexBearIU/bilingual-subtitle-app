@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{SourceHint, SubtitleMode};
+use crate::types::{ClickThrough, SourceHint, SubtitleMode};
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +42,9 @@ pub struct PersistSettings {
     pub subtitle_opacity: f64,
     /// Overlay window geometry (physical pixels).
     pub overlay: OverlayRect,
+    /// How the window treats the mouse: "off" | "auto" | "on".
+    #[serde(default)]
+    pub click_through: ClickThrough,
     /// OpenRouter API key.  Empty = fall back to the `OPENROUTER_API_KEY`
     /// environment variable; translation is disabled if neither is set.
     ///
@@ -84,6 +87,7 @@ impl Default for PersistSettings {
             font_size: 28,
             subtitle_opacity: 0.55,
             overlay: OverlayRect::default(),
+            click_through: ClickThrough::default(),
             openrouter_api_key: String::new(),
             openrouter_model: String::new(),
             speech_threshold: 0.0,

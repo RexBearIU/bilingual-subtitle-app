@@ -1,6 +1,6 @@
 // Typed wrappers over the Rust commands. See docs/IPC-CONTRACT.md.
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioProcess, EngineStatus, OverlayRect, PersistSettings, SourceHint, SubtitleMode, SubtitleUpdate } from "./types";
+import type { AudioProcess, ClickThroughMode, EngineStatus, HitRect, OverlayRect, PersistSettings, SourceHint, SubtitleMode, SubtitleUpdate } from "./types";
 
 export const startCaptioning = () => invoke<void>("start_captioning");
 export const stopCaptioning = () => invoke<void>("stop_captioning");
@@ -14,8 +14,23 @@ export const setSourceHint = (hint: SourceHint) =>
 export const setMusicMode = (enabled: boolean) =>
   invoke<void>("set_music_mode", { enabled });
 
-export const setClickThrough = (enabled: boolean) =>
-  invoke<void>("set_click_through", { enabled });
+export const setClickThrough = (mode: ClickThroughMode) =>
+  invoke<void>("set_click_through", { mode });
+
+/**
+ * Publish the rectangles that must stay clickable while the window is in
+ * `auto` mode. Anywhere else, the mouse goes to whatever is behind the overlay.
+ *
+ * Coordinates are CSS pixels relative to the window's client area — exactly
+ * what `getBoundingClientRect()` returns; Rust converts to screen coordinates.
+ * Send the full set every time: this replaces the previous one.
+ */
+export const setHitRegions = (regions: HitRect[]) =>
+  invoke<void>("set_hit_regions", { regions });
+
+/** Switch the active translation provider. Takes effect on the next subtitle. */
+export const setTranslateProvider = (index: number) =>
+  invoke<void>("set_translate_provider", { index });
 
 /** Re-pin the overlay to the top of the always-on-top band. */
 export const setAlwaysOnTop = (enabled: boolean) =>

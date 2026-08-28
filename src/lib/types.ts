@@ -30,6 +30,28 @@ export interface AudioProcess {
   name: string;
 }
 
+/**
+ * How the overlay window treats the mouse.
+ * - `off`  — the whole window takes the mouse, empty areas included.
+ * - `auto` — passes through except over the regions reported by `setHitRegions`.
+ * - `on`   — nothing is clickable; the mouse always goes to what is behind.
+ */
+export type ClickThroughMode = "off" | "auto" | "on";
+
+/** A configured translation endpoint. Never carries the API key. */
+export interface ProviderInfo {
+  name: string;
+  model: string;
+}
+
+/** A rectangle that must stay clickable, in CSS px relative to the client area. */
+export interface HitRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface EngineStatus {
   capture: "stopped" | "running" | "error";
   asr: "unloaded" | "loading" | "ready" | "error";
@@ -37,9 +59,17 @@ export interface EngineStatus {
   mode: SubtitleMode;
   sourceHint: SourceHint;
   fontSize: number;
-  clickThrough: boolean;
+  clickThrough: ClickThroughMode;
+  /** Whether the mouse is passing through right now (flips as the cursor moves in `auto`). */
+  clickThroughActive: boolean;
   alwaysOnTop: boolean;
   subtitleOpacity: number;   // 0.0–1.0, controls subtitle box background alpha
+  /** Configured providers in preference order; index 0 is tried first. */
+  translateProviders: ProviderInfo[];
+  /** Index into `translateProviders` currently in use. */
+  translateActive: number;
+  /** True when TRANSLATE_PROVIDERS built the list — the key/model settings below are then inert. */
+  translateEnvManaged: boolean;
   openrouterModel: string;   // model slug used for translation
   openrouterKeySet: boolean; // whether a key is available; the key is never sent here
   speechThreshold: number;   // VAD RMS threshold, linear 0–1 (~0.032 = −30 dBFS)
@@ -65,6 +95,7 @@ export interface PersistSettings {
   fontSize: number;
   subtitleOpacity: number;
   overlay: OverlayRect;
+  clickThrough: ClickThroughMode;
   /** Always returned empty — the backend never sends the stored key back. */
   openrouterApiKey: string;
   openrouterModel: string;

@@ -62,13 +62,28 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     // back to when an individual translation call fails.
     match translate::RemoteConfig::resolve(&app) {
         Ok(cfg) => {
+            // Publish the (key-free) provider list so the UI can show which
+            // endpoints exist and switch between them. Resolved per pipeline
+            // start, because .env or settings.json may have changed since the
+            // last one.
+            let infos = cfg.infos();
+            let env_managed = cfg.env_managed;
+            let active = state::read_state(&app, |s| Arc::clone(&s.translate_active))
+                .expect("AppState available at pipeline start");
+            state::update_and_emit(&app, |s| {
+                s.translate_providers = infos;
+                s.translate_env_managed = env_managed;
+            });
             translate::remote::start_translate_worker(
-                tl_rx, app.clone(), cfg, Arc::clone(&stop),
+                tl_rx, app.clone(), cfg, Arc::clone(&stop), active,
             );
         }
         Err(e) => {
             log::error!("TL disabled: {e}");
-            state::update_and_emit(&app, |s| s.translation_status = "error".into());
+            state::update_and_emit(&app, |s| {
+                s.translation_status = "error".into();
+                s.translate_providers.clear();
+            });
             drop(tl_rx);
         }
     }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import * as cmd from "../lib/commands";
-  import type { EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate } from "../lib/types";
+  import type { ClickThroughMode, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate } from "../lib/types";
   import ProcessPicker from "./ProcessPicker.svelte";
 
   let { status, subsHidden = false, onToggleSubs, onSettingsOpen }: {
@@ -13,7 +13,7 @@
   let mode         = $derived<SubtitleMode>(status?.mode       ?? "zh");
   let sourceHint   = $derived<SourceHint>(status?.sourceHint   ?? "auto");
   let running      = $derived(status?.capture === "running");
-  let clickThrough = $derived(status?.clickThrough ?? false);
+  let clickThrough = $derived<ClickThroughMode>(status?.clickThrough ?? "auto");
   let alwaysOnTop  = $derived(status?.alwaysOnTop  ?? true);
   let musicMode    = $derived(status?.musicMode ?? false);
 
@@ -25,6 +25,25 @@
   }
   async function onSourceHint(e: Event) {
     await cmd.setSourceHint((e.target as HTMLSelectElement).value as SourceHint);
+  }
+
+  // off → auto → on → off. `auto` is the resting state: the controls stay
+  // clickable while the empty parts of the overlay stop swallowing clicks meant
+  // for whatever is playing behind it.
+  const CT_ORDER: ClickThroughMode[] = ["off", "auto", "on"];
+  const CT_LABEL: Record<ClickThroughMode, string> = {
+    off:  "● 互動",
+    auto: "◑ 自動",
+    on:   "⊙ 穿透",
+  };
+  const CT_TITLE: Record<ClickThroughMode, string> = {
+    off:  "互動：整個視窗都接滑鼠，空白處也會擋住下層。點一下切到「自動」",
+    auto: "自動：只有控制列跟設定接滑鼠，字幕區域直接穿透。點一下切到「穿透」",
+    on:   "穿透：整個視窗都不接滑鼠（托盤或 Ctrl+Alt+P 可解除）。點一下切到「互動」",
+  };
+  function cycleClickThrough() {
+    const next = CT_ORDER[(CT_ORDER.indexOf(clickThrough) + 1) % CT_ORDER.length];
+    return cmd.setClickThrough(next);
   }
 
   function dot(s: string | undefined) {
@@ -45,7 +64,9 @@
   }
 </script>
 
-<div class="bar">
+<!-- The bar doubles as the window drag handle: in `auto` mode the subtitle
+     area no longer takes the mouse, so it can no longer be dragged. -->
+<div class="bar" data-tauri-drag-region>
 
   <!-- 左側：可縮放的控制群 -->
   <div class="left-group">
@@ -99,11 +120,10 @@
     </button>
 
     <button
-      class="txt-btn passthru"
-      class:active={clickThrough}
-      onclick={() => cmd.setClickThrough(!clickThrough)}
-      title={clickThrough ? "穿透：開 — 無法操作覆蓋層，再按解除" : "穿透：關 — 可操作覆蓋層"}
-    >{clickThrough ? "⊙ 穿透" : "● 互動"}</button>
+      class="txt-btn passthru ct-{clickThrough}"
+      onclick={cycleClickThrough}
+      title={CT_TITLE[clickThrough]}
+    >{CT_LABEL[clickThrough]}</button>
 
     <button
       class="txt-btn"
@@ -116,7 +136,7 @@
   </div>
 
   <!-- spacer -->
-  <div class="spacer"></div>
+  <div class="spacer" data-tauri-drag-region></div>
 
   <!-- 右側：永遠固定在右邊 -->
   <div class="right-group">
@@ -234,7 +254,9 @@
   }
 
   /* ── 穿透 ────────────────────────────────────── */
-  .passthru.active { background: #0f2035; border-color: #1e5080; color: #7ab8f0; }
+  .passthru { min-width: 62px; }
+  .passthru.ct-auto { background: #14263a; border-color: #2a5f88; color: #86c5ea; }
+  .passthru.ct-on   { background: #0f2035; border-color: #1e5080; color: #7ab8f0; }
 
   /* ── 字幕 ────────────────────────────────────── */
   .dim { color: #4e5a68; border-color: #2a3340; }

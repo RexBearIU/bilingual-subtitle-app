@@ -14,7 +14,9 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `set_subtitle_mode` | `{ mode: SubtitleMode }` | `Result<()>` | Hot-swappable while running |
 | `set_source_hint` | `{ hint: SourceHint }` | `Result<()>` | Language hint passed to Whisper per chunk |
 | `set_music_mode` | `{ enabled: bool }` | `Result<()>` | Switches chunker to 10 s chunks + "Song lyrics:" prompt + beam_size=3 |
-| `set_click_through` | `{ enabled: bool }` | `Result<()>` | Toggles window mouse pass-through. **Escape hatch:** `Ctrl+Alt+P` hotkey always forces OFF + re-pins on top |
+| `set_click_through` | `{ mode: ClickThroughMode }` | `Result<()>` | Window mouse policy. **Escape hatch:** `Ctrl+Alt+P` always forces `"off"` + re-pins on top |
+| `set_hit_regions` | `{ regions: HitRect[] }` | `Result<()>` | Rectangles that stay clickable in `"auto"`. CSS px relative to the client area; replaces the previous set |
+| `set_translate_provider` | `{ index: number }` | `Result<()>` | Switch provider; takes effect on the next subtitle. Index into `EngineStatus.translateProviders` |
 | `set_always_on_top` | `{ enabled: bool }` | `Result<()>` | Re-asserts topmost; re-stacks above other topmost windows |
 | `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120) |
 | `list_audio_processes` | — | `AudioProcess[]` | Windows processes with active audio sessions (for process picker) |
@@ -84,9 +86,13 @@ interface EngineStatus {
   mode: SubtitleMode;
   sourceHint: SourceHint;
   fontSize: number;
-  clickThrough: boolean;
+  clickThrough: ClickThroughMode;
+  clickThroughActive: boolean; // whether the mouse is passing through right now
   alwaysOnTop: boolean;
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
+  translateProviders: ProviderInfo[]; // preference order; index 0 is tried first
+  translateActive: number;    // index currently in use (moves on failover too)
+  translateEnvManaged: boolean; // TRANSLATE_PROVIDERS built the list → the two fields below are inert
   openrouterModel: string;    // model slug in use (resolved default if unset)
   openrouterKeySet: boolean;  // key present in env or settings; the key itself is never sent
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
@@ -98,6 +104,27 @@ interface EngineStatus {
   rms?: number;               // present only while capturing
   message?: string;           // last process-loopback error (shown by ProcessPicker)
 }
+
+```ts
+/**
+ * How the overlay window treats the mouse.
+ * - `off`  — the whole window takes the mouse, empty areas included.
+ * - `auto` — passes through except over the regions from `set_hit_regions`.
+ * - `on`   — nothing is clickable; the mouse always goes behind.
+ *
+ * `auto` is the default. A transparent, decoration-less window is a solid
+ * hit target to the OS, so without it an empty overlay blocks whatever is
+ * playing underneath. CSS `pointer-events` cannot fix this — it decides
+ * which element gets an event, not whether the window receives one.
+ */
+type ClickThroughMode = "off" | "auto" | "on";
+
+/** A clickable rectangle, CSS px relative to the window client area. */
+interface HitRect { x: number; y: number; w: number; h: number }
+
+/** A configured translation endpoint. Never carries the API key. */
+interface ProviderInfo { name: string; model: string }
+```
 ```
 
 ## Types
@@ -130,6 +157,7 @@ interface PersistSettings {
   fontSize: number;
   subtitleOpacity: number;    // 0.0–1.0
   overlay: { x: number; y: number; w: number; h: number };
+  clickThrough: ClickThroughMode;
   openrouterApiKey: string;   // ALWAYS returned as "" — get_settings never echoes the stored key
   openrouterModel: string;    // "" = use the built-in default
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)

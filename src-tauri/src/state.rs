@@ -1,10 +1,11 @@
 //! Application state, shared across commands via `tauri::State<Mutex<AppState>>`.
 
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize}};
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::types::{AudioProcess, EngineStatus, SourceHint, SubtitleMode};
+use crate::translate::ProviderInfo;
+use crate::types::{AudioProcess, ClickThrough, EngineStatus, SourceHint, SubtitleMode};
 
 /// Lock AppState, apply `f`, then broadcast the resulting `engine_status`.
 /// No-op if the state is unavailable or the lock is poisoned.
@@ -24,12 +25,30 @@ pub fn read_state<T>(app: &AppHandle, f: impl FnOnce(&AppState) -> T) -> Option<
         .and_then(|st| st.lock().ok().map(|s| f(&s)))
 }
 
+/// One clickable rectangle, in CSS pixels relative to the window client area.
+/// Converted to physical screen coordinates by the hit-test thread, which is
+/// the only place that knows the window's position and DPI scale.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct HitRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub mode: SubtitleMode,
     pub source_hint: SourceHint,
     pub font_size: u32,
-    pub click_through: bool,
+    pub click_through: ClickThrough,
+    /// Whether the mouse is being passed through right now. Owned by the
+    /// hit-test thread; in `Auto` it flips as the cursor crosses a region.
+    pub click_through_active: bool,
+    /// Rectangles the frontend wants to keep clickable, in CSS pixels relative
+    /// to the window's client area. Empty means "nothing is interactive", which
+    /// in `Auto` makes the whole window transparent to the mouse.
+    pub hit_regions: Vec<HitRect>,
     pub always_on_top: bool,
     pub captioning: bool,
     /// Latest RMS from the capture thread (updated ~every 200 ms).
@@ -43,6 +62,17 @@ pub struct AppState {
     /// Subtitle background opacity (0.0–1.0).  Sent in EngineStatus so the
     /// frontend can apply it as a CSS custom property.
     pub subtitle_opacity: f64,
+    /// Translation providers in preference order, published by the pipeline
+    /// after `RemoteConfig::resolve`. Key-free by construction.
+    pub translate_providers: Vec<ProviderInfo>,
+    /// Index into `translate_providers` the worker is using.
+    ///
+    /// Shared with the translate worker rather than copied, so a switch from
+    /// the UI takes effect on the next subtitle instead of the next restart —
+    /// and so a failover the worker performs is visible to the UI.
+    pub translate_active: Arc<AtomicUsize>,
+    /// True when `TRANSLATE_PROVIDERS` supplied the list.
+    pub translate_env_managed: bool,
     /// OpenRouter model slug in use (empty = built-in default).
     /// The API key is deliberately kept out of `AppState` — this struct derives
     /// `Debug` and is logged on state changes.
@@ -76,7 +106,9 @@ impl Default for AppState {
             mode: SubtitleMode::default(),
             source_hint: SourceHint::default(),
             font_size: 28,
-            click_through: false,
+            click_through: ClickThrough::default(),
+            click_through_active: false,
+            hit_regions: Vec::new(),
             always_on_top: true,
             captioning: false,
             rms: 0.0,
@@ -84,6 +116,9 @@ impl Default for AppState {
             asr_status: "unloaded".into(),
             translation_status: "unloaded".into(),
             subtitle_opacity: 0.55,
+            translate_providers: Vec::new(),
+            translate_active: Arc::new(AtomicUsize::new(0)),
+            translate_env_managed: false,
             openrouter_model: String::new(),
             openrouter_key_set: false,
             speech_threshold: 0.0, // 0 = adaptive auto-mode

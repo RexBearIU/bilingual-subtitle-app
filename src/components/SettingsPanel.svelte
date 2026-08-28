@@ -12,6 +12,24 @@
   let keySet            = $derived(status?.openrouterKeySet     ?? false);
   let model             = $derived(status?.openrouterModel      ?? '');
 
+  let providers   = $derived(status?.translateProviders   ?? []);
+  let activeIdx   = $derived(status?.translateActive      ?? 0);
+  // When TRANSLATE_PROVIDERS built the list, the legacy single-provider path
+  // never runs — so the key and model fields below are read by nobody. Saying
+  // so beats letting the user type into inputs that do nothing.
+  let envManaged  = $derived(status?.translateEnvManaged  ?? false);
+
+  // Tabs rather than one long column: the panel lives inside the subtitle
+  // overlay, which is a couple hundred px tall. Growing the window to fit
+  // everything at once means a settings dialog that swallows the screen.
+  type Tab = 'translate' | 'asr' | 'look';
+  const TABS: { id: Tab; label: string }[] = [
+    { id: 'translate', label: '翻譯' },
+    { id: 'asr',       label: '辨識' },
+    { id: 'look',      label: '外觀' },
+  ];
+  let tab = $state<Tab>('translate');
+
   // The key is never sent back from Rust, so this input is a write-only draft:
   // empty means "leave whatever is stored alone".
   let keyDraft = $state('');
@@ -40,6 +58,10 @@
     const v = (e.target as HTMLInputElement).value.trim();
     if (v !== model) await cmd.updateSettings({ openrouterModel: v });
   }
+  async function pickProvider(i: number) {
+    if (i === activeIdx) return;
+    await cmd.setTranslateProvider(i);
+  }
   async function toggleAsr() {
     // Cycle: Whisper → SenseVoice → Zipformer-KO → Whisper
     const next = asrBackend === 'whisper' ? 'sensevoice'
@@ -55,8 +77,9 @@
   }
 </script>
 
-<!-- click outside to close -->
-<div class="backdrop" role="presentation" onclick={onClose}></div>
+<!-- click outside to close. `data-hit` keeps the whole window clickable while
+     the panel is open, so that click actually reaches us in auto mode. -->
+<div class="backdrop" role="presentation" onclick={onClose} data-hit></div>
 
 <div class="panel" role="dialog">
   <div class="header">
@@ -64,23 +87,75 @@
     <button class="close" onclick={onClose}>✕</button>
   </div>
 
+  <div class="tabs">
+    {#each TABS as t (t.id)}
+      <button class="tab" class:on={tab === t.id} onclick={() => (tab = t.id)}>{t.label}</button>
+    {/each}
+  </div>
+
   <div class="body">
-    <!-- row: font size -->
+    {#if tab === 'translate'}
+    <!-- ── 翻譯供應商 ─────────────────────────────────────────────── -->
+    {#if providers.length > 0}
+      <div class="prov-list">
+        {#each providers as p, i (p.name + p.model)}
+          <button class="prov" class:active={i === activeIdx} onclick={() => pickProvider(i)}>
+            <span class="prov-rank">{i + 1}</span>
+            <span class="prov-text">
+              <span class="prov-name">{p.name}</span>
+              <span class="prov-model">{p.model}</span>
+            </span>
+            {#if i === activeIdx}<span class="prov-badge">使用中</span>{/if}
+          </button>
+        {/each}
+      </div>
+      <p class="hint left">
+        由上往下依序備援：連續失敗兩次會自動換下一個。點任一個可立刻手動指定，下一句字幕生效。
+      </p>
+    {:else}
+      <p class="hint left warn">
+        尚未設定任何翻譯供應商。在 <code>.env</code> 設定 <code>TRANSLATE_PROVIDERS</code>
+        與各家的 <code>TRANSLATE_&lt;NAME&gt;_API_KEY</code>，或在下方填入單一金鑰。
+      </p>
+    {/if}
+
+    <!-- ── 單一供應商（舊設定路徑） ────────────────────────────────── -->
+    {#if envManaged}
+      <p class="hint left note">
+        供應商清單由 <code>.env</code> 的 <code>TRANSLATE_PROVIDERS</code> 決定，
+        下面兩欄不會被讀取。要改模型請改 <code>TRANSLATE_&lt;NAME&gt;_MODEL</code>。
+      </p>
+    {/if}
+
     <div class="row">
-      <span class="label">A 字體大小</span>
-      <input class="slider" type="range" min="14" max="64" value={fontSize} oninput={onFont} />
-      <span class="val">{fontSize} px</span>
+      <span class="label">API 金鑰</span>
+      <input class="text-in" type="password" autocomplete="off" spellcheck="false"
+             disabled={envManaged}
+             placeholder={keySet ? '已設定（輸入以更換）' : 'sk-or-v1-…'}
+             bind:value={keyDraft} />
+      <button class="gpu-btn" disabled={envManaged || keySaving || !keyDraft.trim()} onclick={saveKey}>
+        {keySaving ? '儲存中' : '儲存'}
+      </button>
+    </div>
+    <div class="row sub-row">
+      <span class="label"></span>
+      <span class="key-status" class:ok={keySet}>{keySet ? '✓ 金鑰已設定' : '✕ 尚未設定'}</span>
+      {#if keySet && !envManaged}
+        <button class="gpu-btn cpu" onclick={clearKey}>清除</button>
+      {/if}
     </div>
 
-    <!-- row: opacity -->
     <div class="row">
-      <span class="label">◐ 字幕透明度</span>
-      <input class="slider" type="range" min="0.05" max="1" step="0.05"
-             value={opacity} oninput={onOpacity} />
-      <span class="val">{Math.round(opacity * 100)} %</span>
+      <span class="label">翻譯模型</span>
+      <input class="text-in" type="text" autocomplete="off" spellcheck="false"
+             disabled={envManaged}
+             value={model} onchange={onModel} placeholder="google/gemini-3.5-flash-lite" />
     </div>
+    <p class="hint">金鑰存在本機 settings.json，不會顯示回畫面。字幕短、講求延遲，小型快模型通常比大模型好用。改完重新 Start 生效。</p>
+    {/if}
 
-    <!-- row: ASR backend -->
+    {#if tab === 'asr'}
+    <!-- ── 辨識 ───────────────────────────────────────────────────── -->
     <div class="row">
       <span class="label">辨識引擎</span>
       <button class="gpu-btn"
@@ -95,7 +170,6 @@
     </div>
 
     {#if asrBackend === 'whisper'}
-    <!-- row: Whisper model size -->
     <div class="row sub-row">
       <span class="label">模型大小</span>
       <button class="gpu-btn" class:large={whisperModel === 'large'} onclick={toggleWhisperModel}>
@@ -103,11 +177,10 @@
       </button>
       <span class="val hint-inline">{whisperModel === 'large' ? '高品質' : '較快'}</span>
     </div>
-    <p class="hint">Large-v3 int8：品質更好，首次下載需要時間，GPU VRAM ~1.5 GB。切換後重新 Start 生效。</p>
+    <p class="hint">Large-v3 int8：品質更好，首次下載需要時間，GPU VRAM ~1.5 GB。</p>
     {/if}
 
     {#if asrBackend === 'sensevoice'}
-    <!-- row: SenseVoice precision -->
     <div class="row sub-row">
       <span class="label">模型精度</span>
       <button class="gpu-btn" class:sv={sensevoicePrecision === 'fp32'} onclick={toggleSvPrecision}>
@@ -115,43 +188,35 @@
       </button>
       <span class="val hint-inline">{sensevoicePrecision === 'fp32' ? '更精準' : '較快'}</span>
     </div>
-    <p class="hint">float32：完整精度模型 (~220 MB)，準確率更高。切換後重新 Start 生效。</p>
+    <p class="hint">float32：完整精度模型 (~220 MB)，準確率更高。</p>
     {/if}
 
     {#if asrBackend === 'zipformer-ko'}
     <p class="hint">韓文專用 Zipformer：CPU 即時、完整轉錄、口語自然，外來語/夾英較弱。首次自動下載 (~110 MB)。需 sherpa-onnx 環境（同 SenseVoice）。</p>
     {/if}
 
-    <p class="hint">切換引擎後重新 Start 生效。</p>
+    <p class="hint">切換引擎或模型後重新 Start 生效。</p>
+    {/if}
 
-    <!-- row: OpenRouter key -->
+    {#if tab === 'look'}
+    <!-- ── 外觀 ───────────────────────────────────────────────────── -->
     <div class="row">
-      <span class="label">OpenRouter 金鑰</span>
-      <input class="text-in" type="password" autocomplete="off" spellcheck="false"
-             placeholder={keySet ? '已設定（輸入以更換）' : 'sk-or-v1-…'}
-             bind:value={keyDraft} />
-      <button class="gpu-btn" disabled={keySaving || !keyDraft.trim()} onclick={saveKey}>
-        {keySaving ? '儲存中' : '儲存'}
-      </button>
+      <span class="label">A 字體大小</span>
+      <input class="slider" type="range" min="14" max="64" value={fontSize} oninput={onFont} />
+      <span class="val">{fontSize} px</span>
     </div>
-    <div class="row sub-row">
-      <span class="label"></span>
-      <span class="key-status" class:ok={keySet}>{keySet ? '✓ 金鑰已設定' : '✕ 尚未設定'}</span>
-      {#if keySet}
-        <button class="gpu-btn cpu" onclick={clearKey}>清除</button>
-      {/if}
+
+    <div class="row">
+      <span class="label">◐ 字幕透明度</span>
+      <input class="slider" type="range" min="0.05" max="1" step="0.05"
+             value={opacity} oninput={onOpacity} />
+      <span class="val">{Math.round(opacity * 100)} %</span>
     </div>
-    <p class="hint">
-      金鑰存在本機 settings.json，不會顯示回畫面。也可改用 OPENROUTER_API_KEY 環境變數（環境變數優先）。
+    <p class="hint left">
+      控制列的「互動 / 自動 / 穿透」決定滑鼠行為。自動＝只有控制列和設定接滑鼠，
+      字幕區域直接穿透到下層。卡住時按 Ctrl+Alt+P 一定能解除。
     </p>
-
-    <!-- row: translation model -->
-    <div class="row">
-      <span class="label">翻譯模型</span>
-      <input class="text-in" type="text" autocomplete="off" spellcheck="false"
-             value={model} onchange={onModel} placeholder="google/gemini-2.5-flash-lite" />
-    </div>
-    <p class="hint">OpenRouter 模型代號。字幕短、講求延遲，小型快模型通常比大模型好用。改完重新 Start 生效。</p>
+    {/if}
   </div>
 </div>
 
@@ -169,6 +234,12 @@
     transform: translateX(-50%);
     z-index: 20;
     width: min(460px, 94vw);
+    /* The overlay window is short. It is grown when Settings opens, but that
+       can fail (a small screen, a clamped top edge), and a clipped panel with
+       no way to reach the rest is worse than a scrollbar. */
+    max-height: calc(100vh - 60px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
     background: rgba(15, 19, 26, 0.97);
     border: 1px solid #333d4a;
     border-radius: 10px;
@@ -185,6 +256,10 @@
   }
 
   .header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: rgba(15, 19, 26, 0.97);
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -201,14 +276,38 @@
   .close:hover { background: #2a313b; color: #d7dee6; }
 
   .body {
-    padding: 6px 0 4px;
+    padding: 0 0 8px;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 2px;
+    padding: 6px 10px 0;
+    border-bottom: 1px solid #252d38;
+  }
+  .tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: #6d7987;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 5px 12px 5px;
+    cursor: pointer;
+    border-radius: 4px 4px 0 0;
+  }
+  .tab:hover { color: #b7c2ce; background: #1a222c; }
+  .tab.on {
+    color: #cfe0f2;
+    border-bottom-color: #3a5591;
+    font-weight: 600;
   }
 
   .row {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 7px 14px;
+    padding: 5px 14px;
   }
 
   .label {
@@ -239,9 +338,81 @@
     color: #4e5a65;
     line-height: 1.45;
   }
+  /* Full-width variant for text that has no label to line up with. */
+  .hint.left { padding-left: 14px; }
+  .hint.note { color: #8a7a52; }
+  .hint.warn { color: #a8705a; }
+  .hint code {
+    background: #1a222c;
+    border-radius: 3px;
+    padding: 0 3px;
+    color: #8fa4bb;
+  }
 
   .hint-inline {
     color: #5a636e;
+  }
+
+  /* ── provider list ───────────────────────────────────────────────── */
+  .prov-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 2px 14px 6px;
+  }
+  .prov {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    text-align: left;
+    background: #16202c;
+    border: 1px solid #2c3a4a;
+    border-radius: 6px;
+    padding: 6px 9px;
+    color: #b7c2ce;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  .prov:hover { border-color: #3a5591; background: #1a2634; }
+  .prov.active {
+    background: #16302a;
+    border-color: #2f6f52;
+    color: #cfe8dc;
+  }
+  .prov-rank {
+    flex-shrink: 0;
+    width: 16px;
+    text-align: center;
+    color: #4e5a65;
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .prov-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    flex: 1;
+  }
+  .prov-name { font-weight: 600; font-size: 12px; }
+  .prov-model {
+    font-size: 10px;
+    color: #5e6b78;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .prov.active .prov-model { color: #6f9284; }
+  .prov-badge {
+    flex-shrink: 0;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: #7bcfa0;
+    border: 1px solid #2f6f52;
+    border-radius: 4px;
+    padding: 1px 5px;
   }
 
   .gpu-btn {
@@ -249,6 +420,7 @@
     color: #a0c8ff; border-radius: 6px;
     padding: 4px 12px; cursor: pointer; font-size: 12px;
     white-space: nowrap;
+    font-family: inherit;
   }
   .gpu-btn:hover { background: #334880; }
   .gpu-btn:disabled {
@@ -277,6 +449,10 @@
   .text-in:focus {
     outline: none;
     border-color: #3a5591;
+  }
+  .text-in:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
   .text-in::placeholder { color: #4e5a65; }
 
