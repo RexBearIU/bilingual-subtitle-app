@@ -53,6 +53,17 @@ fn apply_dotenv(contents: &str) {
     }
 }
 
+/// `KEY=` means "not set", not "set to empty".
+///
+/// `.env.example` lists every variable with a blank value as documentation, so
+/// a copied template would otherwise define them all as empty strings — and
+/// `std::env::var` returns `Ok("")` for those, which silently defeats every
+/// `unwrap_or_else(default)` downstream. That is exactly how `ASR_PORT=` in a
+/// copied template made the app launch its sidecar on an empty port.
+fn is_unset(value: &str) -> bool {
+    value.is_empty()
+}
+
 /// Pure parser, split out from `apply_dotenv` so it can be tested without
 /// mutating the process environment.
 fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
@@ -81,6 +92,9 @@ fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
             .and_then(|v| v.strip_suffix('"'))
             .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
             .unwrap_or(value);
+        if is_unset(value) {
+            continue;
+        }
         out.push((key.to_string(), value.to_string()));
     }
     out
@@ -125,6 +139,15 @@ mod tests {
                 ("SPACED".into(), "value".into()),
             ]
         );
+    }
+
+    #[test]
+    fn parse_dotenv_treats_a_blank_value_as_unset() {
+        // .env.example ships every variable blank as documentation. A copied
+        // template must not define them as empty strings: std::env::var would
+        // then return Ok("") and defeat every unwrap_or_else(default).
+        let pairs = parse_dotenv("ASR_PORT=\nWHISPER_MODEL=   \nQUOTED=\"\"\nREAL=9001\n");
+        assert_eq!(pairs, vec![("REAL".to_string(), "9001".to_string())]);
     }
 
     #[test]

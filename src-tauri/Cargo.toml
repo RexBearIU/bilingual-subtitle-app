@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/RexBearIU/bilingual-subtitle-app"
 edition = "2021"
 rust-version = "1.77.2"
+# `src/bin/record_loopback.rs` makes this a two-binary crate, which leaves bare
+# `cargo run` — and therefore `tauri dev` — unable to pick one.
+default-run = "app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
