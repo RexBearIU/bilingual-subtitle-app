@@ -40,22 +40,22 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     let (vad_tx, vad_rx) = mpsc::channel::<Vec<f32>>();
 
     // Read current settings once at pipeline start.
-    let (speech_threshold, music_mode_flag, capture_pid, capture_name) =
+    let (speech_threshold, capture_pid, capture_name) =
         state::read_state(&app, |s| {
             let (pid, name) = s.capture_target.as_ref()
                 .map(|p| (p.pid, p.name.clone()))
                 .unwrap_or((0, String::new()));
-            (s.speech_threshold, Arc::clone(&s.music_mode_flag), pid, name)
+            (s.speech_threshold, pid, name)
         })
-        .unwrap_or_else(|| (0.032, Arc::new(AtomicBool::new(false)), 0, String::new()));
+        .unwrap_or((0.032, 0, String::new()));
+
+    // Early-cut channel: the ASR worker writes the utterance id of a partial
+    // whose text already reads as a finished sentence, and the chunker ends
+    // that utterance instead of waiting for a pause or the hard cap.
+    let cut_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Clear any stale loopback error from a previous session.
     state::update_and_emit(&app, |s| s.loopback_error = None);
-
-    log::info!(
-        "pipeline start: music_mode={}",
-        music_mode_flag.load(Ordering::Relaxed),
-    );
 
     // A missing API key must not take the whole pipeline down: ASR still runs
     // and emits source-only subtitles, which is the same degraded mode we fall
@@ -87,8 +87,12 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
             drop(tl_rx);
         }
     }
-    asr::http_client::start_asr_worker(asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx);
-    pipeline::chunker::start_vad_worker(vad_rx, asr_tx, Arc::clone(&stop), speech_threshold, music_mode_flag);
+    asr::http_client::start_asr_worker(
+        asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx, Arc::clone(&cut_request),
+    );
+    pipeline::chunker::start_vad_worker(
+        vad_rx, asr_tx, Arc::clone(&stop), speech_threshold, cut_request,
+    );
 
     std::thread::Builder::new()
         .name("wasapi-loopback".into())

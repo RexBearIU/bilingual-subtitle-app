@@ -374,3 +374,71 @@ where the top-up cannot happen (a short screen, the clamp at the top edge).
 - The temporary geometry is not persisted: overlay move/resize saving is
   suppressed between open and close, or the overlay would come back oversized
   on the next launch.
+
+---
+
+## ADR-0015 — Sentence-boundary flush: the chunker cuts on text, not just time
+
+**Date:** 2026-08-28 · **Status:** Accepted
+
+**Context.** Measured end to end, the time from a speaker starting a sentence to
+its translated subtitle appearing broke down as roughly 3–6 s of chunker wait,
+320 ms of ASR, and 690 ms of translation. The API calls were ~20% of it. The
+chunker dominated because it only ended an utterance two ways: a graduated
+silence rule (800 → 200 ms depending on buffer length), or a 6 s hard cap. A
+speaker who finishes a sentence and keeps going without a real pause pays the
+full cap before anything reaches the screen.
+
+The chunker sees only audio, so it cannot tell "finished a sentence" from "still
+talking". But the partials it already sends every 1.5 s are transcribed anyway —
+their punctuation is the one signal in the pipeline that knows where a sentence
+ends, and reading it costs nothing.
+
+**Decision.** Add a third flush reason. The ASR worker tests each partial's text
+with `looks_complete` and, when it passes, writes that utterance id into a
+shared `AtomicU64`; the chunker consumes it with `swap` and ends the utterance.
+Guards, each of which cost a real mistake in testing before it was added:
+
+- **Minimum 2 s of audio.** Whisper punctuates eagerly and a 0.4 s "네." is a
+  fragment, not a sentence worth its own subtitle and translation call.
+- **No ellipsis.** `...` and `…` are what Whisper writes when a speaker trails
+  off mid-thought — the opposite of a boundary.
+- **No period straight after a digit** — decimals and numbered list items.
+- **No language flip.** Whisper hallucinates short English politeness
+  ("Thank you.", "Yeah.") on a second of non-English audio, and those parse as
+  complete sentences. On the Korean sample this single check separated every
+  bad trigger from every good one.
+
+**Consequence.**
+- Utterances that used to hit the 6 s cap now end at 2–3 s. Measured on the
+  Korean sample: 5 of 20 flushes became `[sentence]`, cutting at 2.0–3.3 s.
+- Being wrong costs a subtitle split mid-sentence; being too strict costs
+  nothing but the old timing. Every guard above is biased that way.
+- A stale request — the ASR worker answering after the chunker already flushed
+  that utterance — cannot fire, because the id no longer matches, and the same
+  `swap` that checks it also clears it.
+- Music mode is gone (its fixed 10 s chunks, "Song lyrics:" prompt, beam=3, and
+  the lyrical translation prompt with it). It was a second segmentation policy
+  competing with this one for the same code path, and unused.
+
+---
+
+## ADR-0016 — Start the window drag explicitly, not with `data-tauri-drag-region`
+
+**Date:** 2026-08-28 · **Status:** Accepted
+
+**Context.** The overlay is decoration-less, so it has no title bar; dragging
+relied on `data-tauri-drag-region` on the subtitle box. That attribute never
+fired in this window. Once ADR-0012 stopped the subtitle area from taking the
+mouse at all, the window could not be moved by any means.
+
+**Decision.** Call `getCurrentWindow().startDragging()` from a `pointerdown`
+handler on the control bar's containers, and drop the attribute.
+
+**Consequence.**
+- Verified working by synthetic drag: the window tracks the cursor exactly.
+- The bar needed a handle to grab. Its buttons had filled the row, so the
+  spacer was widened, given a floor, and made visibly dotted — an unmarked gap
+  between two button groups is not discoverable as a drag target.
+- Explicit beats magic here anyway: the call is greppable, and it can refuse a
+  press that did not land on a container.

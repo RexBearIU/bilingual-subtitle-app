@@ -83,10 +83,6 @@ pub struct AppState {
     /// VAD speech threshold override. 0 = adaptive auto-mode (recommended).
     /// > 0 = fixed RMS threshold (manual override).
     pub speech_threshold: f32,
-    /// Music mode: bypass VAD, use fixed 10 s chunks + song-lyrics prompt.
-    pub music_mode: bool,
-    /// Shared with the VAD worker so toggling takes effect immediately.
-    pub music_mode_flag: Arc<AtomicBool>,
     /// The process currently being captured (None = system-wide loopback).
     /// Changing this requires stopping and restarting the pipeline.
     pub capture_target: Option<AudioProcess>,
@@ -122,8 +118,6 @@ impl Default for AppState {
             openrouter_model: String::new(),
             openrouter_key_set: false,
             speech_threshold: 0.0, // 0 = adaptive auto-mode
-            music_mode: false,
-            music_mode_flag: Arc::new(AtomicBool::new(false)),
             capture_target: None,
             asr_backend: "whisper".into(),
             loopback_error: None,

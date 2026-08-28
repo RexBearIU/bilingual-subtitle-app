@@ -63,7 +63,6 @@ pub fn run() {
             commands::stop_captioning,
             commands::set_subtitle_mode,
             commands::set_source_hint,
-            commands::set_music_mode,
             commands::set_click_through,
             commands::set_hit_regions,
             commands::set_translate_provider,
@@ -124,8 +123,6 @@ pub fn run() {
                 if let Ok(mut s) = st.lock() {
                     s.mode = cfg.mode;
                     s.source_hint = cfg.source_hint;
-                    s.music_mode = cfg.music_mode;
-                    s.music_mode_flag.store(cfg.music_mode, std::sync::atomic::Ordering::Relaxed);
                     s.font_size = cfg.font_size;
                     s.subtitle_opacity = cfg.subtitle_opacity;
                     s.click_through = cfg.click_through;

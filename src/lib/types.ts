@@ -73,7 +73,6 @@ export interface EngineStatus {
   openrouterModel: string;   // model slug used for translation
   openrouterKeySet: boolean; // whether a key is available; the key is never sent here
   speechThreshold: number;   // VAD RMS threshold, linear 0–1 (~0.032 = −30 dBFS)
-  musicMode: boolean;
   asrBackend: string;        // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;      // "turbo" | "large"
   sensevoicePrecision: string; // "int8" | "fp32"

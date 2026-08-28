@@ -11,9 +11,6 @@ export const setSubtitleMode = (mode: SubtitleMode) =>
 export const setSourceHint = (hint: SourceHint) =>
   invoke<void>("set_source_hint", { hint });
 
-export const setMusicMode = (enabled: boolean) =>
-  invoke<void>("set_music_mode", { enabled });
-
 export const setClickThrough = (mode: ClickThroughMode) =>
   invoke<void>("set_click_through", { mode });
 

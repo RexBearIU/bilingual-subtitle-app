@@ -188,8 +188,6 @@ fn translate_loop(
             continue;
         }
 
-        let music_mode = state::read_state(app, |s| s.music_mode).unwrap_or(false);
-
         let prev: Vec<(&str, &str)> = history
             .iter()
             .map(|(s, t)| (s.as_str(), t.as_str()))
@@ -205,7 +203,7 @@ fn translate_loop(
         }
         let provider = &cfg.providers[idx];
         match call_translate(
-            &agent, provider, cfg, &req.source_lang, &req.source_text, req.mode, &prev, music_mode,
+            &agent, provider, cfg, &req.source_lang, &req.source_text, req.mode, &prev,
         ) {
             Ok(translated) => {
                 consecutive_failures = 0;
@@ -279,7 +277,7 @@ fn check_credentials(agent: &ureq::Agent, provider: &Provider) -> Result<(), Cre
 
 // ── prompting ───────────────────────────────────────────────────────────────
 
-fn build_system_prompt(source_lang: &str, target_name: &str, music_mode: bool) -> String {
+fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
     let mut p = format!(
         "You are a real-time subtitle translator. \
          Output ONLY the {target_name} translation — no explanations, no additions. \
@@ -302,20 +300,12 @@ fn build_system_prompt(source_lang: &str, target_name: &str, music_mode: bool) -
         );
     }
 
-    if music_mode {
-        p.push_str(
-            " The text is song lyrics — translate lyrically and concisely, \
-             preserving imagery and emotion over literal word order.",
-        );
-    }
-
     p
 }
 
 /// Call OpenRouter and return the translation in the target language.
 /// `prev` holds the last few (source, translated) pairs, injected as prior
 /// chat turns to keep vocabulary, names, and topic continuity consistent.
-#[allow(clippy::too_many_arguments)]
 fn call_translate(
     agent: &ureq::Agent,
     provider: &Provider,
@@ -324,7 +314,6 @@ fn call_translate(
     text: &str,
     mode: crate::types::SubtitleMode,
     prev: &[(&str, &str)],
-    music_mode: bool,
 ) -> Result<String, String> {
     let source_name = match source_lang {
         "ko" => "Korean",
@@ -335,7 +324,7 @@ fn call_translate(
     };
     let target_name = mode.target_name();
 
-    let system = build_system_prompt(source_lang, target_name, music_mode);
+    let system = build_system_prompt(source_lang, target_name);
     let user = format!("[{source_name}→{target_name}] {text}");
 
     let mut messages = vec![serde_json::json!({ "role": "system", "content": &system })];

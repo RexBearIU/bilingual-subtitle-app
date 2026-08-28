@@ -374,19 +374,6 @@ pub fn set_subtitle_mode(mode: SubtitleMode, state: Db, app: AppHandle) -> Resul
 }
 
 #[tauri::command]
-pub fn set_music_mode(enabled: bool, state: Db, app: AppHandle) -> Result<(), String> {
-    {
-        let mut s = state.lock().map_err(|e| e.to_string())?;
-        s.music_mode = enabled;
-        s.music_mode_flag.store(enabled, std::sync::atomic::Ordering::Relaxed);
-        log::info!("music mode → {enabled}");
-        emit_status(&app, &s);
-    }
-    save_current_settings(&app);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn set_source_hint(hint: SourceHint, state: Db, app: AppHandle) -> Result<(), String> {
     {
         let mut s = state.lock().map_err(|e| e.to_string())?;
@@ -555,7 +542,6 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
         openrouter_api_key: String::new(),
         openrouter_model: s.openrouter_model.clone(),
         speech_threshold: s.speech_threshold,
-        music_mode: s.music_mode,
         asr_backend: s.asr_backend.clone(),
         whisper_model: s.whisper_model.clone(),
         sensevoice_precision: s.sensevoice_precision.clone(),
@@ -715,7 +701,6 @@ pub fn save_current_settings(app: &AppHandle) {
     let mut cfg = PersistSettings::load(&sp.0);
     cfg.mode = s.mode;
     cfg.source_hint = s.source_hint;
-    cfg.music_mode = s.music_mode;
     cfg.font_size = s.font_size;
     cfg.subtitle_opacity = s.subtitle_opacity;
     cfg.click_through = s.click_through;

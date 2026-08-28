@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import * as cmd from "../lib/commands";
   import type { ClickThroughMode, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate } from "../lib/types";
   import ProcessPicker from "./ProcessPicker.svelte";
@@ -15,7 +16,6 @@
   let running      = $derived(status?.capture === "running");
   let clickThrough = $derived<ClickThroughMode>(status?.clickThrough ?? "auto");
   let alwaysOnTop  = $derived(status?.alwaysOnTop  ?? true);
-  let musicMode    = $derived(status?.musicMode ?? false);
 
   async function toggleRun() {
     running ? await cmd.stopCaptioning() : await cmd.startCaptioning();
@@ -46,6 +46,19 @@
     return cmd.setClickThrough(next);
   }
 
+  // `data-tauri-drag-region` does not fire in this window, so the drag is
+  // started explicitly. Doing it by hand is better anyway: it is greppable,
+  // and it can refuse the drag when the press did not start on the handle.
+  async function startDrag(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    try {
+      await getCurrentWindow().startDragging();
+    } catch (err) {
+      console.warn("startDragging failed", err);
+    }
+  }
+
   function dot(s: string | undefined) {
     return s === "ready" || s === "running" ? "ok" : s === "error" ? "err" : "idle";
   }
@@ -64,12 +77,14 @@
   }
 </script>
 
-<!-- The bar doubles as the window drag handle: in `auto` mode the subtitle
-     area no longer takes the mouse, so it can no longer be dragged. -->
-<div class="bar" data-tauri-drag-region>
+<!-- The bar is the window's drag handle: in `auto` mode the subtitle area no
+     longer takes the mouse, so it can no longer be dragged. `onpointerdown` on
+     every container with bare surface, because the handler must see the press
+     land on the container itself — a press on a child button is that button's. -->
+<div class="bar" role="toolbar" tabindex="-1" aria-label="字幕控制列" onpointerdown={startDrag}>
 
   <!-- 左側：可縮放的控制群 -->
-  <div class="left-group">
+  <div class="left-group" role="presentation" onpointerdown={startDrag}>
 
     <!-- ① Start / Stop -->
     <button class="run" class:on={running} onclick={toggleRun}>
@@ -102,17 +117,9 @@
     <!-- ③ 音訊來源 -->
     <ProcessPicker {status} />
 
-    <!-- ④ 音樂模式 -->
-    <button
-      class="icon-btn"
-      class:active={musicMode}
-      onclick={() => cmd.setMusicMode(!musicMode)}
-      title={musicMode ? "音樂模式（10s 切片 + beam=3）" : "語音模式（VAD）"}
-    >🎵</button>
-
     <div class="sep"></div>
 
-    <!-- ⑤ 視窗控制 -->
+    <!-- ④ 視窗控制 -->
     <button class="icon-btn" class:active={alwaysOnTop}
       onclick={() => cmd.setAlwaysOnTop(!alwaysOnTop)}
       title={alwaysOnTop ? "置頂：開（再按關閉）" : "置頂：關"}>
@@ -135,18 +142,19 @@
 
   </div>
 
-  <!-- spacer -->
-  <div class="spacer" data-tauri-drag-region></div>
+  <!-- Drag handle. Needs to be visible and a real target: with the bar this
+       full, an unmarked gap between two button groups is neither. -->
+  <div class="grip" role="separator" aria-label="拖曳移動視窗" onpointerdown={startDrag} title="拖曳移動視窗"></div>
 
   <!-- 右側：永遠固定在右邊 -->
-  <div class="right-group">
+  <div class="right-group" role="presentation" onpointerdown={startDrag}>
     <div class="sep"></div>
 
-    <!-- ⑥ 設定 / Dev -->
+    <!-- ⑤ 設定 / Dev -->
     <button class="icon-btn" onclick={() => onSettingsOpen()} title="設定">⚙️</button>
     <button class="dev" onclick={injectSample} title="注入測試字幕 (dev)">✦</button>
 
-    <!-- ⑦ 狀態指示 -->
+    <!-- ⑥ 狀態指示 -->
     <div class="status" title="音訊 · 語音 · 翻譯">
       <span class="dot {dot(status?.capture)}" title="音訊捕捉"></span>
       <span class="dot {dot(status?.asr)}"     title="語音辨識"></span>
@@ -240,13 +248,6 @@
   .lang-sel:focus  { border-color: #2f6fed; }
   .lang-arrow { font-size: 11px; color: #4a5566; flex-shrink: 0; }
 
-  /* ── 音樂模式 ────────────────────────────────── */
-  .icon-btn.active[title*="音樂"] {
-    background: #321a58;
-    border-color: #6040a0;
-    color: #d4a8ff;
-  }
-
   /* ── 置頂 ────────────────────────────────────── */
   .icon-btn.active[title*="置頂"] {
     background: #1a3a28;
@@ -271,7 +272,11 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    flex: 1 1 0;
+    /* Shrinks when the bar is narrow, but does NOT grow: the free space has to
+       belong to `.spacer`, which is bare and therefore draggable. When this
+       group absorbed it instead, the whole middle of the bar was a dead zone
+       that looked grabbable and was not. */
+    flex: 0 1 auto;
     min-width: 0;
   }
   .right-group {
@@ -282,7 +287,23 @@
   }
 
   /* ── Spacer + 狀態 ───────────────────────────── */
-  .spacer { flex: 0 0 8px; }
+  /* The one stretch of bar guaranteed to be bare, and so the only thing the OS
+     can treat as a title bar. Takes all the slack, with a floor so it stays
+     grabbable once the buttons have filled the row. Dotted so it reads as a
+     handle rather than as a gap someone forgot to close. */
+  .grip {
+    flex: 1 1 auto;
+    min-width: 34px;
+    align-self: stretch;
+    cursor: grab;
+    background-image: radial-gradient(circle, #4a5566 1px, transparent 1px);
+    background-size: 4px 4px;
+    background-position: center;
+    opacity: 0.5;
+    margin: 0 4px;
+  }
+  .grip:hover { opacity: 1; }
+  .grip:active { cursor: grabbing; }
 
   .status {
     display: flex;

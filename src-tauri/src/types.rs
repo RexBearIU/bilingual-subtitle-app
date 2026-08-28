@@ -157,7 +157,6 @@ pub struct EngineStatus {
     pub openrouter_key_set: bool,
     /// VAD speech threshold (linear RMS, 0.0–1.0).
     pub speech_threshold: f32,
-    pub music_mode: bool,
     /// Active ASR backend: "whisper" | "sensevoice".
     pub asr_backend: String,
     /// Whisper model size: "turbo" | "large".
@@ -196,7 +195,6 @@ impl EngineStatus {
             },
             openrouter_key_set: s.openrouter_key_set,
             speech_threshold: s.speech_threshold,
-            music_mode: s.music_mode,
             asr_backend: s.asr_backend.clone(),
             whisper_model: s.whisper_model.clone(),
             sensevoice_precision: s.sensevoice_precision.clone(),

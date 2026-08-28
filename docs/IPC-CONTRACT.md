@@ -13,7 +13,6 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `stop_captioning` | — | `Result<()>` | Stops pipeline; sidecars stay resident (models stay loaded) |
 | `set_subtitle_mode` | `{ mode: SubtitleMode }` | `Result<()>` | Hot-swappable while running |
 | `set_source_hint` | `{ hint: SourceHint }` | `Result<()>` | Language hint passed to Whisper per chunk |
-| `set_music_mode` | `{ enabled: bool }` | `Result<()>` | Switches chunker to 10 s chunks + "Song lyrics:" prompt + beam_size=3 |
 | `set_click_through` | `{ mode: ClickThroughMode }` | `Result<()>` | Window mouse policy. **Escape hatch:** `Ctrl+Alt+P` always forces `"off"` + re-pins on top |
 | `set_hit_regions` | `{ regions: HitRect[] }` | `Result<()>` | Rectangles that stay clickable in `"auto"`. CSS px relative to the client area; replaces the previous set |
 | `set_translate_provider` | `{ index: number }` | `Result<()>` | Switch provider; takes effect on the next subtitle. Index into `EngineStatus.translateProviders` |
@@ -96,7 +95,6 @@ interface EngineStatus {
   openrouterModel: string;    // model slug in use (resolved default if unset)
   openrouterKeySet: boolean;  // key present in env or settings; the key itself is never sent
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
-  musicMode: boolean;
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;       // "turbo" | "large" (large-v3 int8_float16)
   sensevoicePrecision: string;// "int8" | "fp32"
@@ -161,7 +159,6 @@ interface PersistSettings {
   openrouterApiKey: string;   // ALWAYS returned as "" — get_settings never echoes the stored key
   openrouterModel: string;    // "" = use the built-in default
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)
-  musicMode: boolean;
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;       // "turbo" | "large"
   sensevoicePrecision: string;// "int8" | "fp32"
@@ -185,4 +182,4 @@ interface SettingsPatch {
 }
 ```
 
-Note: `mode`, `sourceHint`, `musicMode`, and `fontSize` have their own dedicated commands and are not part of the patch payload.
+Note: `mode`, `sourceHint`, and `fontSize` have their own dedicated commands and are not part of the patch payload.

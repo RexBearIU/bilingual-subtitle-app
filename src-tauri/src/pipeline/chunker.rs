@@ -21,7 +21,7 @@
 //! ## Music mode
 //! Fixed 10 s chunks; no partial or silence detection.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,9 +37,6 @@ const SAMPLE_RATE: usize = 16_000;
 /// latency low while the buffer grows.
 const CHUNK_SAMPLES: usize = 96_000; // 6 s
 
-/// Music mode chunk size — longer window for full lyric lines.
-const MUSIC_CHUNK_SAMPLES: usize = 160_000; // 10 s
-
 /// Minimum samples for the stop-flush (avoid sending a near-empty WAV).
 const MIN_FLUSH_SAMPLES: usize = SAMPLE_RATE / 2; // 0.5 s
 
@@ -51,8 +48,16 @@ const PARTIAL_FLUSH_SAMPLES: usize = SAMPLE_RATE; // 1 s
 const PARTIAL_REFRESH_SAMPLES: usize = SAMPLE_RATE * 3 / 2; // 1.5 s
 
 /// RMS below this is considered silence (≈ −46 dBFS).
-/// Conservative — only catches genuine quiet moments, not music dips.
+/// Conservative — only catches genuine quiet moments, not brief level dips.
 const SILENCE_RMS: f32 = 0.005;
+
+/// Minimum audio behind a sentence-boundary cut.
+///
+/// Whisper punctuates eagerly, so a bare "네." after 0.4 s would otherwise get
+/// its own subtitle and its own translation call. Below this length the
+/// graduated silence rule — which demands a much longer pause for a short
+/// buffer — is the better judge of whether the utterance really ended.
+const SENTENCE_FLUSH_MIN_SAMPLES: usize = SAMPLE_RATE * 2; // 2 s
 
 /// Graduated silence flush: how many consecutive ~200 ms silent blocks are
 /// required to end an utterance, given how much audio is already buffered.
@@ -70,23 +75,31 @@ fn required_silence_frames(buf_len: usize) -> usize {
     }
 }
 
+/// `cut_request` is written by the ASR worker: when a partial's text reads as a
+/// finished sentence it stores that utterance id here, and the chunker ends the
+/// utterance without waiting for a pause or the hard cap.
+///
+/// The chunker only sees audio, so it cannot tell "still talking" from "finished
+/// a sentence and took a breath". The partials it already sends every 1.5 s are
+/// transcribed anyway — reading their punctuation costs nothing and is the only
+/// signal in the pipeline that knows where a sentence ends.
 pub fn start_vad_worker(
     rx: Receiver<Vec<f32>>,
     asr_tx: SyncSender<AudioChunk>,
     stop: Arc<AtomicBool>,
     _speech_threshold: f32, // kept for API compatibility — unused
-    music_mode: Arc<AtomicBool>,
+    cut_request: Arc<AtomicU64>,
 ) {
     log::info!(
-        "chunker: video={}s max / {}s partial / graduated silence-flush (800→200ms)  music={}s",
+        "chunker: {}s max / {}s partial / graduated silence-flush (800→200ms) / sentence-flush after {}s",
         CHUNK_SAMPLES / SAMPLE_RATE,
         PARTIAL_FLUSH_SAMPLES / SAMPLE_RATE,
-        MUSIC_CHUNK_SAMPLES / SAMPLE_RATE,
+        SENTENCE_FLUSH_MIN_SAMPLES / SAMPLE_RATE,
     );
 
     std::thread::Builder::new()
         .name("vad-worker".into())
-        .spawn(move || chunk_loop(rx, asr_tx, &stop, &music_mode))
+        .spawn(move || chunk_loop(rx, asr_tx, &stop, &cut_request))
         .expect("spawn vad-worker thread");
 }
 
@@ -170,7 +183,7 @@ fn chunk_loop(
     rx: Receiver<Vec<f32>>,
     asr_tx: SyncSender<AudioChunk>,
     stop: &Arc<AtomicBool>,
-    music_mode: &Arc<AtomicBool>,
+    cut_request: &Arc<AtomicU64>,
 ) {
     let mut buf: Vec<f32> = Vec::new();
     let session_start = Instant::now();
@@ -224,26 +237,22 @@ fn chunk_loop(
             }
         }
 
-        let is_music = music_mode.load(Ordering::Relaxed);
-
-        if !is_music {
-            if rms(&audio) >= SILENCE_RMS {
-                silence_count = 0;
-                has_speech = true;
-            } else {
-                silence_count += 1;
-            }
+        if rms(&audio) >= SILENCE_RMS {
+            silence_count = 0;
+            has_speech = true;
+        } else {
+            silence_count += 1;
         }
 
         buf.extend_from_slice(&audio);
 
-        let target = if is_music { MUSIC_CHUNK_SAMPLES } else { CHUNK_SAMPLES };
+        let target = CHUNK_SAMPLES;
 
-        // ── Rolling partial flush (video mode, 1 s then every 1.5 s) ─────────
+        // ── Rolling partial flush (1 s then every 1.5 s) ─────────────────────
         // Gated on has_speech: don't burn an ASR call previewing pure silence.
         // Clone, do NOT drain — the final must see the complete utterance audio
         // from the beginning so ASR doesn't start mid-sentence.
-        if !is_music && has_speech && buf.len() >= next_partial {
+        if has_speech && buf.len() >= next_partial {
             if !partial_sent {
                 utterance_id += 1;
                 utterance_started_ms = chunk_started_ms;
@@ -264,26 +273,37 @@ fn chunk_loop(
             // Don't update chunk_started_ms — the final starts from the same point.
         }
 
-        // ── Final flush (silence or max) ──────────────────────────────────────
-        let silence_flush = !is_music
-            && has_speech
+        // ── Final flush (sentence, silence, or max) ──────────────────────────
+        let silence_flush = has_speech
             && silence_count >= required_silence_frames(buf.len())
             && buf.len() >= MIN_FLUSH_SAMPLES;
 
+        // The ASR worker saw a completed sentence in the partial it just
+        // transcribed: end the utterance now instead of waiting for a pause
+        // the speaker may never take, or for the 6 s cap.
+        //
+        // `swap` rather than `load`: consuming the request is what stops it
+        // firing again, and a request left over from an utterance that has
+        // already been flushed is cleared by the same call.
+        let sentence_flush = partial_sent
+            && has_speech
+            && buf.len() >= SENTENCE_FLUSH_MIN_SAMPLES
+            && cut_request.swap(0, Ordering::Relaxed) == utterance_id;
+
         // Buffer hit the cap without any speech in it — pure silence/noise.
-        // Discard instead of sending 4 s of nothing through ASR.
-        if buf.len() >= target && !is_music && !has_speech {
+        // Discard instead of sending 6 s of nothing through ASR.
+        if buf.len() >= target && !has_speech {
             buf.clear();
             chunk_started_ms = now_ms;
             silence_count = 0;
             continue;
         }
 
-        if buf.len() >= target || silence_flush {
-            // Silence flush: the utterance ended naturally, take everything.
+        if buf.len() >= target || silence_flush || sentence_flush {
+            // Sentence / silence flush: the utterance ended, take everything.
             // Max-cap flush: cut at the quietest spot near the cap so we don't
             // split a word in half; the remainder seeds the next utterance.
-            let drain = if silence_flush {
+            let drain = if silence_flush || sentence_flush {
                 buf.len().min(target)
             } else {
                 quietest_cut(&buf, target)
@@ -297,8 +317,8 @@ fn chunk_loop(
                 utterance_started_ms = chunk_started_ms;
             }
 
-            let tag = if is_music {
-                "music"
+            let tag = if sentence_flush {
+                "sentence"
             } else if silence_flush {
                 "silence"
             } else {

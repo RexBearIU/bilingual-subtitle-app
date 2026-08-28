@@ -61,9 +61,6 @@ pub struct PersistSettings {
     /// `0.0` (default) = fully automatic (adaptive noise-floor EMA).
     /// Set to a linear RMS value (e.g. 0.032 = −30 dBFS) to hard-override.
     pub speech_threshold: f32,
-    /// Music mode persisted across restarts.
-    #[serde(default)]
-    pub music_mode: bool,
     /// ASR backend: "whisper" (default) | "sensevoice".
     #[serde(default = "default_asr_backend")]
     pub asr_backend: String,
@@ -91,7 +88,6 @@ impl Default for PersistSettings {
             openrouter_api_key: String::new(),
             openrouter_model: String::new(),
             speech_threshold: 0.0,
-            music_mode: false,
             asr_backend: default_asr_backend(),
             whisper_model: default_whisper_model(),
             sensevoice_precision: default_sv_precision(),
