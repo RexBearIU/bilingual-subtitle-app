@@ -4,20 +4,25 @@
 //!
 //! Providers are configuration, not code. Any endpoint speaking the
 //! OpenAI-compatible `/chat/completions` shape works — OpenRouter, Google AI
-//! Studio, Groq — and several can be listed so one failing does not take
-//! translation down with it.
+//! Studio, Groq — and several are listed in preference order so one failing
+//! does not take translation down with it.
+//!
+//! The ordered list lives in `settings.json` and is owned by the Settings
+//! panel: add, remove, reorder, edit. `.env` is still honoured, but only as a
+//! place to keep API keys out of the settings file — see `resolve_key`.
 
 pub mod remote;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-use crate::settings::{PersistSettings, SettingsPath};
+use crate::settings::{PersistSettings, SavedProvider, SettingsPath};
 use crate::types::SubtitleMode;
 
-/// Built-in presets so a provider can be named instead of spelled out.
+/// Built-in presets, so a well-known provider needs only a name and a key.
 /// `(name, base_url, default_model)`
 const PRESETS: &[(&str, &str, &str)] = &[
     (
@@ -44,9 +49,9 @@ const PRESETS: &[(&str, &str, &str)] = &[
 /// Used when nothing is configured at all.
 pub const DEFAULT_PROVIDER: &str = "openrouter";
 
-/// Model shown in the UI when the user has not chosen one.
-pub fn default_model() -> &'static str {
-    preset(DEFAULT_PROVIDER).map(|(_, m)| m).unwrap_or("")
+/// Names with a built-in preset, offered by the Settings panel's add form.
+pub fn preset_names() -> Vec<&'static str> {
+    PRESETS.iter().map(|(n, _, _)| *n).collect()
 }
 
 fn preset(name: &str) -> Option<(&'static str, &'static str)> {
@@ -56,7 +61,9 @@ fn preset(name: &str) -> Option<(&'static str, &'static str)> {
         .map(|(_, base, model)| (*base, *model))
 }
 
-/// One configured endpoint.
+// ── the live provider list ──────────────────────────────────────────────────
+
+/// One configured endpoint, ready to call.
 ///
 /// Deliberately NOT stored in `AppState`: that derives `Debug` and is logged on
 /// state changes, which would print the API key.
@@ -68,12 +75,24 @@ pub struct Provider {
     pub model: String,
     /// Optional upstream preference — OpenRouter's `provider.order`.
     pub provider_order: Option<Vec<String>>,
+    /// Where the key came from, for the UI. Never the key itself.
+    pub key_source: KeySource,
     /// Learned at runtime: this endpoint rejects `reasoning.enabled=false`.
     ///
     /// Google's OpenAI-compatible endpoint rejects it on EVERY call, so
     /// remembering the first rejection saves a wasted round trip per subtitle.
     /// Per-provider because it is a property of the endpoint, not the app.
     pub reasoning_unsupported: AtomicBool,
+}
+
+/// Where a provider's API key was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeySource {
+    /// Typed into the Settings panel; stored in `settings.json`.
+    Settings,
+    /// `TRANSLATE_<NAME>_API_KEY` (or legacy `OPENROUTER_API_KEY`).
+    Env,
 }
 
 impl Provider {
@@ -84,6 +103,15 @@ impl Provider {
 
     pub fn key_url(&self) -> String {
         format!("{}/models", self.base_url.trim_end_matches('/'))
+    }
+
+    fn info(&self) -> ProviderInfo {
+        ProviderInfo {
+            name: self.name.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            key_source: self.key_source,
+        }
     }
 }
 
@@ -97,166 +125,308 @@ impl Provider {
 pub struct ProviderInfo {
     pub name: String,
     pub model: String,
+    pub base_url: String,
+    pub key_source: KeySource,
 }
 
-/// Everything the translate worker needs, in preference order.
-pub struct RemoteConfig {
-    /// At least one; tried in order, later entries are fallbacks.
-    pub providers: Vec<Provider>,
-    /// Optional attribution headers (OpenRouter leaderboards; ignored elsewhere).
-    pub referer: Option<String>,
-    pub title: Option<String>,
-    /// True when `TRANSLATE_PROVIDERS` produced this list, which means the
-    /// Settings panel's key and model fields are inert — the legacy path that
-    /// reads them never ran. The UI needs to say so rather than accept edits
-    /// that go nowhere.
-    pub env_managed: bool,
+/// The live, ordered provider list, shared between the Settings commands and
+/// the translate worker.
+///
+/// Managed Tauri state rather than a field on `AppState` for the same reason
+/// `Provider` is: the keys must stay out of anything that derives `Debug`.
+/// `Arc<Provider>` entries so the worker can take one out from under the lock
+/// and hold it across an HTTP call without blocking an edit.
+#[derive(Default)]
+pub struct Registry(pub Mutex<Vec<Arc<Provider>>>);
+
+/// The provider the worker should use, given the shared active index.
+///
+/// Takes the index modulo the length, because the list can be edited from the
+/// UI between one subtitle and the next and may have shrunk under a stale
+/// index. Returns `None` only when the list is empty.
+pub fn pick_provider(app: &AppHandle, active: &AtomicUsize) -> Option<(usize, Arc<Provider>)> {
+    let reg = app.try_state::<Registry>()?;
+    let list = reg.0.lock().ok()?;
+    if list.is_empty() {
+        return None;
+    }
+    let idx = active.load(Ordering::Relaxed) % list.len();
+    Some((idx, Arc::clone(&list[idx])))
 }
 
-impl RemoteConfig {
-    /// Resolve from env vars first, then persisted settings.
-    ///
-    /// Two shapes are accepted:
-    ///
-    /// 1. **Multi-provider.** `TRANSLATE_PROVIDERS=aistudio,openrouter` plus,
-    ///    for each name, `TRANSLATE_<NAME>_API_KEY` and optionally
-    ///    `_BASE_URL` / `_MODEL` / `_PROVIDER_ORDER`. Names with a preset need
-    ///    only the key.
-    ///
-    /// 2. **Single provider (legacy).** `OPENROUTER_API_KEY` / `_MODEL` /
-    ///    `_BASE_URL` / `_PROVIDER_ORDER`, falling back to `settings.json`.
-    ///    Kept working so existing setups and the Settings panel are unaffected.
-    ///
-    /// Returns `Err` only when no usable provider has a key.
-    pub fn resolve(app: &AppHandle) -> Result<Self, String> {
-        // `Mutex<SettingsPath>`, not `SettingsPath`: that is how lib.rs manages
-        // it. Asking for the bare type always missed, which silently made the
-        // key stored by the Settings panel unreadable — the legacy branch saw
-        // `PersistSettings::default()` every time.
-        let saved = app
-            .try_state::<std::sync::Mutex<SettingsPath>>()
-            .and_then(|p| p.lock().ok().map(|p| PersistSettings::load(&p.0)))
-            .unwrap_or_default();
+/// Rebuild the live list from `settings.json` + the environment, then publish
+/// the key-free view to the UI.
+///
+/// Called at startup and after every edit, so the list the panel shows and the
+/// list the worker calls can never drift apart — which matters because the UI
+/// addresses providers by index.
+pub fn refresh(app: &AppHandle) -> Vec<ProviderInfo> {
+    let providers = build_all(app);
+    let infos: Vec<ProviderInfo> = providers.iter().map(|p| p.info()).collect();
 
-        let mut providers = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
-        let mut env_managed = false;
+    if let Some(reg) = app.try_state::<Registry>() {
+        if let Ok(mut list) = reg.0.lock() {
+            *list = providers;
+        }
+    }
+    crate::state::update_and_emit(app, |s| s.translate_providers = infos.clone());
+    infos
+}
 
-        if let Some(list) = non_empty_env("TRANSLATE_PROVIDERS") {
-            for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                match build_named(name) {
-                    Some(p) => providers.push(p),
-                    None => skipped.push(name.to_string()),
-                }
+/// Human-readable list for the log. Names and models only.
+pub fn describe(infos: &[ProviderInfo]) -> String {
+    if infos.is_empty() {
+        return "(none configured)".into();
+    }
+    infos
+        .iter()
+        .map(|p| format!("{}({})", p.name, p.model))
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+// ── resolution ──────────────────────────────────────────────────────────────
+
+fn load_settings(app: &AppHandle) -> PersistSettings {
+    // `Mutex<SettingsPath>`, not `SettingsPath`: that is how lib.rs manages it.
+    // Asking for the bare type always missed, which silently made the key
+    // stored by the Settings panel unreadable.
+    app.try_state::<Mutex<SettingsPath>>()
+        .and_then(|p| p.lock().ok().map(|p| PersistSettings::load(&p.0)))
+        .unwrap_or_default()
+}
+
+/// Build the full ordered list from settings, seeding it from the environment
+/// the first time.
+fn build_all(app: &AppHandle) -> Vec<Arc<Provider>> {
+    let mut saved = load_settings(app).providers;
+
+    // First run with a `.env`-configured setup: adopt that list so the panel
+    // has something to show and reorder. Names, URLs and models only — keys
+    // stay in `.env` and are resolved per call, so nothing secret is copied
+    // into a second file.
+    if saved.is_empty() {
+        saved = seed_from_env();
+        if saved.is_empty() {
+            saved.extend(seed_from_legacy(app));
+        }
+        if !saved.is_empty() {
+            log::info!(
+                "TL: seeding provider list from existing config: {}",
+                saved.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "),
+            );
+            persist(app, &saved);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut keyless = Vec::new();
+    for s in &saved {
+        match build_one(s) {
+            Some(p) => out.push(Arc::new(p)),
+            None => keyless.push(s.name.clone()),
+        }
+    }
+
+    if !keyless.is_empty() {
+        log::warn!("TL: no API key for: {} — skipped", keyless.join(", "));
+    }
+    out
+}
+
+fn seed_from_env() -> Vec<SavedProvider> {
+    let Some(list) = non_empty_env("TRANSLATE_PROVIDERS") else {
+        return Vec::new();
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            let upper = env_prefix(name);
+            SavedProvider {
+                name: name.to_string(),
+                // Left empty when a preset covers it, so the preset stays
+                // authoritative if it is ever corrected.
+                base_url: non_empty_env(&format!("TRANSLATE_{upper}_BASE_URL")).unwrap_or_default(),
+                api_key: String::new(),
+                model: non_empty_env(&format!("TRANSLATE_{upper}_MODEL")).unwrap_or_default(),
             }
-            env_managed = !providers.is_empty();
-        }
-
-        // Legacy single-provider config. Also the path the Settings panel writes.
-        if providers.is_empty() {
-            if let Some(p) = build_legacy(&saved) {
-                providers.push(p);
-            }
-        }
-
-        if providers.is_empty() {
-            let hint = if skipped.is_empty() {
-                String::new()
-            } else {
-                format!(" (no API key for: {})", skipped.join(", "))
-            };
-            return Err(format!(
-                "no translation provider configured{hint} — set TRANSLATE_<NAME>_API_KEY \
-                 (with TRANSLATE_PROVIDERS), or OPENROUTER_API_KEY, or the key in Settings"
-            ));
-        }
-        if !skipped.is_empty() {
-            log::warn!("TL: skipping providers with no API key: {}", skipped.join(", "));
-        }
-
-        Ok(RemoteConfig {
-            providers,
-            referer: Some("https://github.com/RexBearIU/bilingual-subtitle-app".into()),
-            title: Some("Bilingual Subtitles".into()),
-            env_managed,
         })
-    }
-
-    /// Names in preference order, for logging.
-    pub fn names(&self) -> String {
-        self.providers
-            .iter()
-            .map(|p| format!("{}({})", p.name, p.model))
-            .collect::<Vec<_>>()
-            .join(" → ")
-    }
-
-    /// Key-free view of the provider list, for `EngineStatus` and the UI.
-    pub fn infos(&self) -> Vec<ProviderInfo> {
-        self.providers
-            .iter()
-            .map(|p| ProviderInfo { name: p.name.clone(), model: p.model.clone() })
-            .collect()
-    }
+        .collect()
 }
 
-/// Build `TRANSLATE_<NAME>_*`. Returns `None` when no API key is set.
-fn build_named(name: &str) -> Option<Provider> {
-    let upper = name.to_uppercase().replace('-', "_");
-    let var = |suffix: &str| non_empty_env(&format!("TRANSLATE_{upper}_{suffix}"));
+fn env_prefix(name: &str) -> String {
+    name.to_uppercase().replace('-', "_")
+}
 
-    let api_key = var("API_KEY")?;
-    let (preset_base, preset_model) = preset(name).unwrap_or(("", ""));
+/// Resolve one saved entry into a callable provider, or `None` if it has no key.
+fn build_one(s: &SavedProvider) -> Option<Provider> {
+    let upper = env_prefix(&s.name);
+    let (preset_base, preset_model) = preset(&s.name).unwrap_or(("", ""));
 
-    let base_url = var("BASE_URL").or_else(|| non_empty(preset_base.to_string()))?;
-    let model = var("MODEL")
-        .or_else(|| non_empty(preset_model.to_string()))
-        .unwrap_or_default();
-    if model.is_empty() {
-        log::warn!("TL: provider {name:?} has no model — set TRANSLATE_{upper}_MODEL");
+    let (api_key, key_source) = resolve_key(s, &upper)?;
+
+    let base_url = non_empty(s.base_url.clone())
+        .or_else(|| non_empty_env(&format!("TRANSLATE_{upper}_BASE_URL")))
+        .or_else(|| non_empty(preset_base.to_string()))?;
+
+    let model = non_empty(s.model.clone())
+        .or_else(|| non_empty_env(&format!("TRANSLATE_{upper}_MODEL")))
+        .or_else(|| non_empty(preset_model.to_string()))?;
+
+    Some(Provider {
+        name: s.name.clone(),
+        base_url,
+        api_key,
+        model,
+        provider_order: non_empty_env(&format!("TRANSLATE_{upper}_PROVIDER_ORDER")).map(split_csv),
+        key_source,
+        reasoning_unsupported: AtomicBool::new(false),
+    })
+}
+
+/// The key for a saved entry: what was typed into Settings, else the
+/// environment.
+///
+/// Settings first, so changing it in the panel visibly wins. The environment
+/// fallback is what lets a `.env` keep holding the secrets while the ordered
+/// list lives in `settings.json`.
+fn resolve_key(s: &SavedProvider, upper: &str) -> Option<(String, KeySource)> {
+    if let Some(k) = non_empty(s.api_key.clone()) {
+        return Some((k, KeySource::Settings));
+    }
+    if let Some(k) = non_empty_env(&format!("TRANSLATE_{upper}_API_KEY")) {
+        return Some((k, KeySource::Env));
+    }
+    // The original variable, for a setup that predates the per-provider names.
+    if s.name == DEFAULT_PROVIDER {
+        if let Some(k) = non_empty_env("OPENROUTER_API_KEY") {
+            return Some((k, KeySource::Env));
+        }
+    }
+    None
+}
+
+/// One-shot migration of the original single-provider config into the list.
+///
+/// Runs only when the list is empty, and moves the stored key rather than
+/// copying it, so a key ends up in exactly one place. Migrating instead of
+/// keeping a permanent fallback matters for delete: a fallback that reappears
+/// after the user removes the last entry looks like the button is broken.
+fn seed_from_legacy(app: &AppHandle) -> Option<SavedProvider> {
+    let cfg = load_settings(app);
+    let stored = non_empty(cfg.openrouter_api_key.clone());
+    // An env-only setup has nothing to migrate but still needs an entry, so the
+    // key can be resolved from OPENROUTER_API_KEY at call time.
+    if stored.is_none() && non_empty_env("OPENROUTER_API_KEY").is_none() {
         return None;
     }
 
-    Some(Provider {
-        name: name.to_string(),
-        base_url,
-        api_key,
-        model,
-        provider_order: var("PROVIDER_ORDER").map(split_csv),
-        reasoning_unsupported: AtomicBool::new(false),
-    })
-}
+    let base_url = non_empty_env("OPENROUTER_BASE_URL").unwrap_or_default();
 
-/// Build from the original single-provider variables, then `settings.json`.
-fn build_legacy(saved: &PersistSettings) -> Option<Provider> {
-    let api_key = non_empty_env("OPENROUTER_API_KEY")
-        .or_else(|| non_empty(saved.openrouter_api_key.clone()))?;
-
-    let base_url = non_empty_env("OPENROUTER_BASE_URL")
-        .unwrap_or_else(|| preset(DEFAULT_PROVIDER).map(|(b, _)| b.to_string()).unwrap_or_default());
-
-    // Name the provider after the endpoint actually in use, so the logs do not
-    // claim "openrouter" while pointing at Google.
+    // Name it after the endpoint actually in use, so the logs and the UI do not
+    // say "openrouter" while pointing at Google.
     let name = PRESETS
         .iter()
-        .find(|(_, base, _)| base_url.trim_end_matches('/') == base.trim_end_matches('/'))
+        .find(|(_, base, _)| {
+            !base_url.is_empty() && base_url.trim_end_matches('/') == base.trim_end_matches('/')
+        })
         .map(|(n, _, _)| (*n).to_string())
-        .unwrap_or_else(|| "custom".to_string());
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
 
-    let model = non_empty_env("OPENROUTER_MODEL")
-        .or_else(|| non_empty(saved.openrouter_model.clone()))
-        .or_else(|| preset(&name).map(|(_, m)| m.to_string()))
-        .unwrap_or_default();
-
-    Some(Provider {
+    Some(SavedProvider {
         name,
-        base_url,
-        api_key,
-        model,
-        provider_order: non_empty_env("OPENROUTER_PROVIDER_ORDER").map(split_csv),
-        reasoning_unsupported: AtomicBool::new(false),
+        base_url: if preset_covers(&base_url) { String::new() } else { base_url },
+        api_key: stored.unwrap_or_default(),
+        model: non_empty_env("OPENROUTER_MODEL")
+            .or_else(|| non_empty(cfg.openrouter_model.clone()))
+            .unwrap_or_default(),
     })
 }
+
+/// True when a preset already supplies this base URL, so it need not be stored.
+fn preset_covers(base_url: &str) -> bool {
+    PRESETS
+        .iter()
+        .any(|(_, base, _)| base_url.trim_end_matches('/') == base.trim_end_matches('/'))
+}
+
+// ── editing ─────────────────────────────────────────────────────────────────
+
+/// One entry as the Settings panel sends it back.
+///
+/// `api_key` is three-valued on purpose, because the panel never receives the
+/// stored key and so cannot echo it: absent means "leave it alone", empty
+/// means "clear it, fall back to the environment", and a value replaces it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDraft {
+    pub name: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Replace the whole list — this is add, remove, edit and reorder at once.
+///
+/// One command rather than four because the panel owns the order, so every
+/// edit is "here is the new list" anyway, and a single write cannot leave the
+/// stored order disagreeing with what the user just dragged.
+pub fn set_list(app: &AppHandle, drafts: Vec<ProviderDraft>) -> Result<Vec<ProviderInfo>, String> {
+    let existing = load_settings(app).providers;
+
+    let mut out: Vec<SavedProvider> = Vec::with_capacity(drafts.len());
+    for d in drafts {
+        let name = d.name.trim().to_string();
+        if name.is_empty() {
+            return Err("provider name must not be empty".into());
+        }
+        if out.iter().any(|p| p.name == name) {
+            return Err(format!("duplicate provider name: {name}"));
+        }
+        // Carry the stored key forward when the panel did not send one.
+        let api_key = match d.api_key {
+            Some(k) => k.trim().to_string(),
+            None => existing
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.api_key.clone())
+                .unwrap_or_default(),
+        };
+        out.push(SavedProvider {
+            name,
+            base_url: d.base_url.trim().to_string(),
+            api_key,
+            model: d.model.trim().to_string(),
+        });
+    }
+
+    persist(app, &out);
+    // Never the keys, and never the URLs either — a base URL can carry a token.
+    log::info!(
+        "TL: provider list set to [{}]",
+        out.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "),
+    );
+    Ok(refresh(app))
+}
+
+fn persist(app: &AppHandle, providers: &[SavedProvider]) {
+    let Some(sp) = app.try_state::<Mutex<SettingsPath>>() else { return };
+    let Ok(sp) = sp.lock() else { return };
+    let mut cfg = PersistSettings::load(&sp.0);
+    cfg.providers = providers.to_vec();
+    // The list is now the only home for keys; leaving a copy in the legacy
+    // field would be a second plaintext secret nobody reads.
+    cfg.openrouter_api_key = String::new();
+    if let Err(e) = cfg.save(&sp.0) {
+        log::warn!("TL: saving provider list failed: {e}");
+    }
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────
 
 fn split_csv(v: String) -> Vec<String> {
     v.split(',')
@@ -292,6 +462,15 @@ pub struct TranslationRequest {
 mod tests {
     use super::*;
 
+    fn saved(name: &str, base: &str, key: &str, model: &str) -> SavedProvider {
+        SavedProvider {
+            name: name.into(),
+            base_url: base.into(),
+            api_key: key.into(),
+            model: model.into(),
+        }
+    }
+
     #[test]
     fn presets_cover_the_documented_names() {
         for name in ["aistudio", "openrouter", "groq"] {
@@ -311,6 +490,7 @@ mod tests {
             api_key: "k".into(),
             model: "m".into(),
             provider_order: None,
+            key_source: KeySource::Settings,
             reasoning_unsupported: AtomicBool::new(false),
         };
         assert_eq!(
@@ -326,5 +506,31 @@ mod tests {
     #[test]
     fn split_csv_trims_and_drops_blanks() {
         assert_eq!(split_csv(" a , ,b ".into()), vec!["a".to_string(), "b".into()]);
+    }
+
+    #[test]
+    fn build_one_fills_blanks_from_the_preset() {
+        // A preset name needs only a key; the URL and model come from PRESETS.
+        let p = build_one(&saved("groq", "", "k", "")).expect("should build");
+        assert_eq!(p.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(p.model, "qwen/qwen3.8-27b");
+        assert_eq!(p.key_source, KeySource::Settings);
+    }
+
+    #[test]
+    fn build_one_prefers_what_the_user_typed() {
+        let p = build_one(&saved("groq", "https://proxy.local/v1", "k", "my-model")).unwrap();
+        assert_eq!(p.base_url, "https://proxy.local/v1");
+        assert_eq!(p.model, "my-model");
+    }
+
+    #[test]
+    fn build_one_needs_a_key_and_a_url() {
+        // No key anywhere: not callable, so not in the list.
+        assert!(build_one(&saved("groq", "", "", "")).is_none());
+        // Unknown name with no base URL: nothing to call.
+        assert!(build_one(&saved("mystery", "", "k", "m")).is_none());
+        // Unknown name with no model: nothing to ask for.
+        assert!(build_one(&saved("mystery", "https://x/v1", "k", "")).is_none());
     }
 }

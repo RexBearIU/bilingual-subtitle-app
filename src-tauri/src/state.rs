@@ -71,15 +71,6 @@ pub struct AppState {
     /// the UI takes effect on the next subtitle instead of the next restart —
     /// and so a failover the worker performs is visible to the UI.
     pub translate_active: Arc<AtomicUsize>,
-    /// True when `TRANSLATE_PROVIDERS` supplied the list.
-    pub translate_env_managed: bool,
-    /// OpenRouter model slug in use (empty = built-in default).
-    /// The API key is deliberately kept out of `AppState` — this struct derives
-    /// `Debug` and is logged on state changes.
-    pub openrouter_model: String,
-    /// Whether an API key was found (env var or settings file) at the last
-    /// check.  Mirrored to the UI so it can show a "key missing" hint.
-    pub openrouter_key_set: bool,
     /// VAD speech threshold override. 0 = adaptive auto-mode (recommended).
     /// > 0 = fixed RMS threshold (manual override).
     pub speech_threshold: f32,
@@ -114,9 +105,6 @@ impl Default for AppState {
             subtitle_opacity: 0.55,
             translate_providers: Vec::new(),
             translate_active: Arc::new(AtomicUsize::new(0)),
-            translate_env_managed: false,
-            openrouter_model: String::new(),
-            openrouter_key_set: false,
             speech_threshold: 0.0, // 0 = adaptive auto-mode
             capture_target: None,
             asr_backend: "whisper".into(),

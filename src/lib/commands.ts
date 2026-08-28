@@ -1,6 +1,6 @@
 // Typed wrappers over the Rust commands. See docs/IPC-CONTRACT.md.
 import { invoke } from "@tauri-apps/api/core";
-import type { AudioProcess, ClickThroughMode, EngineStatus, HitRect, OverlayRect, PersistSettings, SourceHint, SubtitleMode, SubtitleUpdate } from "./types";
+import type { AudioProcess, ClickThroughMode, EngineStatus, HitRect, OverlayRect, PersistSettings, ProviderDraft, SourceHint, SubtitleMode, SubtitleUpdate } from "./types";
 
 export const startCaptioning = () => invoke<void>("start_captioning");
 export const stopCaptioning = () => invoke<void>("stop_captioning");
@@ -29,6 +29,18 @@ export const setHitRegions = (regions: HitRect[]) =>
 export const setTranslateProvider = (index: number) =>
   invoke<void>("set_translate_provider", { index });
 
+/**
+ * Replace the whole provider list — add, remove, edit and reorder in one call,
+ * because the panel owns the order so every edit is "here is the new list".
+ * Takes effect on the next subtitle; no restart.
+ */
+export const setTranslateProviders = (providers: ProviderDraft[]) =>
+  invoke<void>("set_translate_providers", { providers });
+
+/** Names with a built-in base URL and model, so the add form can ask only for a key. */
+export const translatePresetNames = () =>
+  invoke<string[]>("translate_preset_names");
+
 /** Re-pin the overlay to the top of the always-on-top band. */
 export const setAlwaysOnTop = (enabled: boolean) =>
   invoke<void>("set_always_on_top", { enabled });
@@ -48,9 +60,6 @@ export const getSettings = () => invoke<PersistSettings>("get_settings");
 
 export interface SettingsPatch {
   subtitleOpacity?: number;
-  /** Write-only. Empty string clears the stored key. */
-  openrouterApiKey?: string;
-  openrouterModel?: string;
   asrBackend?: string;
   whisperModel?: string;
   sensevoicePrecision?: string;

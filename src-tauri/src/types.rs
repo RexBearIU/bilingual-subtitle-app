@@ -144,17 +144,6 @@ pub struct EngineStatus {
     pub translate_providers: Vec<ProviderInfo>,
     /// Index into `translate_providers` the worker is currently using.
     pub translate_active: usize,
-    /// True when `TRANSLATE_PROVIDERS` supplied the list, which makes the
-    /// Settings panel's key and model fields inert.
-    pub translate_env_managed: bool,
-    /// OpenRouter model slug in use for translation.
-    ///
-    /// Only meaningful when `translate_env_managed` is false — otherwise the
-    /// per-provider models in `translate_providers` are what actually run.
-    pub openrouter_model: String,
-    /// Whether an API key is available (env var or settings file).
-    /// The key itself is never sent to the frontend.
-    pub openrouter_key_set: bool,
     /// VAD speech threshold (linear RMS, 0.0–1.0).
     pub speech_threshold: f32,
     /// Active ASR backend: "whisper" | "sensevoice".
@@ -187,13 +176,6 @@ impl EngineStatus {
             subtitle_opacity: s.subtitle_opacity,
             translate_providers: s.translate_providers.clone(),
             translate_active: s.translate_active.load(std::sync::atomic::Ordering::Relaxed),
-            translate_env_managed: s.translate_env_managed,
-            openrouter_model: if s.openrouter_model.is_empty() {
-                crate::translate::default_model().to_string()
-            } else {
-                s.openrouter_model.clone()
-            },
-            openrouter_key_set: s.openrouter_key_set,
             speech_threshold: s.speech_threshold,
             asr_backend: s.asr_backend.clone(),
             whisper_model: s.whisper_model.clone(),

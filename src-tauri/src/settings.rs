@@ -26,6 +26,28 @@ impl Default for OverlayRect {
     }
 }
 
+/// A translation endpoint the user added from the Settings panel.
+///
+/// Deliberately a settings type and not a state type: it carries the API key,
+/// and `AppState` derives `Debug` and is logged on every change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProvider {
+    /// Label, and the identity used to remove it again. Unique within the list.
+    pub name: String,
+    /// OpenAI-compatible root, e.g. `https://api.groq.com/openai/v1`.
+    /// Empty means "use the built-in preset for this name".
+    #[serde(default)]
+    pub base_url: String,
+    /// Stored in plaintext next to the other settings; never sent to the
+    /// webview, never logged.
+    #[serde(default)]
+    pub api_key: String,
+    /// Empty means "use the built-in preset's model for this name".
+    #[serde(default)]
+    pub model: String,
+}
+
 /// All user-configurable settings that survive app restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -42,6 +64,12 @@ pub struct PersistSettings {
     pub subtitle_opacity: f64,
     /// Overlay window geometry (physical pixels).
     pub overlay: OverlayRect,
+    /// Translation endpoints added from the Settings panel, in preference
+    /// order. Appended after anything `TRANSLATE_PROVIDERS` supplies, so
+    /// adding one from the UI always takes effect rather than being silently
+    /// outranked by the environment.
+    #[serde(default)]
+    pub providers: Vec<SavedProvider>,
     /// How the window treats the mouse: "off" | "auto" | "on".
     #[serde(default)]
     pub click_through: ClickThrough,
@@ -84,6 +112,7 @@ impl Default for PersistSettings {
             font_size: 28,
             subtitle_opacity: 0.55,
             overlay: OverlayRect::default(),
+            providers: Vec::new(),
             click_through: ClickThrough::default(),
             openrouter_api_key: String::new(),
             openrouter_model: String::new(),

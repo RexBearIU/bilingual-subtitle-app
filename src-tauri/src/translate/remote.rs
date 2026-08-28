@@ -15,10 +15,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state;
-use crate::translate::{Provider, RemoteConfig, TranslationRequest};
+use crate::translate::{self, Provider, TranslationRequest};
 use crate::types::{SubtitleMode, SubtitleTexts, SubtitleUpdate};
 
 /// Sent on every request.  Providers sit behind bots-and-abuse filters that
@@ -30,6 +30,11 @@ const USER_AGENT: &str = concat!("BilingualSubtitles/", env!("CARGO_PKG_VERSION"
 
 /// Per-request ceiling.  Subtitles are short; anything slower than this has
 /// already scrolled off screen, so failing fast beats waiting.
+/// Optional attribution headers. OpenRouter uses them for its leaderboards;
+/// every other endpoint ignores them.
+const REFERER: &str = "https://github.com/RexBearIU/bilingual-subtitle-app";
+const TITLE: &str = "Bilingual Subtitles";
+
 const REQUEST_TIMEOUT_SECS: u64 = 12;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 
@@ -42,13 +47,12 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 pub fn start_translate_worker(
     rx: std::sync::mpsc::Receiver<TranslationRequest>,
     app: AppHandle,
-    cfg: RemoteConfig,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
 ) {
     std::thread::Builder::new()
         .name("translate-worker".into())
-        .spawn(move || translate_loop(rx, &app, &cfg, &stop, &active))
+        .spawn(move || translate_loop(rx, &app, &stop, &active))
         .expect("spawn translate-worker thread");
 }
 
@@ -57,11 +61,9 @@ pub fn start_translate_worker(
 fn translate_loop(
     rx: std::sync::mpsc::Receiver<TranslationRequest>,
     app: &AppHandle,
-    cfg: &RemoteConfig,
     stop: &Arc<AtomicBool>,
     active: &Arc<AtomicUsize>,
 ) {
-    log::info!("TL: providers {}", cfg.names());
     set_tl_status(app, "loading");
 
     let agent = ureq::AgentBuilder::new()
@@ -75,12 +77,28 @@ fn translate_loop(
     // The scan begins at whatever the UI last selected rather than at 0, so a
     // provider the user pinned in an earlier session is not silently undone by
     // a restart.
-    let n = cfg.providers.len();
+    // Snapshot the list once for the startup key check. The live list can be
+    // edited from Settings at any time, so everything after this reads it fresh
+    // per request instead.
+    let startup: Vec<Arc<Provider>> = match app.try_state::<translate::Registry>() {
+        Some(reg) => reg.0.lock().map(|l| l.clone()).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if startup.is_empty() {
+        log::error!(
+            "TL: no provider configured - add one in Settings, or set \
+             TRANSLATE_<NAME>_API_KEY / OPENROUTER_API_KEY"
+        );
+        set_tl_status(app, "error");
+        return;
+    }
+
+    let n = startup.len();
     let first = active.load(Ordering::Relaxed).min(n - 1);
     let mut rejected = 0usize;
     for step in 0..n {
         let i = (first + step) % n;
-        let p = &cfg.providers[i];
+        let p = &startup[i];
         match check_credentials(&agent, p) {
             Ok(()) => {
                 log::info!("TL: {} key OK", p.name);
@@ -102,13 +120,14 @@ fn translate_loop(
     }
     if rejected == n {
         log::error!(
-            "TL: every provider rejected its key — check TRANSLATE_<NAME>_API_KEY / \
-             OPENROUTER_API_KEY, or the key in Settings"
+            "TL: every provider rejected its key — check the keys in Settings, or \
+             TRANSLATE_<NAME>_API_KEY / OPENROUTER_API_KEY"
         );
         set_tl_status(app, "error");
         return;
     }
     set_tl_status(app, "ready");
+    drop(startup);
 
     /// Consecutive failures on the active provider before falling forward.
     /// Two, not one: a single 429 or blip is what the per-request retry is for.
@@ -193,17 +212,19 @@ fn translate_loop(
             .map(|(s, t)| (s.as_str(), t.as_str()))
             .collect();
         let t_tl = std::time::Instant::now();
-        // Re-read every request: the UI can have switched provider since the
-        // last one. `% n` because the list is rebuilt on each pipeline start
-        // and may have shrunk under a stale index.
-        let idx = active.load(Ordering::Relaxed) % n;
+        // Read the live list every request: Settings can have switched the
+        // active provider, or added, removed or reordered entries, since the
+        // last subtitle.
+        let Some((idx, provider)) = translate::pick_provider(app, active) else {
+            log::warn!("TL: provider list is empty — nothing to translate with");
+            continue;
+        };
         if idx != counting_for {
             consecutive_failures = 0;
             counting_for = idx;
         }
-        let provider = &cfg.providers[idx];
         match call_translate(
-            &agent, provider, cfg, &req.source_lang, &req.source_text, req.mode, &prev,
+            &agent, &provider, &req.source_lang, &req.source_text, req.mode, &prev,
         ) {
             Ok(translated) => {
                 consecutive_failures = 0;
@@ -226,12 +247,14 @@ fn translate_loop(
                 // success on the new provider resets the counter, and nothing
                 // pins us there, so a later rotation can come back around.
                 consecutive_failures += 1;
-                if consecutive_failures >= FAILOVER_AFTER && n > 1 {
-                    let next = (idx + 1) % n;
+                if consecutive_failures >= FAILOVER_AFTER {
+                    // +1 rather than a length-aware wrap: `pick_provider` takes
+                    // the index modulo the live list, so this lands correctly
+                    // even if the list changed size since the failure.
+                    let next = idx + 1;
                     log::warn!(
-                        "TL: {} failed {consecutive_failures}x — switching to {}",
-                        cfg.providers[idx].name,
-                        cfg.providers[next].name,
+                        "TL: {} failed {consecutive_failures}x — falling forward",
+                        provider.name,
                     );
                     active.store(next, Ordering::Relaxed);
                     counting_for = next;
@@ -309,7 +332,6 @@ fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
 fn call_translate(
     agent: &ureq::Agent,
     provider: &Provider,
-    cfg: &RemoteConfig,
     source_lang: &str,
     text: &str,
     mode: crate::types::SubtitleMode,
@@ -358,7 +380,7 @@ fn call_translate(
         body["provider"] = serde_json::json!({ "order": order, "allow_fallbacks": true });
     }
 
-    let json = post_with_retry(agent, provider, cfg, &body)?;
+    let json = post_with_retry(agent, provider, &body)?;
 
     let raw = json
         .pointer("/choices/0/message/content")
@@ -409,7 +431,6 @@ fn call_translate(
 fn post_with_retry(
     agent: &ureq::Agent,
     provider: &Provider,
-    cfg: &RemoteConfig,
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     const RETRY_DELAY_MS: u64 = 250;
@@ -419,19 +440,13 @@ fn post_with_retry(
     let mut dropped_reasoning = false;
     let mut attempt = 0;
     loop {
-        let mut req = agent
+        let req = agent
             .post(&url)
             .set("Content-Type", "application/json")
             .set("User-Agent", USER_AGENT)
-            .set("Authorization", &format!("Bearer {}", provider.api_key));
-        // Optional attribution headers — they place the app on OpenRouter's
-        // leaderboards and are ignored when absent.
-        if let Some(r) = &cfg.referer {
-            req = req.set("HTTP-Referer", r);
-        }
-        if let Some(t) = &cfg.title {
-            req = req.set("X-Title", t);
-        }
+            .set("Authorization", &format!("Bearer {}", provider.api_key))
+            .set("HTTP-Referer", REFERER)
+            .set("X-Title", TITLE);
 
         let result = req.send_string(&body.to_string());
 

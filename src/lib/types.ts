@@ -38,10 +38,30 @@ export interface AudioProcess {
  */
 export type ClickThroughMode = "off" | "auto" | "on";
 
+/** Where a provider's API key was found. */
+export type KeySource = "settings" | "env";
+
 /** A configured translation endpoint. Never carries the API key. */
 export interface ProviderInfo {
   name: string;
   model: string;
+  baseUrl: string;
+  /** `env` = supplied by TRANSLATE_<NAME>_API_KEY rather than typed in Settings. */
+  keySource: KeySource;
+}
+
+/**
+ * One entry as the Settings panel sends it back.
+ *
+ * `apiKey` is three-valued because the panel never receives the stored key:
+ * omit it to keep what is stored, `""` to clear it (the environment then takes
+ * over again), or a value to replace it.
+ */
+export interface ProviderDraft {
+  name: string;
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
 }
 
 /** A rectangle that must stay clickable, in CSS px relative to the client area. */
@@ -68,10 +88,6 @@ export interface EngineStatus {
   translateProviders: ProviderInfo[];
   /** Index into `translateProviders` currently in use. */
   translateActive: number;
-  /** True when TRANSLATE_PROVIDERS built the list — the key/model settings below are then inert. */
-  translateEnvManaged: boolean;
-  openrouterModel: string;   // model slug used for translation
-  openrouterKeySet: boolean; // whether a key is available; the key is never sent here
   speechThreshold: number;   // VAD RMS threshold, linear 0–1 (~0.032 = −30 dBFS)
   asrBackend: string;        // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;      // "turbo" | "large"
@@ -95,7 +111,7 @@ export interface PersistSettings {
   subtitleOpacity: number;
   overlay: OverlayRect;
   clickThrough: ClickThroughMode;
-  /** Always returned empty — the backend never sends the stored key back. */
+  /** Legacy, always returned empty; superseded by the provider list. */
   openrouterApiKey: string;
   openrouterModel: string;
   speechThreshold: number;

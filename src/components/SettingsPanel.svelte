@@ -1,5 +1,6 @@
 <script lang="ts">
   import * as cmd from "../lib/commands";
+  import ProviderList from "./ProviderList.svelte";
   import type { EngineStatus } from "../lib/types";
 
   let { status, onClose }: { status: EngineStatus | null; onClose: () => void } = $props();
@@ -9,19 +10,12 @@
   let asrBackend        = $derived(status?.asrBackend           ?? 'whisper');
   let whisperModel      = $derived(status?.whisperModel         ?? 'turbo');
   let sensevoicePrecision = $derived(status?.sensevoicePrecision ?? 'int8');
-  let keySet            = $derived(status?.openrouterKeySet     ?? false);
-  let model             = $derived(status?.openrouterModel      ?? '');
-
   let providers   = $derived(status?.translateProviders   ?? []);
-  let activeIdx   = $derived(status?.translateActive      ?? 0);
-  // When TRANSLATE_PROVIDERS built the list, the legacy single-provider path
-  // never runs — so the key and model fields below are read by nobody. Saying
-  // so beats letting the user type into inputs that do nothing.
-  let envManaged  = $derived(status?.translateEnvManaged  ?? false);
+  let activeIdx   = $derived(status?.translateActive ?? 0);
 
   // Tabs rather than one long column: the panel lives inside the subtitle
-  // overlay, which is a couple hundred px tall. Growing the window to fit
-  // everything at once means a settings dialog that swallows the screen.
+  // overlay, which is only a couple hundred px tall. Fitting everything on
+  // one page means a settings dialog that swallows the screen.
   type Tab = 'translate' | 'asr' | 'look';
   const TABS: { id: Tab; label: string }[] = [
     { id: 'translate', label: '翻譯' },
@@ -30,37 +24,11 @@
   ];
   let tab = $state<Tab>('translate');
 
-  // The key is never sent back from Rust, so this input is a write-only draft:
-  // empty means "leave whatever is stored alone".
-  let keyDraft = $state('');
-  let keySaving = $state(false);
-
   async function onFont(e: Event) {
     await cmd.setFontSize(Number((e.target as HTMLInputElement).value));
   }
   async function onOpacity(e: Event) {
     await cmd.updateSettings({ subtitleOpacity: Number((e.target as HTMLInputElement).value) });
-  }
-  async function saveKey() {
-    keySaving = true;
-    try {
-      await cmd.updateSettings({ openrouterApiKey: keyDraft.trim() });
-      keyDraft = '';
-    } finally {
-      keySaving = false;
-    }
-  }
-  async function clearKey() {
-    keyDraft = '';
-    await cmd.updateSettings({ openrouterApiKey: '' });
-  }
-  async function onModel(e: Event) {
-    const v = (e.target as HTMLInputElement).value.trim();
-    if (v !== model) await cmd.updateSettings({ openrouterModel: v });
-  }
-  async function pickProvider(i: number) {
-    if (i === activeIdx) return;
-    await cmd.setTranslateProvider(i);
   }
   async function toggleAsr() {
     // Cycle: Whisper → SenseVoice → Zipformer-KO → Whisper
@@ -95,63 +63,7 @@
 
   <div class="body">
     {#if tab === 'translate'}
-    <!-- ── 翻譯供應商 ─────────────────────────────────────────────── -->
-    {#if providers.length > 0}
-      <div class="prov-list">
-        {#each providers as p, i (p.name + p.model)}
-          <button class="prov" class:active={i === activeIdx} onclick={() => pickProvider(i)}>
-            <span class="prov-rank">{i + 1}</span>
-            <span class="prov-text">
-              <span class="prov-name">{p.name}</span>
-              <span class="prov-model">{p.model}</span>
-            </span>
-            {#if i === activeIdx}<span class="prov-badge">使用中</span>{/if}
-          </button>
-        {/each}
-      </div>
-      <p class="hint left">
-        由上往下依序備援：連續失敗兩次會自動換下一個。點任一個可立刻手動指定，下一句字幕生效。
-      </p>
-    {:else}
-      <p class="hint left warn">
-        尚未設定任何翻譯供應商。在 <code>.env</code> 設定 <code>TRANSLATE_PROVIDERS</code>
-        與各家的 <code>TRANSLATE_&lt;NAME&gt;_API_KEY</code>，或在下方填入單一金鑰。
-      </p>
-    {/if}
-
-    <!-- ── 單一供應商（舊設定路徑） ────────────────────────────────── -->
-    {#if envManaged}
-      <p class="hint left note">
-        供應商清單由 <code>.env</code> 的 <code>TRANSLATE_PROVIDERS</code> 決定，
-        下面兩欄不會被讀取。要改模型請改 <code>TRANSLATE_&lt;NAME&gt;_MODEL</code>。
-      </p>
-    {/if}
-
-    <div class="row">
-      <span class="label">API 金鑰</span>
-      <input class="text-in" type="password" autocomplete="off" spellcheck="false"
-             disabled={envManaged}
-             placeholder={keySet ? '已設定（輸入以更換）' : 'sk-or-v1-…'}
-             bind:value={keyDraft} />
-      <button class="gpu-btn" disabled={envManaged || keySaving || !keyDraft.trim()} onclick={saveKey}>
-        {keySaving ? '儲存中' : '儲存'}
-      </button>
-    </div>
-    <div class="row sub-row">
-      <span class="label"></span>
-      <span class="key-status" class:ok={keySet}>{keySet ? '✓ 金鑰已設定' : '✕ 尚未設定'}</span>
-      {#if keySet && !envManaged}
-        <button class="gpu-btn cpu" onclick={clearKey}>清除</button>
-      {/if}
-    </div>
-
-    <div class="row">
-      <span class="label">翻譯模型</span>
-      <input class="text-in" type="text" autocomplete="off" spellcheck="false"
-             disabled={envManaged}
-             value={model} onchange={onModel} placeholder="google/gemini-3.5-flash-lite" />
-    </div>
-    <p class="hint">金鑰存在本機 settings.json，不會顯示回畫面。字幕短、講求延遲，小型快模型通常比大模型好用。改完重新 Start 生效。</p>
+    <ProviderList {providers} {activeIdx} />
     {/if}
 
     {#if tab === 'asr'}
@@ -277,6 +189,11 @@
 
   .body {
     padding: 0 0 8px;
+    /* Every tab is the same height, so switching one does not resize the panel
+       under the cursor. Sized to the tallest page; shorter pages leave space at
+       the bottom rather than making the window jump. */
+    min-height: 268px;
+    box-sizing: border-box;
   }
 
   .tabs {
@@ -340,79 +257,9 @@
   }
   /* Full-width variant for text that has no label to line up with. */
   .hint.left { padding-left: 14px; }
-  .hint.note { color: #8a7a52; }
-  .hint.warn { color: #a8705a; }
-  .hint code {
-    background: #1a222c;
-    border-radius: 3px;
-    padding: 0 3px;
-    color: #8fa4bb;
-  }
 
   .hint-inline {
     color: #5a636e;
-  }
-
-  /* ── provider list ───────────────────────────────────────────────── */
-  .prov-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 2px 14px 6px;
-  }
-  .prov {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    width: 100%;
-    text-align: left;
-    background: #16202c;
-    border: 1px solid #2c3a4a;
-    border-radius: 6px;
-    padding: 6px 9px;
-    color: #b7c2ce;
-    cursor: pointer;
-    font-family: inherit;
-    font-size: 12px;
-  }
-  .prov:hover { border-color: #3a5591; background: #1a2634; }
-  .prov.active {
-    background: #16302a;
-    border-color: #2f6f52;
-    color: #cfe8dc;
-  }
-  .prov-rank {
-    flex-shrink: 0;
-    width: 16px;
-    text-align: center;
-    color: #4e5a65;
-    font-size: 10px;
-    font-variant-numeric: tabular-nums;
-  }
-  .prov-text {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    min-width: 0;
-    flex: 1;
-  }
-  .prov-name { font-weight: 600; font-size: 12px; }
-  .prov-model {
-    font-size: 10px;
-    color: #5e6b78;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .prov.active .prov-model { color: #6f9284; }
-  .prov-badge {
-    flex-shrink: 0;
-    font-size: 9px;
-    letter-spacing: 0.06em;
-    color: #7bcfa0;
-    border: 1px solid #2f6f52;
-    border-radius: 4px;
-    padding: 1px 5px;
   }
 
   .gpu-btn {
@@ -428,41 +275,10 @@
     cursor: default;
     background: #2a3d6a;
   }
-  .gpu-btn.cpu { background: #3a2a2a; border-color: #6a3a3a; color: #ffb0a0; }
   .gpu-btn.sv    { background: #2a4a3a; border-color: #3a7a5a; color: #90e8b0; }
   .gpu-btn.zip   { background: #4a3a2a; border-color: #7a5a3a; color: #e8c090; }
   .gpu-btn.large { background: #3a2a6a; border-color: #5a4aaa; color: #c0a8ff; }
 
   .sub-row { padding-left: 28px; }
 
-  .text-in {
-    flex: 1;
-    min-width: 0;
-    background: #16202c;
-    border: 1px solid #2c3a4a;
-    border-radius: 6px;
-    padding: 4px 8px;
-    color: #cfd8e3;
-    font-size: 11px;
-    font-family: inherit;
-  }
-  .text-in:focus {
-    outline: none;
-    border-color: #3a5591;
-  }
-  .text-in:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-  .text-in::placeholder { color: #4e5a65; }
-
-  /* Longer than the numeric readouts `.val` is sized for, so it gets its own
-     rule rather than widening every status cell in the panel. */
-  .key-status {
-    flex: 1;
-    min-width: 0;
-    font-size: 11px;
-    color: #a08a6a;
-  }
-  .key-status.ok { color: #7bcfa0; }
 </style>

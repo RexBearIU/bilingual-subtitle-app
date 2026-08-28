@@ -58,6 +58,7 @@ pub fn run() {
         .manage(Mutex::new(AppState::default()))
         .manage(Mutex::new(state::AsrProc(None)))
         .manage(Mutex::new(settings::SettingsPath(std::path::PathBuf::new())))
+        .manage(translate::Registry::default())
         .invoke_handler(tauri::generate_handler![
             commands::start_captioning,
             commands::stop_captioning,
@@ -66,6 +67,8 @@ pub fn run() {
             commands::set_click_through,
             commands::set_hit_regions,
             commands::set_translate_provider,
+            commands::set_translate_providers,
+            commands::translate_preset_names,
             commands::set_always_on_top,
             commands::set_font_size,
             commands::get_status,
@@ -126,12 +129,6 @@ pub fn run() {
                     s.font_size = cfg.font_size;
                     s.subtitle_opacity = cfg.subtitle_opacity;
                     s.click_through = cfg.click_through;
-                    s.openrouter_model = cfg.openrouter_model.clone();
-                    // Env var wins over the settings file, mirroring
-                    // RemoteConfig::resolve — so the hint the UI shows matches
-                    // what the translate worker will actually find.
-                    s.openrouter_key_set = !cfg.openrouter_api_key.trim().is_empty()
-                        || std::env::var("OPENROUTER_API_KEY").is_ok_and(|v| !v.trim().is_empty());
                     s.speech_threshold = cfg.speech_threshold;
                     s.asr_backend = cfg.asr_backend.clone();
                     s.whisper_model = cfg.whisper_model.clone();
@@ -153,20 +150,11 @@ pub fn run() {
                 let _ = w.set_always_on_top(true);
             }
 
-            // Publish the provider list before the first Start, so Settings can
-            // show and switch providers on a freshly launched, idle app.
-            // Cheap: `resolve` only reads env vars and settings.json.
-            match translate::RemoteConfig::resolve(&app.handle().clone()) {
-                Ok(rc) => {
-                    log::info!("TL: providers {}", rc.names());
-                    let (infos, env_managed) = (rc.infos(), rc.env_managed);
-                    state::update_and_emit(&app.handle().clone(), |s| {
-                        s.translate_providers = infos;
-                        s.translate_env_managed = env_managed;
-                    });
-                }
-                Err(e) => log::warn!("TL: {e}"),
-            }
+            // Build the provider list before the first Start, so Settings can
+            // show, edit and reorder it on a freshly launched, idle app.
+            // Cheap: it only reads env vars and settings.json.
+            let infos = translate::refresh(&app.handle().clone());
+            log::info!("TL: providers {}", translate::describe(&infos));
 
             hittest::spawn(app.handle().clone());
 

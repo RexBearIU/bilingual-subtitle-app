@@ -60,32 +60,20 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     // A missing API key must not take the whole pipeline down: ASR still runs
     // and emits source-only subtitles, which is the same degraded mode we fall
     // back to when an individual translation call fails.
-    match translate::RemoteConfig::resolve(&app) {
-        Ok(cfg) => {
-            // Publish the (key-free) provider list so the UI can show which
-            // endpoints exist and switch between them. Resolved per pipeline
-            // start, because .env or settings.json may have changed since the
-            // last one.
-            let infos = cfg.infos();
-            let env_managed = cfg.env_managed;
-            let active = state::read_state(&app, |s| Arc::clone(&s.translate_active))
-                .expect("AppState available at pipeline start");
-            state::update_and_emit(&app, |s| {
-                s.translate_providers = infos;
-                s.translate_env_managed = env_managed;
-            });
-            translate::remote::start_translate_worker(
-                tl_rx, app.clone(), cfg, Arc::clone(&stop), active,
-            );
-        }
-        Err(e) => {
-            log::error!("TL disabled: {e}");
-            state::update_and_emit(&app, |s| {
-                s.translation_status = "error".into();
-                s.translate_providers.clear();
-            });
-            drop(tl_rx);
-        }
+    // Rebuild the provider list from settings + env before starting, in case
+    // either changed since the last run. A missing key must not take the whole
+    // pipeline down: ASR still runs and emits source-only subtitles, the same
+    // degraded mode we fall back to when an individual call fails.
+    let infos = translate::refresh(&app);
+    log::info!("TL: providers {}", translate::describe(&infos));
+    if infos.is_empty() {
+        log::error!("TL disabled: no provider configured");
+        state::update_and_emit(&app, |s| s.translation_status = "error".into());
+        drop(tl_rx);
+    } else {
+        let active = state::read_state(&app, |s| Arc::clone(&s.translate_active))
+            .expect("AppState available at pipeline start");
+        translate::remote::start_translate_worker(tl_rx, app.clone(), Arc::clone(&stop), active);
     }
     asr::http_client::start_asr_worker(
         asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx, Arc::clone(&cut_request),

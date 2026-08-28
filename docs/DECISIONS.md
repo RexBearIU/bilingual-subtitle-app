@@ -442,3 +442,46 @@ handler on the control bar's containers, and drop the attribute.
   between two button groups is not discoverable as a drag target.
 - Explicit beats magic here anyway: the call is greppable, and it can refuse a
   press that did not land on a container.
+
+---
+
+## ADR-0017 — The provider list lives in `settings.json`, owned by the UI
+
+**Date:** 2026-08-28 · **Status:** Accepted · **Supersedes:** ADR-0013 (ownership half)
+
+**Context.** ADR-0013 let the user switch between providers but not manage them:
+the list came from `TRANSLATE_PROVIDERS` and could only be changed by editing
+`.env` and restarting. Adding one meant leaving the app. Worse, the panel's key
+and model fields wrote to a legacy path that the env-configured list outranked,
+so typing into them did nothing — the panel had two ways to configure a
+provider and the visible one was the dead one.
+
+**Decision.** `settings.json` holds the ordered list; the Settings panel owns
+it. One command, `set_translate_providers`, replaces the whole thing — that is
+add, remove, edit and reorder at once. The panel drives it with a form and
+HTML5 drag-and-drop.
+
+`.env` keeps working, but demoted to one job: **supplying keys**. On first run
+with an empty list, `TRANSLATE_PROVIDERS` (or the older `OPENROUTER_*`) seeds
+it with names, URLs and models — *not* keys, which stay in `.env` and are
+resolved per call by name. So an existing setup keeps working, gains a UI, and
+no secret is copied into a second file.
+
+**Consequence.**
+- Edits are live. The worker reads the list per request from a shared registry
+  rather than holding a snapshot, so a reorder or a new provider lands on the
+  next subtitle with no restart. The index the UI addresses can therefore never
+  point at a different list than the one being called.
+- The keys never leave Rust. `ProviderInfo` carries `keySource` instead, so the
+  panel can show where a key came from without ever holding one, and
+  `get_settings` blanks every key on the way out.
+- `apiKey` in a draft is three-valued — absent keeps the stored key, `""`
+  clears it, a value replaces it — because the panel cannot echo back a key it
+  was never given.
+- The legacy single-provider config is **migrated**, not kept as a fallback. A
+  fallback that reappears after the user deletes the last entry looks like the
+  delete button is broken.
+- `dragDropEnabled: false` on the window: Tauri's file drag-drop handler
+  otherwise swallows HTML5 drag events. The overlay accepts no file drops.
+- Every tab in the panel is now the same height, so switching one does not
+  resize the panel under the cursor.

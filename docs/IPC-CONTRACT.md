@@ -15,7 +15,9 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `set_source_hint` | `{ hint: SourceHint }` | `Result<()>` | Language hint passed to Whisper per chunk |
 | `set_click_through` | `{ mode: ClickThroughMode }` | `Result<()>` | Window mouse policy. **Escape hatch:** `Ctrl+Alt+P` always forces `"off"` + re-pins on top |
 | `set_hit_regions` | `{ regions: HitRect[] }` | `Result<()>` | Rectangles that stay clickable in `"auto"`. CSS px relative to the client area; replaces the previous set |
-| `set_translate_provider` | `{ index: number }` | `Result<()>` | Switch provider; takes effect on the next subtitle. Index into `EngineStatus.translateProviders` |
+| `set_translate_provider` | `{ index: number }` | `Result<()>` | Switch the active provider; takes effect on the next subtitle. Index into `EngineStatus.translateProviders` |
+| `set_translate_providers` | `{ providers: ProviderDraft[] }` | `Result<()>` | Replace the whole list — add, remove, edit and reorder in one call. Persisted to `settings.json` |
+| `translate_preset_names` | — | `string[]` | Names with a built-in base URL and model, so the add form can ask only for a key |
 | `set_always_on_top` | `{ enabled: bool }` | `Result<()>` | Re-asserts topmost; re-stacks above other topmost windows |
 | `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120) |
 | `list_audio_processes` | — | `AudioProcess[]` | Windows processes with active audio sessions (for process picker) |
@@ -91,9 +93,6 @@ interface EngineStatus {
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
   translateProviders: ProviderInfo[]; // preference order; index 0 is tried first
   translateActive: number;    // index currently in use (moves on failover too)
-  translateEnvManaged: boolean; // TRANSLATE_PROVIDERS built the list → the two fields below are inert
-  openrouterModel: string;    // model slug in use (resolved default if unset)
-  openrouterKeySet: boolean;  // key present in env or settings; the key itself is never sent
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;       // "turbo" | "large" (large-v3 int8_float16)
@@ -121,7 +120,27 @@ type ClickThroughMode = "off" | "auto" | "on";
 interface HitRect { x: number; y: number; w: number; h: number }
 
 /** A configured translation endpoint. Never carries the API key. */
-interface ProviderInfo { name: string; model: string }
+interface ProviderInfo {
+  name: string;
+  model: string;
+  baseUrl: string;
+  /** `env` = the key came from TRANSLATE_<NAME>_API_KEY, not from Settings. */
+  keySource: "settings" | "env";
+}
+
+/**
+ * One entry as the Settings panel sends it back.
+ *
+ * `apiKey` is three-valued because the panel never receives the stored key:
+ * omit it to keep what is stored, `""` to clear it (the environment then takes
+ * over again), or a value to replace it.
+ */
+interface ProviderDraft {
+  name: string;
+  baseUrl: string;   // "" = use the built-in preset for this name
+  model: string;     // "" = use the built-in preset for this name
+  apiKey?: string;
+}
 ```
 ```
 
@@ -156,8 +175,10 @@ interface PersistSettings {
   subtitleOpacity: number;    // 0.0–1.0
   overlay: { x: number; y: number; w: number; h: number };
   clickThrough: ClickThroughMode;
-  openrouterApiKey: string;   // ALWAYS returned as "" — get_settings never echoes the stored key
-  openrouterModel: string;    // "" = use the built-in default
+  /** The ordered provider list. Every `apiKey` is ALWAYS returned as "". */
+  providers: { name: string; baseUrl: string; apiKey: string; model: string }[];
+  openrouterApiKey: string;   // legacy, ALWAYS ""; migrated into `providers` on first launch
+  openrouterModel: string;    // legacy, superseded by `providers`
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;       // "turbo" | "large"
@@ -172,8 +193,6 @@ All fields optional — only supplied keys are updated:
 ```ts
 interface SettingsPatch {
   subtitleOpacity?: number;
-  openrouterApiKey?: string;  // write-only; "" clears the stored key (env var then takes over)
-  openrouterModel?: string;   // takes effect on the next Start
   asrBackend?: string;        // kills idle asr-srv so next Start relaunches with the new backend
   whisperModel?: string;      // "turbo" | "large" — same relaunch behavior
   sensevoicePrecision?: string; // "int8" | "fp32" — same relaunch behavior

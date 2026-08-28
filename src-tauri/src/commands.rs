@@ -432,6 +432,42 @@ pub fn set_translate_provider(index: usize, state: Db, app: AppHandle) -> Result
     Ok(())
 }
 
+/// Replace the whole translation provider list: add, remove, edit, reorder.
+///
+/// One command for all four because the panel owns the order, so every edit is
+/// "here is the new list" anyway — and a single write cannot leave the stored
+/// order disagreeing with what the user just dragged.
+///
+/// An entry whose `apiKey` is absent keeps its stored key; an empty string
+/// clears it, after which the environment takes over again. The key is never
+/// sent back, so the panel could not echo it even if it wanted to.
+#[tauri::command]
+pub fn set_translate_providers(
+    providers: Vec<crate::translate::ProviderDraft>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let infos = crate::translate::set_list(&app, providers)?;
+    log::info!("TL: providers {}", crate::translate::describe(&infos));
+    // The list just changed under the active index. Clamping here rather than
+    // leaving it to the worker keeps the highlighted row honest while stopped.
+    if let Ok(s) = app.state::<Mutex<AppState>>().lock() {
+        let n = infos.len().max(1);
+        let cur = s.translate_active.load(Ordering::Relaxed);
+        if cur >= n {
+            s.translate_active.store(0, Ordering::Relaxed);
+        }
+        emit_status(&app, &s);
+    }
+    Ok(())
+}
+
+/// Provider names with a built-in base URL and model, so the add form can offer
+/// them and ask only for a key.
+#[tauri::command]
+pub fn translate_preset_names() -> Vec<&'static str> {
+    crate::translate::preset_names()
+}
+
 #[tauri::command]
 pub fn set_always_on_top(
     enabled: bool,
@@ -536,11 +572,20 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
         font_size: s.font_size,
         subtitle_opacity: s.subtitle_opacity,
         overlay: saved.overlay,
+        // Same rule as `openrouter_api_key` below: the shape crosses to the
+        // webview, so every key in it is blanked. The panel learns whether one
+        // is set from `EngineStatus.translateProviders[].keySource`.
+        providers: saved
+            .providers
+            .into_iter()
+            .map(|p| crate::settings::SavedProvider { api_key: String::new(), ..p })
+            .collect(),
         click_through: s.click_through,
-        // Never hand the API key back to the webview — the UI shows
-        // `openrouterKeySet` from EngineStatus instead, and writes are one-way.
+        // Never hand any API key back to the webview. Both of these are
+        // legacy: the provider list has replaced them, and they survive only
+        // so an old settings.json can still be migrated on first launch.
         openrouter_api_key: String::new(),
-        openrouter_model: s.openrouter_model.clone(),
+        openrouter_model: saved.openrouter_model,
         speech_threshold: s.speech_threshold,
         asr_backend: s.asr_backend.clone(),
         whisper_model: s.whisper_model.clone(),
@@ -572,24 +617,6 @@ pub fn update_settings(
             let clamped = op.clamp(0.0, 1.0);
             s.subtitle_opacity = clamped;
             saved.subtitle_opacity = clamped;
-        }
-        if let Some(ref key) = patch.openrouter_api_key {
-            // Empty string is a deliberate "clear the stored key" — after which
-            // the env var (if any) takes over again.
-            let key = key.trim().to_string();
-            s.openrouter_key_set =
-                !key.is_empty() || std::env::var("OPENROUTER_API_KEY").is_ok_and(|v| !v.trim().is_empty());
-            saved.openrouter_api_key = key;
-            // Never log the value.
-            log::info!("settings: openrouter_api_key updated (set={})", s.openrouter_key_set);
-        }
-        if let Some(ref model) = patch.openrouter_model {
-            let model = model.trim().to_string();
-            if s.openrouter_model != model {
-                log::info!("settings: openrouter_model → {model:?}");
-                s.openrouter_model = model.clone();
-                saved.openrouter_model = model;
-            }
         }
         if let Some(ref backend) = patch.asr_backend {
             let backend = backend.trim().to_lowercase();
@@ -677,9 +704,6 @@ pub fn update_settings(
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub subtitle_opacity: Option<f64>,
-    /// Write-only: the key is stored but never read back to the frontend.
-    pub openrouter_api_key: Option<String>,
-    pub openrouter_model: Option<String>,
     pub asr_backend: Option<String>,
     pub whisper_model: Option<String>,
     pub sensevoice_precision: Option<String>,
@@ -704,9 +728,8 @@ pub fn save_current_settings(app: &AppHandle) {
     cfg.font_size = s.font_size;
     cfg.subtitle_opacity = s.subtitle_opacity;
     cfg.click_through = s.click_through;
-    // `cfg` was loaded from disk, so the stored API key is carried through
-    // untouched — AppState never holds it.
-    cfg.openrouter_model = s.openrouter_model.clone();
+    // The legacy single-provider fields are carried through untouched: they
+    // live only until `translate` migrates them into the provider list.
     cfg.speech_threshold = s.speech_threshold;
     cfg.asr_backend = s.asr_backend.clone();
     cfg.whisper_model = s.whisper_model.clone();
