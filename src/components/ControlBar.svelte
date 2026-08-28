@@ -51,6 +51,10 @@
   // and it can refuse the drag when the press did not start on the handle.
   async function startDrag(e: PointerEvent) {
     if (e.button !== 0) return;
+    // Only when the press landed on the container itself. `pointerdown` bubbles,
+    // so without this every button press also starts a window drag, and the OS
+    // move loop it enters swallows the click the button was waiting for.
+    if (e.target !== e.currentTarget) return;
     e.preventDefault();
     try {
       await getCurrentWindow().startDragging();
