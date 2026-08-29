@@ -159,7 +159,17 @@ fn asr_loop(
         let lang_hint = state::read_state(app, |s| s.source_hint.lang_code().map(str::to_string))
             .unwrap_or(None);
 
-        let effective_prompt = last_prompt.as_deref();
+        // Whisper's prompt window is small and its cost is paid per request,
+        // so the context does not extend the prompt — it takes the front of it,
+        // and the rolling transcript keeps whatever is left. Total length is
+        // unchanged, and so is inference time.
+        //
+        // This is the half of the context that matters most: a name whisper
+        // never heard right cannot be repaired downstream, however good the
+        // translation prompt is.
+        let context = state::read_state(app, |s| s.context.clone()).unwrap_or_default();
+        let prompt_buf = compose_prompt(&context, last_prompt.as_deref());
+        let effective_prompt = prompt_buf.as_deref();
 
         // Partial chunks are throw-away previews — greedy (1) is fast enough.
         // Final chunks get beam=5 for accuracy; Korean especially benefits from this.
@@ -588,6 +598,43 @@ fn build_multipart(
 /// in that session — 4.93 s and 5.72 s — still qualify.
 const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 7 / 2; // 3.5 s
 
+/// Total characters of `initial_prompt` sent to whisper.
+///
+/// Unchanged from when the prompt was the rolling transcript alone, which is
+/// what keeps inference time where it was.
+const PROMPT_BUDGET: usize = 200;
+
+/// The share of that budget the user's context may take.
+///
+/// Half: enough for the names and the setting, while leaving the transcript
+/// enough room to carry a sentence across a chunk boundary.
+const CONTEXT_SHARE: usize = PROMPT_BUDGET / 2;
+
+/// Build whisper's `initial_prompt` from the user's context and recent text.
+///
+/// Context first, because whisper weights the beginning of the prompt most,
+/// and it is the part that does not change. Both halves are trimmed on char
+/// boundaries — a byte slice panics inside a multi-byte character, and Korean
+/// runs three bytes each.
+fn compose_prompt(context: &str, recent: Option<&str>) -> Option<String> {
+    let ctx: String = context.trim().chars().take(CONTEXT_SHARE).collect();
+    let room = PROMPT_BUDGET - ctx.chars().count();
+    let tail: String = match recent {
+        Some(r) => {
+            let n = r.chars().count();
+            r.chars().skip(n.saturating_sub(room)).collect()
+        }
+        None => String::new(),
+    };
+    let joined = match (ctx.is_empty(), tail.is_empty()) {
+        (true, true) => return None,
+        (false, true) => ctx,
+        (true, false) => tail,
+        (false, false) => format!("{ctx} {tail}"),
+    };
+    Some(joined)
+}
+
 /// How long to wait for a partial's transcription before abandoning it.
 ///
 /// Measured over one session: median 328 ms, p90 1047 ms — but repetitive
@@ -858,6 +905,43 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_context_never_lengthens_the_prompt() {
+        // The whole point: whisper's prompt costs time per request, so adding
+        // context must displace transcript, not extend the prompt.
+        let ctx = "x".repeat(500);
+        let recent = "y".repeat(500);
+        let p = compose_prompt(&ctx, Some(&recent)).expect("some prompt");
+        assert!(
+            p.chars().count() <= PROMPT_BUDGET + 1, // +1 for the joining space
+            "{} chars exceeds the budget",
+            p.chars().count(),
+        );
+    }
+
+    #[test]
+    fn the_context_comes_first_and_the_transcript_keeps_its_tail() {
+        let p = compose_prompt("LPL 轉播", Some("...早先的字 最後這幾個字")).unwrap();
+        assert!(p.starts_with("LPL 轉播"), "{p:?}");
+        assert!(p.ends_with("最後這幾個字"), "{p:?}");
+    }
+
+    #[test]
+    fn either_half_may_be_missing() {
+        assert_eq!(compose_prompt("", None), None);
+        assert_eq!(compose_prompt("only ctx", None).as_deref(), Some("only ctx"));
+        assert_eq!(compose_prompt("", Some("only recent")).as_deref(), Some("only recent"));
+    }
+
+    #[test]
+    fn trimming_lands_on_char_boundaries() {
+        // Korean is three bytes a character; a byte slice here would panic.
+        let ctx = "한".repeat(300);
+        let recent = "국".repeat(300);
+        let p = compose_prompt(&ctx, Some(&recent)).unwrap();
+        assert!(p.chars().count() <= PROMPT_BUDGET + 1);
+    }
+
     /// Prefix lengths the chunker flushes as partials, in samples.
     fn partials_of(utterance_secs: f64) -> Vec<usize> {
         use crate::pipeline::chunker::{PARTIAL_FLUSH_SAMPLES, PARTIAL_REFRESH_SAMPLES};

@@ -13,6 +13,19 @@
   let providers   = $derived(status?.translateProviders   ?? []);
   let activeIdx   = $derived(status?.translateActive ?? 0);
 
+  // Fetched once rather than carried on EngineStatus: that is re-broadcast on
+  // every RMS update, and this is a few hundred characters that almost never
+  // change.
+  const CONTEXT_MAX = 400;
+  let context = $state("");
+  let contextSaved = $state(true);
+  cmd.getSettings().then((s) => (context = s.context ?? "")).catch(() => {});
+
+  async function saveContext() {
+    await cmd.updateSettings({ context });
+    contextSaved = true;
+  }
+
   // Tabs rather than one long column: the panel lives inside the subtitle
   // overlay, which is only a couple hundred px tall. Fitting everything on
   // one page means a settings dialog that swallows the screen.
@@ -63,6 +76,31 @@
 
   <div class="body">
     {#if tab === 'translate'}
+    <div class="ctx">
+      <div class="ctx-head">
+        <span class="ctx-label">這段在講什麼</span>
+        <span class="ctx-count" class:over={context.length > CONTEXT_MAX}>
+          {context.length}/{CONTEXT_MAX}
+        </span>
+      </div>
+      <textarea
+        class="ctx-input"
+        rows="2"
+        spellcheck="false"
+        placeholder="例：LPL 英雄聯盟轉播，IG vs TES，選手 TheShy、Rookie、Keshi"
+        bind:value={context}
+        oninput={() => (contextSaved = false)}
+        onblur={saveContext}
+      ></textarea>
+      <p class="ctx-hint">
+        {#if contextSaved}
+          同時餵給辨識和翻譯。人名、隊名先寫在這裡，辨識才聽得對 —— 聽錯的字翻譯救不回來。
+        {:else}
+          點一下外面就會儲存
+        {/if}
+      </p>
+    </div>
+
     <ProviderList {providers} {activeIdx} />
     {/if}
 
@@ -133,6 +171,40 @@
 </div>
 
 <style>
+  /* ── 背景說明 ─────────────────────────────── */
+  .ctx { padding: 4px 14px 8px; }
+  .ctx-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .ctx-label { color: #9aa3ae; font-size: 11px; }
+  .ctx-count { color: #4e5a65; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .ctx-count.over { color: #e08070; }
+  .ctx-input {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    background: #16202c;
+    border: 1px solid #2c3a4a;
+    border-radius: 5px;
+    padding: 5px 7px;
+    color: #cfd8e3;
+    font-size: 11px;
+    font-family: inherit;
+    line-height: 1.5;
+  }
+  .ctx-input:focus { outline: none; border-color: #3a5591; }
+  .ctx-input::placeholder { color: #4e5a65; }
+  .ctx-hint {
+    margin: 4px 0 0;
+    font-size: 10px;
+    color: #4e5a65;
+    line-height: 1.45;
+  }
+
   .backdrop {
     position: fixed;
     inset: 0;

@@ -270,8 +270,9 @@ fn translate_loop(
             consecutive_failures = 0;
             counting_for = idx;
         }
+        let context = state::read_state(app, |s| s.context.clone()).unwrap_or_default();
         match call_translate(
-            &agent, &provider, &req.source_lang, &req.source_text, req.mode, &prev,
+            &agent, &provider, &req.source_lang, &req.source_text, req.mode, &prev, &context,
         ) {
             Ok(translated) => {
                 consecutive_failures = 0;
@@ -330,13 +331,18 @@ fn translate_loop(
 
 /// Whether a request needs no translation because it is already in the target.
 ///
-/// Not simply `source == target`. "zh" is one code for two scripts: whisper
-/// transcribes Mandarin in Simplified, and this app's zh mode means Traditional
-/// (`SubtitleMode::Zh.target_name()` says so). Treating zh→zh as a no-op put
-/// 简体 straight on screen under a 繁中 label — the shortcut skipped the one
-/// step that mode exists to perform.
+/// Chinese is deliberately included, and this is worth knowing before
+/// "fixing" it: "zh" is one code for two scripts, so a Chinese source under
+/// the 繁中 target can arrive in Simplified and stay that way. That is a
+/// product decision, not an oversight — a reader of Chinese reads both
+/// scripts, so paying an API call and its latency on every line to convert
+/// between them buys nothing.
+///
+/// The script targets still do their job where it matters: ko→繁中 and
+/// en→简中 are real translations and honour the script they name. Only a
+/// source that is already Chinese short-circuits.
 fn is_noop_translation(source_lang: &str, target: &str) -> bool {
-    source_lang == target && target != "zh"
+    source_lang == target
 }
 
 /// Choose between the request in hand and a newer one waiting behind it.
@@ -404,7 +410,7 @@ fn check_credentials(agent: &ureq::Agent, provider: &Provider) -> Result<(), Cre
 
 // ── prompting ───────────────────────────────────────────────────────────────
 
-fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
+fn build_system_prompt(source_lang: &str, target_name: &str, context: &str) -> String {
     let mut p = format!(
         "You are a real-time subtitle translator. \
          Output ONLY the {target_name} translation — no explanations, no additions. \
@@ -427,12 +433,26 @@ fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
         );
     }
 
+    // What the user says this audio is about. Byte-identical on every request,
+    // so a provider with prompt caching charges for it once; the note is capped
+    // at 400 chars where it is stored, which bounds the cost where it is not.
+    let context = context.trim();
+    if !context.is_empty() {
+        p.push_str(
+            " The following describes what is being watched. Use it for names, \
+             titles and terminology; it is background, never something to \
+             translate or mention: ",
+        );
+        p.push_str(context);
+    }
+
     p
 }
 
 /// Call OpenRouter and return the translation in the target language.
 /// `prev` holds the last few (source, translated) pairs, injected as prior
 /// chat turns to keep vocabulary, names, and topic continuity consistent.
+#[allow(clippy::too_many_arguments)]
 fn call_translate(
     agent: &ureq::Agent,
     provider: &Provider,
@@ -440,6 +460,7 @@ fn call_translate(
     text: &str,
     mode: crate::types::SubtitleMode,
     prev: &[(&str, &str)],
+    context: &str,
 ) -> Result<String, String> {
     let source_name = match source_lang {
         "ko" => "Korean",
@@ -450,7 +471,7 @@ fn call_translate(
     };
     let target_name = mode.target_name();
 
-    let system = build_system_prompt(source_lang, target_name);
+    let system = build_system_prompt(source_lang, target_name, context);
     let user = format!("[{source_name}→{target_name}] {text}");
 
     let mut messages = vec![serde_json::json!({ "role": "system", "content": &system })];
@@ -680,10 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn chinese_to_chinese_is_a_script_conversion_not_a_no_op() {
-        // The reported bug: 繁中 → 繁中 displayed Simplified, because whisper
-        // returns "zh" for either script and the shortcut took it as identical.
-        assert!(!is_noop_translation("zh", "zh"));
+    fn chinese_to_chinese_passes_straight_through() {
+        // Deliberate: whisper may hand back either script, and converting
+        // between them costs a call and its latency on every single line to
+        // produce something the reader could already read.
+        assert!(is_noop_translation("zh", "zh"));
     }
 
     #[test]

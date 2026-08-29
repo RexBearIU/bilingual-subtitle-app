@@ -40,6 +40,12 @@ pub struct HitRect {
 pub struct AppState {
     pub mode: SubtitleMode,
     pub source_hint: SourceHint,
+    /// Free-text description of what is being watched.
+    ///
+    /// Lives here rather than being read from disk per chunk: the ASR worker
+    /// wants it on every request, and a file read in that path would put I/O
+    /// between the audio and the transcription.
+    pub context: String,
     pub font_size: u32,
     pub click_through: ClickThrough,
     /// Whether the mouse is being passed through right now. Owned by the
@@ -92,6 +98,7 @@ impl Default for AppState {
         AppState {
             mode: SubtitleMode::default(),
             source_hint: SourceHint::default(),
+            context: String::new(),
             font_size: 28,
             click_through: ClickThrough::default(),
             click_through_active: false,

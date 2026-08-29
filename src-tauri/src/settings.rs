@@ -62,6 +62,11 @@ pub struct PersistSettings {
     /// Source language hint for Whisper (auto = per-chunk detection).
     #[serde(default)]
     pub source_hint: SourceHint,
+    /// What this audio is about, in the user's own words: show, teams, the
+    /// names likely to come up. Fed to both ASR and translation — see
+    /// `AppState::context`.
+    #[serde(default)]
+    pub context: String,
     /// Subtitle font size (px).
     pub font_size: u32,
     /// Opacity of the subtitle background box, 0.0–1.0.
@@ -114,6 +119,7 @@ impl Default for PersistSettings {
         PersistSettings {
             mode: SubtitleMode::default(),
             source_hint: SourceHint::default(),
+            context: String::new(),
             font_size: 28,
             subtitle_opacity: 0.55,
             overlay: OverlayRect::default(),

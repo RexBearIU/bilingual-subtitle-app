@@ -135,6 +135,7 @@ pub fn run() {
                 if let Ok(mut s) = st.lock() {
                     s.mode = cfg.mode;
                     s.source_hint = cfg.source_hint;
+                    s.context = cfg.context.clone();
                     s.font_size = cfg.font_size;
                     s.subtitle_opacity = cfg.subtitle_opacity;
                     s.click_through = cfg.click_through;

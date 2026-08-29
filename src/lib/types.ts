@@ -118,6 +118,8 @@ export interface OverlayRect {
 export interface PersistSettings {
   mode: SubtitleMode;
   sourceHint: SourceHint;
+  /** What the audio is about, in the user's words. Primes ASR and translation. */
+  context: string;
   fontSize: number;
   subtitleOpacity: number;
   overlay: OverlayRect;
