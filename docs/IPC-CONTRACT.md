@@ -32,7 +32,9 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 ### `subtitle_update`
 
 ```ts
-type SubtitleMode = "none" | "zh" | "ko" | "en";
+// `zh` is Traditional — the name it carried before Simplified was added,
+// kept so an existing settings.json still selects what it always did.
+type SubtitleMode = "none" | "zh" | "zh-hans" | "ko" | "en";
 type SourceLang   = "ko" | "en" | "zh";
 
 interface SubtitleTexts {
@@ -159,7 +161,9 @@ interface ProviderDraft {
 ### `SubtitleMode`
 
 ```ts
-type SubtitleMode = "none" | "zh" | "ko" | "en";
+// `zh` is Traditional — the name it carried before Simplified was added,
+// kept so an existing settings.json still selects what it always did.
+type SubtitleMode = "none" | "zh" | "zh-hans" | "ko" | "en";
 ```
 
 - `"none"` — show source text only, no translation

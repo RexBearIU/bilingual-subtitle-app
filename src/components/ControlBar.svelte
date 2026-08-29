@@ -170,7 +170,9 @@
       <select class="lang-sel" value={sourceHint} onchange={onSourceHint}
               title="Whisper 接收語言（自動 = 每句自動判斷）">
         <option value="auto">自動</option>
-        <option value="zh">繁中</option>
+        <!-- Not 繁/簡: whisper takes a language, not a script, so offering the
+             choice here would promise something it cannot do. -->
+        <option value="zh">中文</option>
         <option value="ko">한국</option>
         <option value="en">EN</option>
       </select>
@@ -179,6 +181,7 @@
               title="翻譯目標語言（不翻 = 只顯示原文）">
         <option value="none">不翻</option>
         <option value="zh">繁中</option>
+        <option value="zh-hans">简中</option>
         <option value="ko">한국</option>
         <option value="en">EN</option>
       </select>

@@ -53,8 +53,14 @@ pub enum SubtitleMode {
     #[serde(rename = "none")]
     NoTranslate,
     /// Translate everything to Traditional Chinese (繁體中文).
+    ///
+    /// Keeps the bare `"zh"` wire name it has always had, so a settings.json
+    /// written before Simplified existed still selects what it selected then.
     #[default]
     Zh,
+    /// Translate everything to Simplified Chinese (简体中文).
+    #[serde(rename = "zh-hans")]
+    ZhHans,
     /// Translate everything to Korean (한국어).
     Ko,
     /// Translate everything to English.
@@ -66,7 +72,9 @@ impl SubtitleMode {
     pub fn target_lang(self) -> &'static str {
         match self {
             Self::NoTranslate => "",
-            Self::Zh => "zh",
+            // Both scripts share one language code and one subtitle slot; the
+            // script lives in `target_name`, which is what the prompt reads.
+            Self::Zh | Self::ZhHans => "zh",
             Self::Ko => "ko",
             Self::En => "en",
         }
@@ -76,6 +84,7 @@ impl SubtitleMode {
         match self {
             Self::NoTranslate => "",
             Self::Zh => "Traditional Chinese (繁體中文)",
+            Self::ZhHans => "Simplified Chinese (简体中文)",
             Self::Ko => "Korean (한국어)",
             Self::En => "English",
         }
@@ -211,10 +220,12 @@ mod tests {
     fn subtitle_mode_target_lang_and_name() {
         assert_eq!(SubtitleMode::NoTranslate.target_lang(), "");
         assert_eq!(SubtitleMode::Zh.target_lang(), "zh");
+        assert_eq!(SubtitleMode::ZhHans.target_lang(), "zh");
         assert_eq!(SubtitleMode::Ko.target_lang(), "ko");
         assert_eq!(SubtitleMode::En.target_lang(), "en");
         assert_eq!(SubtitleMode::NoTranslate.target_name(), "");
         assert!(SubtitleMode::Zh.target_name().contains("繁體中文"));
+        assert!(SubtitleMode::ZhHans.target_name().contains("简体中文"));
     }
 
     #[test]
@@ -222,6 +233,12 @@ mod tests {
         // The frontend/IPC contract depends on these exact strings.
         assert_eq!(serde_json::to_string(&SubtitleMode::NoTranslate).unwrap(), "\"none\"");
         assert_eq!(serde_json::to_string(&SubtitleMode::Zh).unwrap(), "\"zh\"");
+        // A settings.json from before Simplified existed must still mean 繁中.
+        assert_eq!(serde_json::from_str::<SubtitleMode>("\"zh\"").unwrap(), SubtitleMode::Zh);
+        assert_eq!(
+            serde_json::to_string(&SubtitleMode::ZhHans).unwrap(),
+            "\"zh-hans\"",
+        );
         assert_eq!(serde_json::to_string(&SourceHint::Auto).unwrap(), "\"auto\"");
         assert_eq!(
             serde_json::from_str::<SubtitleMode>("\"none\"").unwrap(),

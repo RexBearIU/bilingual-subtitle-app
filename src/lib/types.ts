@@ -4,7 +4,8 @@
 export type SourceHint = "auto" | "zh" | "ko" | "en";
 
 /** Target translation language. "none" = show source text only, no translation. */
-export type SubtitleMode = "none" | "zh" | "ko" | "en";
+/** `zh` is Traditional — the name it had before Simplified was added. */
+export type SubtitleMode = "none" | "zh" | "zh-hans" | "ko" | "en";
 export type SourceLang = "ko" | "en" | "zh";
 export type Lang = "zh" | "ko" | "en";
 
