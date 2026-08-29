@@ -78,7 +78,49 @@ reference — you know what was actually said, and the failure modes that matter
 loanwords, wrong language detection) are obvious on sight and invisible in a
 single aggregate number.
 
+## probe_partials.py — measuring hallucinations
+
+`compare_backends.py` sends one request per utterance. The app does not: it
+flushes a partial 1 s in, refreshes every 1.5 s, and attaches a rolling
+`initial_prompt`. Hallucinations live almost entirely in those short prompted
+requests, so comparing backends will not show them to you.
+
+```powershell
+python bench/probe_partials.py bench/sample.wav
+```
+
+It reproduces that exact cadence, prints `duration / no_speech / language /
+text` per request, marks the ones the app's current rule would suppress, and
+writes the raw numbers to `bench/out/partials.json` so a threshold can be
+re-checked without paying for inference again.
+
+The reason it exists: `no_speech_prob` is not what it appears to be under a
+prompt. The same 1.2 s chunk, transcribed `Bye.` in the middle of Korean audio,
+scored **0.902 standalone and 0.000 with the rolling prompt attached** — which
+is why the `no_speech >= 0.7` filter almost never fires on the chunks it was
+written for. That measurement is what produced the length-plus-language-flip
+rule in `asr/http_client.rs` (ADR-0021).
+
+`LANG_WINDOW` and `SHORT_FLIP_SECS` at the top of the script mirror the Rust
+constants. Change one and change the other, or the verdicts it prints describe
+a rule the app does not run.
+
+Whisper is not deterministic: the wording of a hallucination varies between
+runs (`¡Bienvenidos a la secundita!` one run, `¿Qué es esto?` the next). The
+chunks it happens on do not.
+
 ## Note on ports
 
-Defaults to 9101 so it does not collide with the app's asr-srv on 9001. You can
-leave the app running while benchmarking.
+`compare_backends.py` defaults to 9101 and `probe_partials.py` to 9103, so
+neither collides with the app's asr-srv on 9001. You can leave the app running
+while benchmarking.
+
+## A note on the interpreter
+
+Both scripts launch `asr_srv.py` with `sys.executable`. That must be the
+`uv sync`-created `.venv` — a system Python loads the model and then fails
+every inference with a 500, because `nvidia-cublas-cu12` lives in the venv:
+
+```powershell
+.venv\Scripts\python.exe bench/probe_partials.py bench/sample.wav
+```
