@@ -81,7 +81,7 @@ fn asr_loop(
     // When the last preview translation was requested, per utterance. Resets
     // with the utterance, so every long one gets previews and no short one
     // pays for a call it does not need.
-    let mut last_preview: Option<(u64, std::time::Instant)> = None;
+    let mut last_preview: Option<(u64, std::time::Instant, String)> = None;
     // Languages of the last few ACCEPTED finals. A window with a majority
     // vote, not simply "the language of the last final": one hallucination that
     // gets through would otherwise become the reference, and then every correct
@@ -313,20 +313,36 @@ fn asr_loop(
                     //     need one every few seconds, not every 1.5 s. This
                     //     costs roughly two extra calls on a 6 s utterance and
                     //     nothing at all on a short one.
+                    //     Three gates, and the text one is not optional:
+                    //     two seconds of audio can still transcribe to "아...",
+                    //     which costs a call to render as "啊……" and then
+                    //     flashes on screen until the real sentence replaces
+                    //     it. Measured — that is exactly what the first
+                    //     version did.
                     let long_enough = chunk.samples.len() >= PREVIEW_MIN_SAMPLES;
-                    let due = match last_preview {
-                        Some((id, at)) if id == chunk.utterance_id => {
-                            at.elapsed() >= PREVIEW_MIN_GAP
+                    let worth_reading = is_worth_previewing(&text);
+                    let due = match &last_preview {
+                        Some((id, at, shown)) if *id == chunk.utterance_id => {
+                            // Re-translating text that has not moved on buys a
+                            // rewrite of the same line and nothing else.
+                            at.elapsed() >= PREVIEW_MIN_GAP && *shown != text
                         }
                         _ => true,
                     };
-                    if long_enough && due {
-                        last_preview = Some((chunk.utterance_id, std::time::Instant::now()));
+                    if long_enough && worth_reading && due {
+                        last_preview = Some((
+                            chunk.utterance_id,
+                            std::time::Instant::now(),
+                            text.clone(),
+                        ));
                         send_translation(
                             &translate_tx, app, subtitle_id, &text, &lang, &chunk, true,
                         );
                     } else {
-                        log::debug!("ASR u{subtitle_id}: preview translation not due");
+                        log::debug!(
+                            "ASR u{subtitle_id}: no preview (audio={long_enough} \
+                             text={worth_reading} due={due})",
+                        );
                     }
                     continue;
                 }
@@ -515,6 +531,13 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
 /// translation could arrive, so it never gets one.
 const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 2; // 2 s
 
+/// Letters a preview needs before it is worth translating.
+///
+/// Counted over alphabetic characters, so trailing dots and quotes do not
+/// stand in for content. Four is enough to clear interjections — "아", "어",
+/// "음" — while passing any real clause, including a short Korean one.
+const PREVIEW_MIN_CHARS: usize = 4;
+
 /// Minimum spacing between preview translations of the same utterance.
 ///
 /// Partials arrive every 1.5 s. Translating each one triples the call count
@@ -540,6 +563,16 @@ fn established_lang(recent: &std::collections::VecDeque<String>) -> Option<&str>
     let best = recent.iter().max_by_key(|c| recent.iter().filter(|x| x == c).count())?;
     let n = recent.iter().filter(|x| *x == best).count();
     (n * 2 > recent.len()).then_some(best.as_str())
+}
+
+/// Whether a preview says enough to be worth a translation call.
+///
+/// Length of audio is not a proxy for this: a two-second chunk of someone
+/// drawing breath transcribes to a single syllable, and translating it spends
+/// a call to put a word on screen that the real sentence overwrites a moment
+/// later.
+fn is_worth_previewing(text: &str) -> bool {
+    text.chars().filter(|c| c.is_alphabetic()).count() >= PREVIEW_MIN_CHARS
 }
 
 /// Queue one translation request, dropping it if the worker is behind.
@@ -755,6 +788,29 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_interjection_is_not_worth_previewing() {
+        // Measured: 2.0 s of audio transcribed to this, was translated as
+        // "啊……", and was replaced one second later by the real sentence.
+        assert!(!is_worth_previewing("\u{c544}..."));
+        assert!(!is_worth_previewing("\u{c5b4}"));
+        assert!(!is_worth_previewing("..."));
+        assert!(!is_worth_previewing(""));
+    }
+
+    #[test]
+    fn a_real_clause_is_worth_previewing() {
+        // From the same session — the partial that produced a useful preview.
+        assert!(is_worth_previewing("\u{b9d0}\u{c740} \u{b2f9}\u{d588}..."));
+        assert!(is_worth_previewing("that works"));
+    }
+
+    #[test]
+    fn punctuation_does_not_count_towards_the_minimum() {
+        // Three letters dressed up with padding is still three letters.
+        assert!(!is_worth_previewing("\u{c544}\u{c544}\u{c544}!!!???\"\"\""));
+    }
+
     fn window(langs: &[&str]) -> std::collections::VecDeque<String> {
         langs.iter().map(|s| s.to_string()).collect()
     }

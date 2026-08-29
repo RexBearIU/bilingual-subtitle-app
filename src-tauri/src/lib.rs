@@ -86,6 +86,15 @@ pub fn run() {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
+                        // The default is a small file with KeepOne, which
+                        // TRUNCATES on overflow — a minute of captioning at
+                        // debug level overruns it, and every investigation
+                        // starts by finding only the last few seconds. Big
+                        // enough for a long session, and keep the previous
+                        // file so a restart does not erase what was just
+                        // reproduced.
+                        .max_file_size(5_000_000)
+                        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                         // Our own code: full debug
                         .level(log::LevelFilter::Debug)
                         // External crates: warn-only (suppress ureq/wasapi spam)
