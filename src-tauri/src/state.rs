@@ -1,10 +1,11 @@
 //! Application state, shared across commands via `tauri::State<Mutex<AppState>>`.
 
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize}};
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::types::{AudioProcess, EngineStatus, SourceHint, SubtitleMode};
+use crate::translate::ProviderInfo;
+use crate::types::{AudioProcess, ClickThrough, EngineStatus, SourceHint, SubtitleMode};
 
 /// Lock AppState, apply `f`, then broadcast the resulting `engine_status`.
 /// No-op if the state is unavailable or the lock is poisoned.
@@ -24,12 +25,30 @@ pub fn read_state<T>(app: &AppHandle, f: impl FnOnce(&AppState) -> T) -> Option<
         .and_then(|st| st.lock().ok().map(|s| f(&s)))
 }
 
+/// One clickable rectangle, in CSS pixels relative to the window client area.
+/// Converted to physical screen coordinates by the hit-test thread, which is
+/// the only place that knows the window's position and DPI scale.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct HitRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub mode: SubtitleMode,
     pub source_hint: SourceHint,
     pub font_size: u32,
-    pub click_through: bool,
+    pub click_through: ClickThrough,
+    /// Whether the mouse is being passed through right now. Owned by the
+    /// hit-test thread; in `Auto` it flips as the cursor crosses a region.
+    pub click_through_active: bool,
+    /// Rectangles the frontend wants to keep clickable, in CSS pixels relative
+    /// to the window's client area. Empty means "nothing is interactive", which
+    /// in `Auto` makes the whole window transparent to the mouse.
+    pub hit_regions: Vec<HitRect>,
     pub always_on_top: bool,
     pub captioning: bool,
     /// Latest RMS from the capture thread (updated ~every 200 ms).
@@ -43,15 +62,18 @@ pub struct AppState {
     /// Subtitle background opacity (0.0–1.0).  Sent in EngineStatus so the
     /// frontend can apply it as a CSS custom property.
     pub subtitle_opacity: f64,
-    /// GPU layers for llama-server (0 = CPU, 36 = full GPU).
-    pub llama_gpu_layers: u32,
+    /// Translation providers in preference order, published by the pipeline
+    /// after `RemoteConfig::resolve`. Key-free by construction.
+    pub translate_providers: Vec<ProviderInfo>,
+    /// Index into `translate_providers` the worker is using.
+    ///
+    /// Shared with the translate worker rather than copied, so a switch from
+    /// the UI takes effect on the next subtitle instead of the next restart —
+    /// and so a failover the worker performs is visible to the UI.
+    pub translate_active: Arc<AtomicUsize>,
     /// VAD speech threshold override. 0 = adaptive auto-mode (recommended).
     /// > 0 = fixed RMS threshold (manual override).
     pub speech_threshold: f32,
-    /// Music mode: bypass VAD, use fixed 10 s chunks + song-lyrics prompt.
-    pub music_mode: bool,
-    /// Shared with the VAD worker so toggling takes effect immediately.
-    pub music_mode_flag: Arc<AtomicBool>,
     /// The process currently being captured (None = system-wide loopback).
     /// Changing this requires stopping and restarting the pipeline.
     pub capture_target: Option<AudioProcess>,
@@ -71,7 +93,9 @@ impl Default for AppState {
             mode: SubtitleMode::default(),
             source_hint: SourceHint::default(),
             font_size: 28,
-            click_through: false,
+            click_through: ClickThrough::default(),
+            click_through_active: false,
+            hit_regions: Vec::new(),
             always_on_top: true,
             captioning: false,
             rms: 0.0,
@@ -79,10 +103,9 @@ impl Default for AppState {
             asr_status: "unloaded".into(),
             translation_status: "unloaded".into(),
             subtitle_opacity: 0.55,
-            llama_gpu_layers: 36,
+            translate_providers: Vec::new(),
+            translate_active: Arc::new(AtomicUsize::new(0)),
             speech_threshold: 0.0, // 0 = adaptive auto-mode
-            music_mode: false,
-            music_mode_flag: Arc::new(AtomicBool::new(false)),
             capture_target: None,
             asr_backend: "whisper".into(),
             loopback_error: None,
@@ -103,20 +126,6 @@ impl Drop for AsrProc {
         if let Some(mut c) = self.0.take() {
             let _ = c.kill();
             log::info!("AsrProc: asr-srv killed on exit");
-        }
-    }
-}
-
-/// Wrapper around the llama-server child process.
-/// Stored as separate managed state so `AppState` stays `Debug`-derivable.
-/// Same keep-alive policy as `AsrProc`.
-pub struct LlamaProc(pub Option<std::process::Child>);
-
-impl Drop for LlamaProc {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
-            let _ = c.kill();
-            log::info!("LlamaProc: server killed on exit");
         }
     }
 }

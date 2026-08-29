@@ -1,0 +1,86 @@
+name: CI
+
+# Windows-only by design: WASAPI loopback and the overlay window are native
+# Windows APIs (ADR-0002 / ADR-0003), so the crate does not build elsewhere.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug symbols cost build time and cache space; CI never debugs a binary.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check frontend
+        run: npm run check
+
+      # Must run before any cargo step: tauri.conf.json points frontendDist at
+      # ../dist, and tauri-build fails its config validation if that is missing.
+      - name: Build frontend
+        run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+  # Guards the one mistake that is expensive to undo: a key reaching a public
+  # repo. Runs standalone so it reports even when the build job fails.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tracked files for credentials
+        shell: bash
+        run: |
+          # .env.example ships the variable names with empty values, so a match
+          # there would mean someone pasted a real key into the template.
+          if git grep -nEI 'sk-or-v1-[A-Za-z0-9]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}' -- . ; then
+            echo "::error::a credential-shaped string is committed — rotate the key, then remove it from history"
+            exit 1
+          fi
+          echo "no credentials found in tracked files"
+
+      - name: Ensure .env is ignored
+        shell: bash
+        run: |
+          if ! git check-ignore -q .env; then
+            echo "::error::.env is not gitignored"
+            exit 1
+          fi
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked by git"
+            exit 1
+          fi
+          echo ".env is ignored and untracked"

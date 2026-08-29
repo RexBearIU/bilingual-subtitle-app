@@ -13,8 +13,11 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `stop_captioning` | — | `Result<()>` | Stops pipeline; sidecars stay resident (models stay loaded) |
 | `set_subtitle_mode` | `{ mode: SubtitleMode }` | `Result<()>` | Hot-swappable while running |
 | `set_source_hint` | `{ hint: SourceHint }` | `Result<()>` | Language hint passed to Whisper per chunk |
-| `set_music_mode` | `{ enabled: bool }` | `Result<()>` | Switches chunker to 10 s chunks + "Song lyrics:" prompt + beam_size=3 |
-| `set_click_through` | `{ enabled: bool }` | `Result<()>` | Toggles window mouse pass-through. **Escape hatch:** `Ctrl+Alt+P` hotkey always forces OFF + re-pins on top |
+| `set_click_through` | `{ mode: ClickThroughMode }` | `Result<()>` | Window mouse policy. **Escape hatch:** `Ctrl+Alt+P` always forces `"off"` + re-pins on top |
+| `set_hit_regions` | `{ regions: HitRect[] }` | `Result<()>` | Rectangles that stay clickable in `"auto"`. CSS px relative to the client area; replaces the previous set |
+| `set_translate_provider` | `{ index: number }` | `Result<()>` | Switch the active provider; takes effect on the next subtitle. Index into `EngineStatus.translateProviders` |
+| `set_translate_providers` | `{ providers: ProviderDraft[] }` | `Result<()>` | Replace the whole list — add, remove, edit and reorder in one call. Persisted to `settings.json` |
+| `translate_preset_names` | — | `{ name, label }[]` | Providers with a built-in base URL, model and display label, so the add form can ask only for a key |
 | `set_always_on_top` | `{ enabled: bool }` | `Result<()>` | Re-asserts topmost; re-stacks above other topmost windows |
 | `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120) |
 | `list_audio_processes` | — | `AudioProcess[]` | Windows processes with active audio sessions (for process picker) |
@@ -84,12 +87,13 @@ interface EngineStatus {
   mode: SubtitleMode;
   sourceHint: SourceHint;
   fontSize: number;
-  clickThrough: boolean;
+  clickThrough: ClickThroughMode;
+  clickThroughActive: boolean; // whether the mouse is passing through right now
   alwaysOnTop: boolean;
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
-  llamaGpuLayers: number;     // 0 = CPU, 36 = full RTX 3070
+  translateProviders: ProviderInfo[]; // preference order; index 0 is tried first
+  translateActive: number;    // index currently in use (moves on failover too)
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
-  musicMode: boolean;
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;       // "turbo" | "large" (large-v3 int8_float16)
   sensevoicePrecision: string;// "int8" | "fp32"
@@ -97,6 +101,57 @@ interface EngineStatus {
   rms?: number;               // present only while capturing
   message?: string;           // last process-loopback error (shown by ProcessPicker)
 }
+
+```ts
+/**
+ * How the overlay window treats the mouse.
+ * - `off`  — the whole window takes the mouse, empty areas included.
+ * - `auto` — passes through except over the regions from `set_hit_regions`.
+ * - `on`   — nothing is clickable; the mouse always goes behind.
+ *
+ * `auto` is the default. A transparent, decoration-less window is a solid
+ * hit target to the OS, so without it an empty overlay blocks whatever is
+ * playing underneath. CSS `pointer-events` cannot fix this — it decides
+ * which element gets an event, not whether the window receives one.
+ */
+type ClickThroughMode = "off" | "auto" | "on";
+
+/** A clickable rectangle, CSS px relative to the window client area. */
+interface HitRect { x: number; y: number; w: number; h: number }
+
+/** A configured translation endpoint. Never carries the API key. */
+interface ProviderInfo {
+  /** The identity: keys the stored API key and TRANSLATE_<NAME>_API_KEY. */
+  name: string;
+  /** Display text, already resolved: the preset's label, else `name`. */
+  label: string;
+  model: string;
+  baseUrl: string;
+  /** `env` = the key came from TRANSLATE_<NAME>_API_KEY, not from Settings. */
+  keySource: "settings" | "env";
+  /**
+   * Whether this entry can be called. Anything but `ready` is still listed —
+   * it is shown so it can be fixed or deleted — but is skipped when
+   * translating, and never appears as `translateActive`.
+   */
+  readiness: "ready" | "missingKey" | "missingUrl" | "missingModel";
+}
+
+/**
+ * One entry as the Settings panel sends it back.
+ *
+ * `apiKey` is three-valued because the panel never receives the stored key:
+ * omit it to keep what is stored, `""` to clear it (the environment then takes
+ * over again), or a value to replace it.
+ */
+interface ProviderDraft {
+  name: string;
+  label: string;     // "" = use the built-in preset's label, else `name`
+  baseUrl: string;   // "" = use the built-in preset for this name
+  model: string;     // "" = use the built-in preset for this name
+  apiKey?: string;
+}
+```
 ```
 
 ## Types
@@ -129,9 +184,12 @@ interface PersistSettings {
   fontSize: number;
   subtitleOpacity: number;    // 0.0–1.0
   overlay: { x: number; y: number; w: number; h: number };
-  llamaGpuLayers: number;     // 0 = CPU, 36 = full GPU
+  clickThrough: ClickThroughMode;
+  /** The ordered provider list. Every `apiKey` is ALWAYS returned as "". */
+  providers: { name: string; label: string; baseUrl: string; apiKey: string; model: string }[];
+  openrouterApiKey: string;   // legacy, ALWAYS ""; migrated into `providers` on first launch
+  openrouterModel: string;    // legacy, superseded by `providers`
   speechThreshold: number;    // 0 = adaptive auto-mode (recommended)
-  musicMode: boolean;
   asrBackend: string;         // "whisper" | "sensevoice" | "zipformer-ko"
   whisperModel: string;       // "turbo" | "large"
   sensevoicePrecision: string;// "int8" | "fp32"
@@ -145,7 +203,6 @@ All fields optional — only supplied keys are updated:
 ```ts
 interface SettingsPatch {
   subtitleOpacity?: number;
-  llamaGpuLayers?: number;
   asrBackend?: string;        // kills idle asr-srv so next Start relaunches with the new backend
   whisperModel?: string;      // "turbo" | "large" — same relaunch behavior
   sensevoicePrecision?: string; // "int8" | "fp32" — same relaunch behavior
@@ -154,4 +211,4 @@ interface SettingsPatch {
 }
 ```
 
-Note: `mode`, `sourceHint`, `musicMode`, and `fontSize` have their own dedicated commands and are not part of the patch payload.
+Note: `mode`, `sourceHint`, and `fontSize` have their own dedicated commands and are not part of the patch payload.

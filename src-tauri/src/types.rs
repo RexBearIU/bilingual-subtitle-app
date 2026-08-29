@@ -3,6 +3,26 @@
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
+use crate::translate::ProviderInfo;
+
+/// How the overlay window treats the mouse.
+///
+/// Was a bool. It grew a third state because neither of the two was what the
+/// window actually wants: fully interactive means a mostly-empty transparent
+/// window swallows clicks meant for whatever is behind it, and fully
+/// click-through means the controls are unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClickThrough {
+    /// The whole window takes the mouse, empty areas included.
+    Off,
+    /// The mouse passes through except over the control bar and the settings
+    /// panel — the regions the frontend reports via `set_hit_regions`. Default.
+    #[default]
+    Auto,
+    /// Nothing in the window is clickable; the mouse always goes behind it.
+    On,
+}
 
 /// Source-language hint passed to Whisper.
 /// `Auto` lets Whisper detect per-chunk (best for multilingual streams).
@@ -113,15 +133,19 @@ pub struct EngineStatus {
     pub mode: SubtitleMode,
     pub source_hint: SourceHint,
     pub font_size: u32,
-    pub click_through: bool,
+    pub click_through: ClickThrough,
+    /// Whether the mouse is passing through *right now*. In `Auto` this flips
+    /// as the cursor moves; the UI uses it only for a live indicator.
+    pub click_through_active: bool,
     pub always_on_top: bool,
     /// Subtitle background opacity (0.0–1.0).
     pub subtitle_opacity: f64,
-    /// GPU layers for llama-server (0 = CPU, 36 = all GPU).
-    pub llama_gpu_layers: u32,
+    /// Translation providers in preference order, without their API keys.
+    pub translate_providers: Vec<ProviderInfo>,
+    /// Index into `translate_providers` the worker is currently using.
+    pub translate_active: usize,
     /// VAD speech threshold (linear RMS, 0.0–1.0).
     pub speech_threshold: f32,
-    pub music_mode: bool,
     /// Active ASR backend: "whisper" | "sensevoice".
     pub asr_backend: String,
     /// Whisper model size: "turbo" | "large".
@@ -147,11 +171,12 @@ impl EngineStatus {
             source_hint: s.source_hint,
             font_size: s.font_size,
             click_through: s.click_through,
+            click_through_active: s.click_through_active,
             always_on_top: s.always_on_top,
             subtitle_opacity: s.subtitle_opacity,
-            llama_gpu_layers: s.llama_gpu_layers,
+            translate_providers: s.translate_providers.clone(),
+            translate_active: s.translate_active.load(std::sync::atomic::Ordering::Relaxed),
             speech_threshold: s.speech_threshold,
-            music_mode: s.music_mode,
             asr_backend: s.asr_backend.clone(),
             whisper_model: s.whisper_model.clone(),
             sensevoice_precision: s.sensevoice_precision.clone(),

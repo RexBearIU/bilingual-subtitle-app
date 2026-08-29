@@ -5,41 +5,66 @@
 If you installed from the **release `.exe`**, skip the dev-build prerequisites below
 and follow these steps instead.
 
-### 1 — Install Python 3.10+
-
-Download from [python.org](https://www.python.org/downloads/) and tick
-**"Add Python to PATH"** during install.
-
-### 2 — Install faster-whisper and its dependencies
+### 1 — Install uv
 
 ```powershell
-pip install faster-whisper fastapi uvicorn python-multipart ctranslate2
+winget install astral-sh.uv
 ```
+
+uv fetches its own Python, so there is nothing else to install first.
+
+### 2 — Create the ASR sidecar environment
+
+From the repo root:
+
+```powershell
+uv sync
+```
+
+That builds `.venv` from `pyproject.toml` + `uv.lock`. The app finds this venv
+automatically — `resolve_python()` in `commands.rs` prefers it over any
+system interpreter, so you do not need to set `PYTHON_BIN`.
+
+Roughly 700 MB, most of it `nvidia-cublas-cu12`. That wheel is a hard
+dependency rather than an optional extra on purpose: `ctranslate2` ships
+`cudnn64_9.dll` but not cuBLAS, and without it faster-whisper loads on CUDA
+without complaint and then fails **every** inference with a 500.
 
 > On first launch, the Whisper large-v3-turbo model (~1.5 GB) downloads
 > automatically from HuggingFace. This takes a few minutes. The ASR status dot
 > will show **loading** until the download is complete.
 
-### 3 — Download the Qwen3-4B translation model
+> **Do not loosen the `sherpa-onnx==1.13.2` pin without testing.** 1.13.6
+> resolves without its companion `sherpa-onnx-core` wheel and then hard-crashes
+> (0xC0000005) at model load with an ONNX Runtime API-version mismatch.
+
+### 3 — Set an OpenRouter API key
+
+Translation calls a hosted model, so it needs a key from
+<https://openrouter.ai/keys>. There is no model to download.
+
+Easiest: launch the app, open **Settings ⚙️**, paste the key, press 儲存. It is
+stored in `%APPDATA%\com.bilingualsubtitle.app\settings.json`.
+
+Or put it in a gitignored `.env` at the repo root — copy the template and fill
+in the blank:
 
 ```powershell
-# ~2.4 GB — run once
-$dest = "$env:APPDATA\BilingSubs\models"
-New-Item -ItemType Directory -Force $dest | Out-Null
-Invoke-WebRequest `
-  "https://huggingface.co/bartowski/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf" `
-  -OutFile "$dest\Qwen3-4B-Q4_K_M.gguf" -UseBasicParsing
+Copy-Item .env.example .env
+notepad .env
 ```
 
-Then tell the app where the model is (run once in a terminal):
+Or set it as a real environment variable, which takes priority over both `.env`
+and the stored key:
 
 ```powershell
-[System.Environment]::SetEnvironmentVariable(
-  "LLAMA_MODEL",
-  "$env:APPDATA\BilingSubs\models\Qwen3-4B-Q4_K_M.gguf",
-  "User"
-)
+[System.Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "sk-or-v1-...", "User")
 ```
+
+Resolution order is: real environment → `.env` → `settings.json`.
+
+Without a key the app still runs — ASR works and subtitles show the source text
+only, with the translation status dot red.
 
 ### 4 — Launch
 
@@ -101,17 +126,18 @@ The ASR backend is `asr_srv.py` — a Python HTTP server that supports two backe
 | `whisper` (default) | faster-whisper (CTranslate2) | moderate | yes, via CUDA |
 | `sensevoice` | SenseVoice ONNX (sherpa-onnx) | excellent | CPU only (fast enough) |
 
-**Step 1 — Install Python 3.10+ and dependencies:**
+**Step 1 — Create the sidecar environment:**
 
 ```powershell
-python --version   # expect 3.10+
-
-# whisper backend
-pip install faster-whisper fastapi uvicorn python-multipart ctranslate2
-
-# sensevoice backend (additional)
-pip install sherpa-onnx
+uv sync
 ```
+
+One command covers every backend — `pyproject.toml` declares the whisper stack
+(faster-whisper, ctranslate2, nvidia-cublas-cu12) and the sherpa-onnx stack
+(SenseVoice, Zipformer-KO) together, and `uv.lock` pins them.
+
+`uv sync --group bench` additionally installs numpy for
+[bench/compare_backends.py](../bench/README.md).
 
 **Step 2 — Set env vars** (user-level, persists across terminals):
 
@@ -162,73 +188,60 @@ transducer (KsponSpeech). CPU real-time (~0.25 s for 25 s), full-length
 transcription, natural conversational Korean; weaker than whisper large-v3 on
 loanwords / code-switching. The model (~110 MB) auto-downloads on first Start to
 `~/.cache/bilingual-subtitle/`; set `ZIPFORMER_MODEL` to a local model directory
-to override. **Shares the sherpa-onnx runtime with SenseVoice**, so `PYTHON_BIN`
-must point at a Python with `sherpa-onnx`, `fastapi`, `uvicorn`, and
-`python-multipart` installed (the whisper backend instead needs `faster-whisper`).
+to override. **Shares the sherpa-onnx runtime with SenseVoice** — `uv sync`
+installs it, so no interpreter juggling is needed.
+
+> The sherpa backends need **both** `sherpa-onnx` and `sherpa-onnx-core` at the
+> same version. `sherpa-onnx` alone is just the Python binding; without the
+> `-core` wheel's native libraries the extension falls back to
+> `C:\Windows\System32\onnxruntime.dll` — ORT 1.17.1, shipped by Windows — and
+> hard-crashes (0xC0000005) at model load on an API-version mismatch.
+> `pyproject.toml` pins both; do not drop one.
 
 **GPU acceleration:** faster-whisper uses CTranslate2 with CUDA automatically when
 an NVIDIA GPU is present.  SenseVoice and Zipformer-KO run on CPU (ONNX) and are
 already faster than real-time, so GPU is not needed for those backends.
 
-### llama-server (translation, M5)
+### Translation via OpenRouter (M5)
 
-**No CUDA Toolkit required** — use the **Vulkan** build (self-contained, ships
-with any NVIDIA driver).
+No binaries, no model download, no GPU budget — translation is an HTTPS call.
 
-```powershell
-# Download Vulkan build (check https://github.com/ggml-org/llama.cpp/releases for latest)
-$ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest `
-  "https://github.com/ggml-org/llama.cpp/releases/download/b9542/llama-b9542-bin-win-vulkan-x64.zip" `
-  -OutFile "$env:TEMP\llama-vulkan.zip" -UseBasicParsing
-Expand-Archive "$env:TEMP\llama-vulkan.zip" -DestinationPath "$env:TEMP\llama-vulkan" -Force
-
-$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-Get-ChildItem "$env:TEMP\llama-vulkan" -Recurse |
-    Where-Object { $_.Extension -in ".exe",".dll" } |
-    ForEach-Object { Copy-Item $_.FullName "$proj\binaries\$($_.Name)" -Force }
-```
-
-Download Qwen3-4B model (~2.4 GB):
+Get a key at <https://openrouter.ai/keys>, then either paste it into
+**Settings ⚙️** in the app, or set it in the environment:
 
 ```powershell
-$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-Invoke-WebRequest `
-  "https://huggingface.co/bartowski/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf" `
-  -OutFile "$proj\models\Qwen3-4B-Q4_K_M.gguf" -UseBasicParsing
+[System.Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "sk-or-v1-...", "User")
 ```
 
-Set env vars:
+Smoke-test the key and model without launching the app:
 
 ```powershell
-$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-[System.Environment]::SetEnvironmentVariable("LLAMA_SERVER_BIN",  "$proj\binaries\llama-server.exe",    "User")
-[System.Environment]::SetEnvironmentVariable("LLAMA_MODEL",       "$proj\models\Qwen3-4B-Q4_K_M.gguf", "User")
-[System.Environment]::SetEnvironmentVariable("LLAMA_PORT",        "9002",                               "User")
-[System.Environment]::SetEnvironmentVariable("LLAMA_GPU_LAYERS",  "36",                                 "User")
+$body = @{
+  model    = "google/gemini-2.5-flash-lite"
+  messages = @(@{ role = "user"; content = "Translate to Traditional Chinese: it's a bit overcast" })
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Method Post "https://openrouter.ai/api/v1/chat/completions" `
+  -Headers @{ Authorization = "Bearer $env:OPENROUTER_API_KEY" } `
+  -ContentType "application/json" -Body $body |
+  ForEach-Object { $_.choices[0].message.content }
 ```
 
-Smoke-test:
+**Choosing a model.** Subtitles are one or two sentences and latency is what you
+feel, so a small fast model beats a large one here. Anything on
+<https://openrouter.ai/models> works — set it in Settings ⚙️ or via
+`OPENROUTER_MODEL`. Note that the app sends the previous 3 subtitle pairs as
+context on every call, so cost scales with roughly 4× the visible text.
 
-```powershell
-$proj = "C:\Users\User\.claude\projects\Bilingual Subtitle App"
-& "$proj\binaries\llama-server.exe" `
-  -m "$proj\models\Qwen3-4B-Q4_K_M.gguf" `
-  --port 9002 -ngl 36 -c 2048 --no-webui
-# In another terminal:
-# Invoke-WebRequest http://127.0.0.1:9002/health   → {"status":"ok"}
-# Then POST /v1/chat/completions with /no_think prompt
-```
+**Offline / gaming scenario.** Translation needs network access. If the call
+fails or no key is set, ASR keeps running and the overlay shows source-only
+subtitles rather than stopping.
 
-**Gaming scenario** (free VRAM for the game): set `LLAMA_GPU_LAYERS=0` to run
-translation on CPU only. Latency increases ~3× but typically stays under 1s for
-subtitle-length text.
-
-_M5 env vars:_
+_M5 env vars (all optional — Settings ⚙️ covers the common ones):_
 
 | Env var | Default in code | Description |
 |---------|-----------------|-------------|
-| `LLAMA_SERVER_BIN` | `llama-server` (PATH) | Path to llama-server.exe |
-| `LLAMA_MODEL` | `models/Qwen3-4B-Q4_K_M.gguf` | Path to Qwen3 GGUF model |
-| `LLAMA_PORT` | `9002` | HTTP port for llama-server |
-| `LLAMA_GPU_LAYERS` | `36` | GPU offload layers (0=CPU, 36=all GPU) |
+| `OPENROUTER_API_KEY` | — | API key; overrides the one in settings.json |
+| `OPENROUTER_MODEL` | `google/gemini-2.5-flash-lite` | Model slug |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Point at a proxy or an OpenAI-compatible gateway |
+| `OPENROUTER_PROVIDER_ORDER` | — | Comma-separated upstream provider preference |

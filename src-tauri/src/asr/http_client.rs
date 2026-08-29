@@ -4,7 +4,7 @@
 //! WAV, POSTs them to the ASR server's `/inference` endpoint, and emits
 //! `subtitle_update` events with the resulting transcription.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
@@ -25,16 +25,20 @@ const BOUNDARY: &str = "----AsrBoundary8f3a2e1d";
 /// Exits when `stop` is set or the sender side of `rx` is dropped.
 /// `lang_hint` is an optional ISO-639-1 code passed to the ASR server per request.
 /// `None` = auto-detect (multilingual).
+/// `cut_request` is the chunker's early-cut channel: when a partial's text
+/// reads as a finished sentence, its utterance id goes here and the chunker
+/// ends the utterance without waiting for a pause. See `chunker::start_vad_worker`.
 pub fn start_asr_worker(
     rx: std::sync::mpsc::Receiver<AudioChunk>,
     app: AppHandle,
     port: u16,
     stop: Arc<AtomicBool>,
     translate_tx: SyncSender<TranslationRequest>,
+    cut_request: Arc<AtomicU64>,
 ) {
     std::thread::Builder::new()
         .name("asr-worker".into())
-        .spawn(move || asr_loop(rx, &app, port, &stop, translate_tx))
+        .spawn(move || asr_loop(rx, &app, port, &stop, translate_tx, &cut_request))
         .expect("spawn asr-worker thread");
 }
 
@@ -46,6 +50,7 @@ fn asr_loop(
     port: u16,
     stop: &Arc<AtomicBool>,
     translate_tx: SyncSender<TranslationRequest>,
+    cut_request: &Arc<AtomicU64>,
 ) {
     let base = format!("http://127.0.0.1:{port}");
     log::info!("ASR: waiting for asr-srv at {base}");
@@ -73,6 +78,13 @@ fn asr_loop(
     // Track which utterance_id had a partial sent, so the following final chunk
     // is not incorrectly flagged as a consecutive repeat of the partial's text.
     let mut last_partial_utterance_id: Option<u64> = None;
+    // Languages of the last few ACCEPTED finals. A window with a majority
+    // vote, not simply "the language of the last final": one hallucination that
+    // gets through would otherwise become the reference, and then every correct
+    // line after it reads as the flip. Measured — a single stray `Bye.` marked
+    // the next three Korean chunks as language changes.
+    let mut recent_langs: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(LANG_WINDOW);
 
     // Backlog of chunks pulled off the channel but not yet transcribed.
     let mut pending: std::collections::VecDeque<AudioChunk> = std::collections::VecDeque::new();
@@ -126,35 +138,15 @@ fn asr_loop(
             chunk.samples.len() as f64 / SAMPLE_RATE as f64
         );
 
-        // Read live settings (source hint + music mode) for this chunk.
-        let (lang_hint, music_mode) = state::read_state(app, |s| (
-            s.source_hint.lang_code().map(str::to_string),
-            s.music_mode,
-        ))
-        .unwrap_or((None, false));
+        // Read the live source-language hint for this chunk.
+        let lang_hint = state::read_state(app, |s| s.source_hint.lang_code().map(str::to_string))
+            .unwrap_or(None);
 
-        // In music mode, prepend "Song lyrics:" so Whisper knows the context.
-        let music_prompt = if music_mode {
-            let base = "Song lyrics:";
-            Some(match last_prompt.as_deref() {
-                Some(p) if !p.is_empty() => format!("{base} {p}"),
-                _ => base.to_string(),
-            })
-        } else {
-            None
-        };
-        let effective_prompt = music_prompt.as_deref().or(last_prompt.as_deref());
+        let effective_prompt = last_prompt.as_deref();
 
         // Partial chunks are throw-away previews — greedy (1) is fast enough.
         // Final chunks get beam=5 for accuracy; Korean especially benefits from this.
-        // Music mode always uses beam=3 for lyric accuracy.
-        let beam_size = if music_mode {
-            Some(3u32)
-        } else if chunk.is_partial {
-            Some(1u32)
-        } else {
-            Some(5u32)
-        };
+        let beam_size = if chunk.is_partial { Some(1u32) } else { Some(5u32) };
 
         let duration_s = chunk.samples.len() as f64 / SAMPLE_RATE as f64;
         log::info!(
@@ -192,6 +184,39 @@ fn asr_loop(
                         chunk.utterance_id,
                     );
                     continue;
+                }
+
+                // Tertiary filter: a short chunk in a different language.
+                //
+                // This is the one the no_speech filter above cannot catch.
+                // Measured on Korean audio: the same 1.2 s chunk scores
+                // no_speech=0.90 on its own but 0.00 once an initial_prompt is
+                // attached — the prompt convinces the model that speech
+                // continues here. A rolling prompt is attached to almost every
+                // request, so in practice the 0.7 gate is far weaker than it
+                // looks, and short hallucinations sail past it.
+                //
+                // What stays reliable is that Whisper invents when there is too
+                // little audio to anchor it, and what it invents tends to be in
+                // another language. On the sample that produced this rule, the
+                // pair caught 4 of 4 hallucinations (`you`, `Bye.`, `yeah`,
+                // `¡Bienvenidos a la secundita!`) with no false positive across
+                // 52 requests.
+                //
+                // Length rather than a stock-phrase blocklist on purpose: the
+                // Spanish one is in no such list, and real code-switching worth
+                // showing — a whole sentence in another language — runs longer
+                // than this.
+                let chunk_secs = chunk.samples.len() as f64 / crate::pipeline::chunker::SAMPLE_RATE as f64;
+                if let Some(est) = established_lang(&recent_langs) {
+                    if lang != est && chunk_secs <= SHORT_FLIP_SECS {
+                        log::info!(
+                            "ASR [u{}]: {chunk_secs:.1}s of {lang:?} inside {est:?} — \
+                             hallucination suppressed ({infer_ms}ms): {text:?}",
+                            chunk.utterance_id,
+                        );
+                        continue;
+                    }
                 }
 
                 // Consecutive-repeat detection (initial_prompt feedback loop).
@@ -246,6 +271,28 @@ fn asr_loop(
                 //    skips the consecutive-repeat check, then skip translation.
                 if chunk.is_partial {
                     last_partial_utterance_id = Some(chunk.utterance_id);
+                    // 2b. If the preview already reads as a finished sentence,
+                    //     tell the chunker to end the utterance now. Waiting for
+                    //     a pause that may not come, or for the 6 s cap, is the
+                    //     single largest component of on-screen latency.
+                    //
+                    //     Not on a partial that changed language, though. Whisper
+                    //     hallucinates short English politeness ("Thank you.",
+                    //     "Yeah.") on a second of non-English audio, and those
+                    //     land as complete sentences. Measured on Korean audio,
+                    //     the language flip separated every bad trigger from
+                    //     every good one, and the cost of being wrong here is a
+                    //     subtitle cut mid-sentence.
+                    let established = established_lang(&recent_langs);
+                    if established.is_some_and(|l| l != lang) {
+                        log::debug!(
+                            "ASR u{subtitle_id}: partial lang {lang:?} != {established:?} \
+                             — no early cut",
+                        );
+                    } else if looks_complete(&text) {
+                        cut_request.store(chunk.utterance_id, Ordering::Relaxed);
+                        log::debug!("ASR u{subtitle_id}: sentence boundary — early cut requested");
+                    }
                     log::debug!("ASR u{subtitle_id}: partial — translation skipped");
                     continue;
                 }
@@ -253,6 +300,10 @@ fn asr_loop(
                 if is_completing_partial {
                     last_partial_utterance_id = None;
                 }
+                if recent_langs.len() == LANG_WINDOW {
+                    recent_langs.pop_front();
+                }
+                recent_langs.push_back(lang.clone());
 
                 let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
 
@@ -280,6 +331,35 @@ fn asr_loop(
 
     set_asr_status(app, "unloaded");
     log::info!("ASR worker exited");
+}
+
+/// Does this transcript read as a finished sentence?
+///
+/// Used on partials to end an utterance early, so a subtitle appears when the
+/// speaker finishes a sentence rather than when they eventually pause or the
+/// 6 s cap fires. Being too permissive here costs a split subtitle; being too
+/// strict just leaves the old timing in place. So it is deliberately narrow:
+///
+/// - Whisper writes `...` / `\u{2026}` when a speaker trails off mid-thought,
+///   which is the opposite of a boundary.
+/// - A period straight after a digit is usually a decimal or a numbered list
+///   item ("2024." / "1."), not the end of anything.
+/// - Closing quotes and brackets sit outside the terminal mark, so they are
+///   stripped before the last character is inspected.
+fn looks_complete(text: &str) -> bool {
+    let t = text.trim_end_matches(|c: char| {
+        c.is_whitespace() || "\"'\u{201d}\u{2019}\u{300d}\u{300f}\u{ff09})]".contains(c)
+    });
+    if t.ends_with("...") || t.ends_with('\u{2026}') {
+        return false;
+    }
+    let Some(last) = t.chars().last() else {
+        return false;
+    };
+    if !".!?\u{3002}\u{ff01}\u{ff1f}".contains(last) {
+        return false;
+    }
+    !(last == '.' && t.chars().nth_back(1).is_some_and(|c| c.is_ascii_digit()))
 }
 
 /// Send a chunk to asr-srv and return `(text, lang, no_speech_prob)`.
@@ -400,7 +480,7 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
         body.extend_from_slice(lh.as_bytes());
     }
 
-    // Part 5 (optional): beam_size override (music mode uses 3 for better accuracy)
+    // Part 5 (optional): beam_size override
     if let Some(bs) = beam_size {
         let b = format!(
             "\r\n--{BOUNDARY}\r\n\
@@ -413,6 +493,26 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
     // Closing boundary
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     body
+}
+
+/// How many recent accepted finals decide "the language being spoken".
+const LANG_WINDOW: usize = 5;
+
+/// A chunk no longer than this, in a different language, is a hallucination.
+///
+/// Every measured false transcription sat at or below 1.2 s. Two seconds keeps
+/// margin without reaching the length a real switch of language needs.
+const SHORT_FLIP_SECS: f64 = 2.0;
+
+/// The language currently being spoken, or `None` while that is unclear.
+///
+/// A strict majority of the window, so one outlier cannot move the reference
+/// and a genuine change of language takes a few finals to take effect — which
+/// is the right way round: the reference exists to judge single odd chunks.
+fn established_lang(recent: &std::collections::VecDeque<String>) -> Option<&str> {
+    let best = recent.iter().max_by_key(|c| recent.iter().filter(|x| x == c).count())?;
+    let n = recent.iter().filter(|x| *x == best).count();
+    (n * 2 > recent.len()).then_some(best.as_str())
 }
 
 /// Return `true` if `text` looks like a Whisper hallucination that should be
@@ -591,7 +691,77 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    fn window(langs: &[&str]) -> std::collections::VecDeque<String> {
+        langs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn established_lang_needs_a_strict_majority() {
+        assert_eq!(established_lang(&window(&["ko", "ko", "ko"])), Some("ko"));
+        // Two of four is not a majority: with the window split, there is no
+        // reference, so nothing gets judged a flip.
+        assert_eq!(established_lang(&window(&["ko", "ko", "en", "en"])), None);
+        assert_eq!(established_lang(&window(&[])), None);
+    }
+
+    #[test]
+    fn one_stray_language_cannot_become_the_reference() {
+        // The measured cascade: a single hallucinated `Bye.` used to make `en`
+        // the reference and marked every following Korean line as the flip.
+        assert_eq!(established_lang(&window(&["ko", "ko", "en", "ko", "ko"])), Some("ko"));
+    }
+
+    #[test]
+    fn a_real_change_of_language_eventually_takes_over() {
+        assert_eq!(established_lang(&window(&["ko", "en", "en", "en"])), Some("en"));
+    }
+
+    #[test]
+    fn short_flip_threshold_covers_every_measured_hallucination() {
+        // Durations of the four false transcriptions measured on the Korean
+        // sample: `you`, `Bye.`, `yeah`, and the Spanish one.
+        for secs in [1.00, 1.20, 1.00, 1.00] {
+            assert!(secs <= SHORT_FLIP_SECS, "{secs}s should be suppressed");
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn looks_complete_accepts_terminal_punctuation() {
+        assert!(looks_complete("Thank you."));
+        assert!(looks_complete("20 something?"));
+        assert!(looks_complete("\u{c815}\u{b9d0} \u{c7ac}\u{bc0c}\u{b124}\u{c694}!"));
+        assert!(looks_complete("\u{4eca}\u{5929}\u{771f}\u{7684}\u{5f88}\u{597d}\u{73a9}\u{3002}"));
+        // Closing quotes and brackets sit outside the terminal mark.
+        assert!(looks_complete("he said \"go home.\""));
+        assert!(looks_complete("\u{305d}\u{3046}\u{3067}\u{3059}\u{ff1f}"));
+    }
+
+    #[test]
+    fn looks_complete_rejects_mid_utterance_text() {
+        assert!(!looks_complete("and then we"));
+        assert!(!looks_complete(""));
+        assert!(!looks_complete("   "));
+        // A comma is a clause break, not a sentence end.
+        assert!(!looks_complete("first of all,"));
+    }
+
+    #[test]
+    fn looks_complete_rejects_trailing_off() {
+        // Whisper writes these when the speaker has NOT finished.
+        assert!(!looks_complete("I mean..."));
+        assert!(!looks_complete("I mean\u{2026}"));
+    }
+
+    #[test]
+    fn looks_complete_rejects_a_period_after_a_digit() {
+        // Decimals and numbered list items, not sentence ends.
+        assert!(!looks_complete("it costs 3."));
+        assert!(!looks_complete("2024."));
+        // A digit elsewhere in the sentence is fine.
+        assert!(looks_complete("there were 3 of them."));
+    }
 
     #[test]
     fn normalize_lang_maps_names_codes_and_unknowns() {

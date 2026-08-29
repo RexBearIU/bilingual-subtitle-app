@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{SourceHint, SubtitleMode};
+use crate::types::{ClickThrough, SourceHint, SubtitleMode};
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -26,6 +26,33 @@ impl Default for OverlayRect {
     }
 }
 
+/// A translation endpoint the user added from the Settings panel.
+///
+/// Deliberately a settings type and not a state type: it carries the API key,
+/// and `AppState` derives `Debug` and is logged on every change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProvider {
+    /// The identity: keys the stored API key, `TRANSLATE_<NAME>_API_KEY` and
+    /// the removal. Unique within the list. Not what the UI shows — see
+    /// `label`, which exists so a cosmetic rename cannot orphan a key.
+    pub name: String,
+    /// What the UI shows. Empty = the built-in preset's label, else `name`.
+    #[serde(default)]
+    pub label: String,
+    /// OpenAI-compatible root, e.g. `https://api.groq.com/openai/v1`.
+    /// Empty means "use the built-in preset for this name".
+    #[serde(default)]
+    pub base_url: String,
+    /// Stored in plaintext next to the other settings; never sent to the
+    /// webview, never logged.
+    #[serde(default)]
+    pub api_key: String,
+    /// Empty means "use the built-in preset's model for this name".
+    #[serde(default)]
+    pub model: String,
+}
+
 /// All user-configurable settings that survive app restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -42,16 +69,31 @@ pub struct PersistSettings {
     pub subtitle_opacity: f64,
     /// Overlay window geometry (physical pixels).
     pub overlay: OverlayRect,
-    /// GPU offload layers for llama-server (0 = CPU only, 36 = full RTX 3070).
-    /// Overrides the `LLAMA_GPU_LAYERS` env var when set via the UI.
-    pub llama_gpu_layers: u32,
+    /// Translation endpoints added from the Settings panel, in preference
+    /// order. Appended after anything `TRANSLATE_PROVIDERS` supplies, so
+    /// adding one from the UI always takes effect rather than being silently
+    /// outranked by the environment.
+    #[serde(default)]
+    pub providers: Vec<SavedProvider>,
+    /// How the window treats the mouse: "off" | "auto" | "on".
+    #[serde(default)]
+    pub click_through: ClickThrough,
+    /// OpenRouter API key.  Empty = fall back to the `OPENROUTER_API_KEY`
+    /// environment variable; translation is disabled if neither is set.
+    ///
+    /// Stored in plaintext in the app data dir, same as any other setting —
+    /// treat it as a scoped key and revoke it at openrouter.ai if the machine
+    /// is shared.
+    #[serde(default)]
+    pub openrouter_api_key: String,
+    /// OpenRouter model slug (e.g. `google/gemini-2.5-flash-lite`).
+    /// Empty = use the built-in default.
+    #[serde(default)]
+    pub openrouter_model: String,
     /// VAD speech threshold override.
     /// `0.0` (default) = fully automatic (adaptive noise-floor EMA).
     /// Set to a linear RMS value (e.g. 0.032 = −30 dBFS) to hard-override.
     pub speech_threshold: f32,
-    /// Music mode persisted across restarts.
-    #[serde(default)]
-    pub music_mode: bool,
     /// ASR backend: "whisper" (default) | "sensevoice".
     #[serde(default = "default_asr_backend")]
     pub asr_backend: String,
@@ -75,9 +117,11 @@ impl Default for PersistSettings {
             font_size: 28,
             subtitle_opacity: 0.55,
             overlay: OverlayRect::default(),
-            llama_gpu_layers: 36,
+            providers: Vec::new(),
+            click_through: ClickThrough::default(),
+            openrouter_api_key: String::new(),
+            openrouter_model: String::new(),
             speech_threshold: 0.0,
-            music_mode: false,
             asr_backend: default_asr_backend(),
             whisper_model: default_whisper_model(),
             sensevoice_precision: default_sv_precision(),

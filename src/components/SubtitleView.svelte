@@ -20,9 +20,9 @@
   }
 </script>
 
-<div class="subtitle-stack" style:font-size="{fontSize}px" data-tauri-drag-region>
+<div class="subtitle-stack" style:font-size="{fontSize}px">
   {#if segments.length === 0}
-    <div class="placeholder" data-tauri-drag-region>
+    <div class="placeholder">
       字幕待命中 · waiting for audio
     </div>
   {:else}
@@ -31,14 +31,14 @@
       <div
         class="segment"
         class:partial={!seg.isFinal}
-        data-tauri-drag-region
+       
       >
         {#each lines as line (line.lang)}
           <div
             class="line"
             class:primary={line.primary}
             class:secondary={!line.primary}
-            data-tauri-drag-region
+           
           >
             {line.text}
           </div>

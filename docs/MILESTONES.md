@@ -115,7 +115,7 @@ HTTP (no tokio conflict).
 **To activate:** `pip install faster-whisper fastapi uvicorn sherpa-onnx` and
 set env vars — see `docs/SETUP.md`.
 
-## M5 — Translation (Qwen)  ✅
+## M5 — Translation  ✅
 
 `llama-server` sidecar. Models: Qwen2.5-1.5B-Instruct Q4_K_M; upgrade to Qwen3-4B
 if quality insufficient. Output subtitle text only · Traditional Chinese · natural
@@ -135,6 +135,13 @@ strips any residual `<think>…</think>` blocks. `state.rs` adds `translation_st
 (`is_final=false`), then enqueues a `TranslationRequest`; translation worker emits
 updated event with same `id` and `zh` slot filled (`is_final=true`). Pipeline:
 WASAPI → VAD → ASR → [translate channel] → Translation → `subtitle_update`.
+
+> **Superseded by [ADR-0011](DECISIONS.md) (2026-08-27).** The local
+> `llama-server` sidecar is gone — translation now calls OpenRouter over HTTPS.
+> `translate/llama_server.rs` → `translate/openrouter.rs`; `LlamaProc`,
+> `launch_llama_server`, the `LLAMA_*` env vars and `llama_gpu_layers` are all
+> removed. The channel boundary, prompt design, rolling 3-pair context, and the
+> source-first-then-translation emit sequence described above are unchanged.
 
 ## M6 — Subtitle state manager  ✅
 
@@ -164,13 +171,14 @@ JSON file stored at `{AppData}/com.bilingualsubtitle.app/settings.json` (no
 plugin dependency, uses `serde_json` + `std::fs`). `SettingsPath` managed state
 holds the resolved path.  `setup` in `lib.rs` loads settings at launch, applies
 window position/size via `set_position`/`set_size`, syncs AppState
-(mode/font_size/subtitle_opacity/llama_gpu_layers). Commands: `get_settings`
+(mode/font_size/subtitle_opacity/openrouter_model). Commands: `get_settings`
 (returns current settings) and `update_settings(patch)` (partial update →
 AppState + file). `set_font_size` / `set_subtitle_mode` call `save_current_settings`
 after updating.  Frontend: `App.svelte` listens to `window.onMoved` /
 `window.onResized` (400ms debounce) → `updateSettings({overlay})`.  ControlBar
-adds opacity slider (◐ icon) and GPU/CPU toggle button (persists
-`llama_gpu_layers`: 36 ↔ 0). Subtitle background uses CSS `--subtitle-bg-opacity`
+adds opacity slider (◐ icon); the settings panel carries the OpenRouter key and
+model fields (the GPU/CPU toggle went away with ADR-0011 — there is no local
+model left to place). Subtitle background uses CSS `--subtitle-bg-opacity`
 custom property driven by `EngineStatus.subtitleOpacity`.
 
 ## M8 — Performance  ✅
