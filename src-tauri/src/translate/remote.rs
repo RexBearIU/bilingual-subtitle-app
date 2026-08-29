@@ -234,7 +234,7 @@ fn translate_loop(
         log::info!("TL [{}→{} {kind}]: {:?}", req.source_lang, target, req.source_text);
 
         // Source is already in the target language — nothing to translate.
-        if req.source_lang == target {
+        if is_noop_translation(&req.source_lang, target) {
             emit_translated(app, &req, req.source_text.clone());
             continue;
         }
@@ -326,6 +326,17 @@ fn translate_loop(
 
     set_tl_status(app, "unloaded");
     log::info!("translate worker exited");
+}
+
+/// Whether a request needs no translation because it is already in the target.
+///
+/// Not simply `source == target`. "zh" is one code for two scripts: whisper
+/// transcribes Mandarin in Simplified, and this app's zh mode means Traditional
+/// (`SubtitleMode::Zh.target_name()` says so). Treating zh→zh as a no-op put
+/// 简体 straight on screen under a 繁中 label — the shortcut skipped the one
+/// step that mode exists to perform.
+fn is_noop_translation(source_lang: &str, target: &str) -> bool {
+    source_lang == target && target != "zh"
 }
 
 /// Choose between the request in hand and a newer one waiting behind it.
@@ -662,6 +673,25 @@ fn set_tl_status(app: &AppHandle, status: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_language_needs_no_translation() {
+        assert!(is_noop_translation("ko", "ko"));
+        assert!(is_noop_translation("en", "en"));
+    }
+
+    #[test]
+    fn chinese_to_chinese_is_a_script_conversion_not_a_no_op() {
+        // The reported bug: 繁中 → 繁中 displayed Simplified, because whisper
+        // returns "zh" for either script and the shortcut took it as identical.
+        assert!(!is_noop_translation("zh", "zh"));
+    }
+
+    #[test]
+    fn different_languages_always_translate() {
+        assert!(!is_noop_translation("ko", "zh"));
+        assert!(!is_noop_translation("en", "ko"));
+    }
+
     fn req(id: &str, is_partial: bool) -> TranslationRequest {
         TranslationRequest {
             id: id.into(),
