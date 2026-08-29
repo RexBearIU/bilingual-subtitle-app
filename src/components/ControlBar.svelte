@@ -51,10 +51,16 @@
   // and it can refuse the drag when the press did not start on the handle.
   async function startDrag(e: PointerEvent) {
     if (e.button !== 0) return;
-    // Only when the press landed on the container itself. `pointerdown` bubbles,
-    // so without this every button press also starts a window drag, and the OS
-    // move loop it enters swallows the click the button was waiting for.
-    if (e.target !== e.currentTarget) return;
+    // `pointerdown` bubbles, so a press on a button reaches the bar too — and
+    // if that started a drag, the OS move loop would swallow the click the
+    // button was waiting for. Refuse only presses that landed on a control.
+    //
+    // This used to demand `e.target === e.currentTarget`, an exact hit on bare
+    // container, which left so little grabbable surface that a dedicated
+    // dotted strip had to be carved out of the row for it. Excluding the
+    // controls instead makes every gap, every group's padding, and the bar's
+    // own margin draggable, which is far more area than that strip ever was.
+    if ((e.target as HTMLElement).closest("button, select")) return;
     e.preventDefault();
     try {
       await getCurrentWindow().startDragging();
@@ -148,7 +154,7 @@
 
   <!-- Drag handle. Needs to be visible and a real target: with the bar this
        full, an unmarked gap between two button groups is neither. -->
-  <div class="grip" role="separator" aria-label="拖曳移動視窗" onpointerdown={startDrag} title="拖曳移動視窗"></div>
+  <div class="spacer"></div>
 
   <!-- 右側：永遠固定在右邊 -->
   <div class="right-group" role="presentation" onpointerdown={startDrag}>
@@ -174,6 +180,9 @@
     display: flex;
     align-items: center;
     gap: 4px;
+    /* The whole bar is the drag handle now. The controls set `cursor: pointer`
+       themselves, so this shows up only over the surface that actually drags. */
+    cursor: grab;
     padding: 4px 10px;
     background: rgba(14, 18, 24, 0.94);
     border-radius: 10px;
@@ -272,14 +281,14 @@
   .dev:hover { opacity: 0.7; background: #242b34; border-color: #343d4a; }
 
   /* ── 左右群組 ───────────────────────────────── */
+  .bar:active { cursor: grabbing; }
+
   .left-group {
     display: flex;
     align-items: center;
     gap: 4px;
-    /* Shrinks when the bar is narrow, but does NOT grow: the free space has to
-       belong to `.spacer`, which is bare and therefore draggable. When this
-       group absorbed it instead, the whole middle of the bar was a dead zone
-       that looked grabbable and was not. */
+    /* Shrinks when the bar is narrow, but does NOT grow — the slack belongs to
+       `.spacer`, which keeps the settings group pinned to the right edge. */
     flex: 0 1 auto;
     min-width: 0;
   }
@@ -291,23 +300,12 @@
   }
 
   /* ── Spacer + 狀態 ───────────────────────────── */
-  /* The one stretch of bar guaranteed to be bare, and so the only thing the OS
-     can treat as a title bar. Takes all the slack, with a floor so it stays
-     grabbable once the buttons have filled the row. Dotted so it reads as a
-     handle rather than as a gap someone forgot to close. */
-  .grip {
+  /* Holds the two groups apart. Nothing is drawn in it: the whole bar drags
+     now, so it does not have to advertise itself as the one place that does. */
+  .spacer {
     flex: 1 1 auto;
-    min-width: 34px;
     align-self: stretch;
-    cursor: grab;
-    background-image: radial-gradient(circle, #4a5566 1px, transparent 1px);
-    background-size: 4px 4px;
-    background-position: center;
-    opacity: 0.5;
-    margin: 0 4px;
   }
-  .grip:hover { opacity: 1; }
-  .grip:active { cursor: grabbing; }
 
   .status {
     display: flex;
