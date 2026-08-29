@@ -1,6 +1,6 @@
 <script lang="ts">
   import * as cmd from "../lib/commands";
-  import type { ProviderDraft, ProviderInfo } from "../lib/types";
+  import type { ProviderDraft, ProviderInfo, Readiness } from "../lib/types";
 
   let { providers, activeIdx }: { providers: ProviderInfo[]; activeIdx: number } = $props();
 
@@ -12,6 +12,14 @@
   /** Key input for the row being edited or added; never pre-filled. */
   let keyDraft = $state("");
   let form = $state({ name: "", label: "", baseUrl: "", model: "" });
+
+  /** Why a row cannot be used. The backend logs its own English wording. */
+  const BROKEN: Record<Readiness, string> = {
+    ready: "",
+    missingKey: "缺金鑰",
+    missingUrl: "缺 Base URL",
+    missingModel: "缺模型",
+  };
 
   let presets = $state<{ name: string; label: string }[]>([]);
   cmd.translatePresetNames().then((n) => (presets = n)).catch(() => {});
@@ -106,10 +114,9 @@
         error = `已經有一個代號叫 ${entry.name} 的供應商`;
         return;
       }
-      if (!entry.apiKey) {
-        error = "請填 API 金鑰";
-        return;
-      }
+      // No key required. It may live in .env as TRANSLATE_<NAME>_API_KEY, and
+      // an entry that ends up without one is now shown as 缺金鑰 rather than
+      // silently dropped — so blocking the add here would only be in the way.
       next.push(entry);
     }
     await commit(next);
@@ -163,7 +170,8 @@
       {#each providers as p, i (p.name)}
         <li
           class="row"
-          class:active={i === activeIdx}
+          class:active={i === activeIdx && p.readiness === "ready"}
+          class:broken={p.readiness !== "ready"}
           class:over={dragOver === i && dragFrom !== i}
           class:dragging={dragFrom === i}
           draggable="true"
@@ -173,18 +181,26 @@
           ondragend={onDragEnd}
         >
           <span class="handle" title="拖曳調整順序">⠿</span>
+          <!-- A row that cannot be called has nothing to switch to, so the
+               same click opens the form where the missing piece is filled in. -->
           <button
             class="pick"
-            onclick={() => cmd.setTranslateProvider(i)}
-            title={`改用這一個（代號 ${p.name}）`}
+            onclick={() => (p.readiness === "ready" ? cmd.setTranslateProvider(i) : openEdit(i))}
+            title={p.readiness === "ready"
+              ? `改用這一個（代號 ${p.name}）`
+              : `${BROKEN[p.readiness]} —— 點一下補上`}
           >
             <span class="name">
               {p.label}
-              {#if p.keySource === "env"}<span class="tag" title=".env 提供金鑰">env</span>{/if}
+              {#if p.readiness !== "ready"}
+                <span class="tag bad">{BROKEN[p.readiness]}</span>
+              {:else if p.keySource === "env"}
+                <span class="tag" title=".env 提供金鑰">env</span>
+              {/if}
             </span>
-            <span class="model">{p.model}</span>
+            <span class="model">{p.model || "—"}</span>
           </button>
-          {#if i === activeIdx}<span class="badge">使用中</span>{/if}
+          {#if i === activeIdx && p.readiness === "ready"}<span class="badge">使用中</span>{/if}
           <button class="mini" onclick={() => openEdit(i)} title="編輯">✎</button>
           <button class="mini del" onclick={() => remove(i)} title="移除" disabled={busy}>✕</button>
         </li>
@@ -280,6 +296,9 @@
     padding: 3px 6px 3px 2px;
   }
   .row.active { background: #16302a; border-color: #2f6f52; }
+  /* Kept in the list rather than dropped, so it can be fixed or deleted. */
+  .row.broken { background: #1d1720; border-color: #4a3340; }
+  .row.broken .name { color: #b08a95; }
   .row.dragging { opacity: 0.4; }
   /* The drop target, marked on its top edge so the insertion point is obvious. */
   .row.over { border-top-color: #7bcfa0; box-shadow: inset 0 2px 0 #7bcfa0; }
@@ -322,6 +341,12 @@
     white-space: nowrap;
   }
   .row.active .model { color: #6f9284; }
+
+  .tag.bad {
+    color: #e09a86;
+    border-color: #6a3f38;
+    letter-spacing: 0;
+  }
 
   .tag {
     font-size: 8px;

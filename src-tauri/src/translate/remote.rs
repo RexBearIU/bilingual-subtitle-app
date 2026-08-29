@@ -80,25 +80,43 @@ fn translate_loop(
     // Snapshot the list once for the startup key check. The live list can be
     // edited from Settings at any time, so everything after this reads it fresh
     // per request instead.
-    let startup: Vec<Arc<Provider>> = match app.try_state::<translate::Registry>() {
+    let all: Vec<Arc<Provider>> = match app.try_state::<translate::Registry>() {
         Some(reg) => reg.0.lock().map(|l| l.clone()).unwrap_or_default(),
         None => Vec::new(),
     };
+    // Indices into the full list, since `active` addresses that. Entries that
+    // are not `Ready` stay in the list for the UI to show, but there is nothing
+    // to authenticate against.
+    let startup: Vec<usize> = (0..all.len())
+        .filter(|&i| all[i].readiness == translate::Readiness::Ready)
+        .collect();
     if startup.is_empty() {
-        log::error!(
-            "TL: no provider configured - add one in Settings, or set \
-             TRANSLATE_<NAME>_API_KEY / OPENROUTER_API_KEY"
-        );
+        if all.is_empty() {
+            log::error!(
+                "TL: no provider configured - add one in Settings, or set \
+                 TRANSLATE_<NAME>_API_KEY / OPENROUTER_API_KEY"
+            );
+        } else {
+            log::error!(
+                "TL: no provider is callable — {}",
+                translate::describe(&all.iter().map(|p| p.info()).collect::<Vec<_>>()),
+            );
+        }
         set_tl_status(app, "error");
         return;
     }
 
     let n = startup.len();
-    let first = active.load(Ordering::Relaxed).min(n - 1);
+    // Resume from whatever the UI last selected, rounded to the next callable
+    // entry, so a pinned provider survives a restart.
+    let first = startup
+        .iter()
+        .position(|&i| i >= active.load(Ordering::Relaxed))
+        .unwrap_or(0);
     let mut rejected = 0usize;
     for step in 0..n {
-        let i = (first + step) % n;
-        let p = &startup[i];
+        let i = startup[(first + step) % n];
+        let p = &all[i];
         match check_credentials(&agent, p) {
             Ok(()) => {
                 log::info!("TL: {} key OK", p.label);
@@ -128,6 +146,7 @@ fn translate_loop(
     }
     set_tl_status(app, "ready");
     drop(startup);
+    drop(all);
 
     /// Consecutive failures on the active provider before falling forward.
     /// Two, not one: a single 429 or blip is what the per-request retry is for.
@@ -144,6 +163,11 @@ fn translate_loop(
     const CTX_PAIRS: usize = 3;
     let mut history: std::collections::VecDeque<(String, String)> =
         std::collections::VecDeque::with_capacity(CTX_PAIRS);
+    // What the history was collected under. The prior turns are re-rendered
+    // with the CURRENT `[source→target]` tag, so carrying them across a change
+    // tells the model a Korean line was English.
+    let mut ctx_for: Option<(String, SubtitleMode)> = None;
+    let mut ctx_end_ms: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -207,6 +231,13 @@ fn translate_loop(
             continue;
         }
 
+        // Context is only useful while it is still the same conversation.
+        let now = (req.source_lang.clone(), req.mode);
+        if !context_survives(ctx_for.as_ref(), &now, req.started_at_ms.saturating_sub(ctx_end_ms)) {
+            history.clear();
+        }
+        ctx_for = Some(now);
+
         let prev: Vec<(&str, &str)> = history
             .iter()
             .map(|(s, t)| (s.as_str(), t.as_str()))
@@ -216,7 +247,7 @@ fn translate_loop(
         // active provider, or added, removed or reordered entries, since the
         // last subtitle.
         let Some((idx, provider)) = translate::pick_provider(app, active) else {
-            log::warn!("TL: provider list is empty — nothing to translate with");
+            log::warn!("TL: no callable provider — check the list in Settings");
             continue;
         };
         if idx != counting_for {
@@ -234,6 +265,7 @@ fn translate_loop(
                     history.pop_front();
                 }
                 history.push_back((req.source_text.clone(), translated.clone()));
+                ctx_end_ms = req.ended_at_ms;
                 emit_translated(app, &req, translated);
             }
             Err(e) => {
@@ -269,6 +301,24 @@ fn translate_loop(
 
     set_tl_status(app, "unloaded");
     log::info!("translate worker exited");
+}
+
+/// Whether the rolling context still applies to the request about to be sent.
+///
+/// Two ways it stops applying. A different source language or subtitle mode
+/// means the prior turns would be re-labelled with the wrong
+/// `[source→target]` tag, which is worse than no context at all: it states
+/// something false. And a long silence usually means a different scene or
+/// speaker, where stale names and topic bias the translation rather than
+/// steady it.
+fn context_survives(
+    was: Option<&(String, SubtitleMode)>,
+    now: &(String, SubtitleMode),
+    gap_ms: u64,
+) -> bool {
+    /// Silence long enough to assume the topic moved on.
+    const MAX_GAP_MS: u64 = 30_000;
+    was.is_some_and(|w| w == now) && gap_ms <= MAX_GAP_MS
 }
 
 // ── credential check ────────────────────────────────────────────────────────
@@ -569,6 +619,35 @@ fn set_tl_status(app: &AppHandle, status: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_is_kept_within_one_conversation() {
+        let k = ("ko".to_string(), SubtitleMode::Zh);
+        assert!(context_survives(Some(&k), &k, 1_000));
+    }
+
+    #[test]
+    fn context_is_dropped_when_the_language_or_mode_changes() {
+        let ko_zh = ("ko".to_string(), SubtitleMode::Zh);
+        let en_zh = ("en".to_string(), SubtitleMode::Zh);
+        let ko_en = ("ko".to_string(), SubtitleMode::En);
+        // Prior turns get re-tagged with the current pair, so keeping them
+        // across either change would label them with a language they are not.
+        assert!(!context_survives(Some(&ko_zh), &en_zh, 0));
+        assert!(!context_survives(Some(&ko_zh), &ko_en, 0));
+    }
+
+    #[test]
+    fn context_is_dropped_after_a_long_silence() {
+        let k = ("ko".to_string(), SubtitleMode::Zh);
+        assert!(context_survives(Some(&k), &k, 30_000), "at the limit");
+        assert!(!context_survives(Some(&k), &k, 30_001));
+    }
+
+    #[test]
+    fn there_is_no_context_on_the_first_subtitle() {
+        assert!(!context_survives(None, &("ko".to_string(), SubtitleMode::Zh), 0));
+    }
+
     use super::*;
 
     #[test]

@@ -111,12 +111,44 @@ pub struct Provider {
     pub provider_order: Option<Vec<String>>,
     /// Where the key came from, for the UI. Never the key itself.
     pub key_source: KeySource,
+    /// Whether this entry can actually be called. A non-`Ready` provider is
+    /// kept so the UI can show it, and skipped by `pick_provider`.
+    pub readiness: Readiness,
     /// Learned at runtime: this endpoint rejects `reasoning.enabled=false`.
     ///
     /// Google's OpenAI-compatible endpoint rejects it on EVERY call, so
     /// remembering the first rejection saves a wasted round trip per subtitle.
     /// Per-provider because it is a property of the endpoint, not the app.
     pub reasoning_unsupported: AtomicBool,
+}
+
+/// Why an entry cannot be called, or `Ready` if it can.
+///
+/// An unusable entry stays in the list rather than being dropped. Dropping it
+/// meant clearing a key made the row vanish from Settings while still sitting
+/// in `settings.json` — invisible, and so impossible to fix or delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Readiness {
+    Ready,
+    MissingKey,
+    MissingUrl,
+    MissingModel,
+}
+
+impl Readiness {
+    /// Reason for the log. Empty when ready.
+    ///
+    /// English, like every other log line here. The UI writes its own Chinese
+    /// wording from the enum rather than displaying this.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Readiness::Ready => "",
+            Readiness::MissingKey => "no API key",
+            Readiness::MissingUrl => "no base URL",
+            Readiness::MissingModel => "no model",
+        }
+    }
 }
 
 /// Where a provider's API key was found.
@@ -146,6 +178,7 @@ impl Provider {
             model: self.model.clone(),
             base_url: self.base_url.clone(),
             key_source: self.key_source,
+            readiness: self.readiness,
         }
     }
 }
@@ -164,6 +197,7 @@ pub struct ProviderInfo {
     pub model: String,
     pub base_url: String,
     pub key_source: KeySource,
+    pub readiness: Readiness,
 }
 
 /// The live, ordered provider list, shared between the Settings commands and
@@ -180,15 +214,29 @@ pub struct Registry(pub Mutex<Vec<Arc<Provider>>>);
 ///
 /// Takes the index modulo the length, because the list can be edited from the
 /// UI between one subtitle and the next and may have shrunk under a stale
-/// index. Returns `None` only when the list is empty.
+/// index. Returns `None` when nothing in the list is callable.
+///
+/// Entries that are not `Ready` are skipped rather than dropped from the list,
+/// so their row stays visible in Settings. The found index is written back to
+/// `active`, so the "in use" badge names the provider actually being called
+/// and not the unusable one that was selected.
 pub fn pick_provider(app: &AppHandle, active: &AtomicUsize) -> Option<(usize, Arc<Provider>)> {
     let reg = app.try_state::<Registry>()?;
     let list = reg.0.lock().ok()?;
     if list.is_empty() {
         return None;
     }
-    let idx = active.load(Ordering::Relaxed) % list.len();
-    Some((idx, Arc::clone(&list[idx])))
+    let start = active.load(Ordering::Relaxed) % list.len();
+    for step in 0..list.len() {
+        let i = (start + step) % list.len();
+        if list[i].readiness == Readiness::Ready {
+            if i != start {
+                active.store(i, Ordering::Relaxed);
+            }
+            return Some((i, Arc::clone(&list[i])));
+        }
+    }
+    None
 }
 
 /// Rebuild the live list from `settings.json` + the environment, then publish
@@ -217,7 +265,10 @@ pub fn describe(infos: &[ProviderInfo]) -> String {
     }
     infos
         .iter()
-        .map(|p| format!("{}({})", p.label, p.model))
+        .map(|p| match p.readiness {
+            Readiness::Ready => format!("{}({})", p.label, p.model),
+            r => format!("{}[{}]", p.label, r.reason()),
+        })
         .collect::<Vec<_>>()
         .join(" → ")
 }
@@ -256,17 +307,15 @@ fn build_all(app: &AppHandle) -> Vec<Arc<Provider>> {
         }
     }
 
-    let mut out = Vec::new();
-    let mut keyless = Vec::new();
-    for s in &saved {
-        match build_one(s) {
-            Some(p) => out.push(Arc::new(p)),
-            None => keyless.push(s.name.clone()),
-        }
-    }
+    let out: Vec<Arc<Provider>> = saved.iter().map(|s| Arc::new(build_one(s))).collect();
 
-    if !keyless.is_empty() {
-        log::warn!("TL: no API key for: {} — skipped", keyless.join(", "));
+    let broken: Vec<String> = out
+        .iter()
+        .filter(|p| p.readiness != Readiness::Ready)
+        .map(|p| format!("{} ({})", p.name, p.readiness.reason()))
+        .collect();
+    if !broken.is_empty() {
+        log::warn!("TL: not callable, shown in Settings but skipped: {}", broken.join(", "));
     }
     out
 }
@@ -300,30 +349,50 @@ fn env_prefix(name: &str) -> String {
 }
 
 /// Resolve one saved entry into a callable provider, or `None` if it has no key.
-fn build_one(s: &SavedProvider) -> Option<Provider> {
+/// Resolve one saved entry, filling blanks from the environment and the
+/// preset. Always returns a `Provider`: one that could not be completed comes
+/// back with a non-`Ready` `readiness` and empty fields, so the UI can show the
+/// row and say what is missing instead of the entry disappearing.
+fn build_one(s: &SavedProvider) -> Provider {
     let upper = env_prefix(&s.name);
     let (preset_base, preset_model) = preset(&s.name).unwrap_or(("", ""));
 
-    let (api_key, key_source) = resolve_key(s, &upper)?;
+    let key = resolve_key(s, &upper);
 
     let base_url = non_empty(s.base_url.clone())
         .or_else(|| non_empty_env(&format!("TRANSLATE_{upper}_BASE_URL")))
-        .or_else(|| non_empty(preset_base.to_string()))?;
+        .or_else(|| non_empty(preset_base.to_string()));
 
     let model = non_empty(s.model.clone())
         .or_else(|| non_empty_env(&format!("TRANSLATE_{upper}_MODEL")))
-        .or_else(|| non_empty(preset_model.to_string()))?;
+        .or_else(|| non_empty(preset_model.to_string()));
 
-    Some(Provider {
+    // URL and model first: they are what makes an entry structurally wrong,
+    // and reporting "no key" for a row that also has nowhere to send it would
+    // send the user off to fetch a key they cannot yet use.
+    let readiness = if base_url.is_none() {
+        Readiness::MissingUrl
+    } else if model.is_none() {
+        Readiness::MissingModel
+    } else if key.is_none() {
+        Readiness::MissingKey
+    } else {
+        Readiness::Ready
+    };
+
+    let (api_key, key_source) = key.unwrap_or((String::new(), KeySource::Settings));
+
+    Provider {
         name: s.name.clone(),
         label: non_empty(s.label.clone()).unwrap_or_else(|| default_label(&s.name)),
-        base_url,
+        base_url: base_url.unwrap_or_default(),
         api_key,
-        model,
+        model: model.unwrap_or_default(),
         provider_order: non_empty_env(&format!("TRANSLATE_{upper}_PROVIDER_ORDER")).map(split_csv),
         key_source,
+        readiness,
         reasoning_unsupported: AtomicBool::new(false),
-    })
+    }
 }
 
 /// The key for a saved entry: what was typed into Settings, else the
@@ -520,14 +589,14 @@ mod tests {
 
     #[test]
     fn a_preset_name_gets_the_presets_display_label() {
-        let p = build_one(&saved("groq", "", "k", "")).expect("built");
+        let p = build_one(&saved("groq", "", "k", ""));
         assert_eq!(p.label, "Groq");
         assert_eq!(p.name, "groq", "the identity is untouched by the label");
     }
 
     #[test]
     fn an_unknown_name_is_its_own_label() {
-        let p = build_one(&saved("mine", "https://x.test/v1", "k", "m")).expect("built");
+        let p = build_one(&saved("mine", "https://x.test/v1", "k", "m"));
         assert_eq!(p.label, "mine");
     }
 
@@ -536,7 +605,7 @@ mod tests {
         let mut s = saved("groq", "", "k", "");
         s.label = "  快的那個  ".into();
         // Trimmed on the way in by `set_list`; untrimmed input still resolves.
-        let p = build_one(&s).expect("built");
+        let p = build_one(&s);
         assert_eq!(p.label.trim(), "快的那個");
     }
 
@@ -561,6 +630,7 @@ mod tests {
             model: "m".into(),
             provider_order: None,
             key_source: KeySource::Settings,
+            readiness: Readiness::Ready,
             reasoning_unsupported: AtomicBool::new(false),
         };
         assert_eq!(
@@ -581,7 +651,8 @@ mod tests {
     #[test]
     fn build_one_fills_blanks_from_the_preset() {
         // A preset name needs only a key; the URL and model come from PRESETS.
-        let p = build_one(&saved("groq", "", "k", "")).expect("should build");
+        let p = build_one(&saved("groq", "", "k", ""));
+        assert_eq!(p.readiness, Readiness::Ready);
         assert_eq!(p.base_url, "https://api.groq.com/openai/v1");
         assert_eq!(p.model, "qwen/qwen3.8-27b");
         assert_eq!(p.key_source, KeySource::Settings);
@@ -589,18 +660,40 @@ mod tests {
 
     #[test]
     fn build_one_prefers_what_the_user_typed() {
-        let p = build_one(&saved("groq", "https://proxy.local/v1", "k", "my-model")).unwrap();
+        let p = build_one(&saved("groq", "https://proxy.local/v1", "k", "my-model"));
         assert_eq!(p.base_url, "https://proxy.local/v1");
         assert_eq!(p.model, "my-model");
     }
 
     #[test]
-    fn build_one_needs_a_key_and_a_url() {
-        // No key anywhere: not callable, so not in the list.
-        assert!(build_one(&saved("groq", "", "", "")).is_none());
-        // Unknown name with no base URL: nothing to call.
-        assert!(build_one(&saved("mystery", "", "k", "m")).is_none());
-        // Unknown name with no model: nothing to ask for.
-        assert!(build_one(&saved("mystery", "https://x/v1", "k", "")).is_none());
+    fn an_incomplete_entry_survives_and_says_what_is_missing() {
+        // Every one of these used to be dropped from the list, which made the
+        // row disappear from Settings while staying in settings.json.
+        // NOTE: assumes no TRANSLATE_GROQ_API_KEY / OPENROUTER_API_KEY in the
+        // test environment; `resolve_key` would otherwise find one.
+        assert_eq!(build_one(&saved("groq", "", "", "")).readiness, Readiness::MissingKey);
+        assert_eq!(
+            build_one(&saved("mystery", "", "k", "m")).readiness,
+            Readiness::MissingUrl,
+        );
+        assert_eq!(
+            build_one(&saved("mystery", "https://x/v1", "k", "")).readiness,
+            Readiness::MissingModel,
+        );
+    }
+
+    #[test]
+    fn a_missing_url_is_reported_before_a_missing_key() {
+        // Both are missing. Naming the key would send the user to fetch one
+        // they still could not use.
+        assert_eq!(build_one(&saved("mystery", "", "", "")).readiness, Readiness::MissingUrl);
+    }
+
+    #[test]
+    fn readiness_reasons_are_only_empty_when_ready() {
+        assert!(Readiness::Ready.reason().is_empty());
+        for r in [Readiness::MissingKey, Readiness::MissingUrl, Readiness::MissingModel] {
+            assert!(!r.reason().is_empty(), "{r:?}");
+        }
     }
 }

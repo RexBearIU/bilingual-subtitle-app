@@ -509,3 +509,42 @@ future corrections from reaching an old install. `snapshot()` therefore sends
 Logs use the label too. A line reading `groq failed 2x` while the row on screen
 says `Groq` is a small thing, but it is the kind of small thing that makes a
 user doubt they are looking at the same provider.
+
+## ADR-0019 — An unusable provider is shown, not dropped
+
+`build_all` used to keep only entries it could turn into a callable provider
+and log a warning about the rest. So clearing a key removed that row from
+Settings while the entry stayed in `settings.json`: invisible, and therefore
+impossible to either repair or delete. The same happened to any entry whose
+base URL or model could not be resolved.
+
+`build_one` now always returns a `Provider`, carrying a `Readiness` that says
+what is missing (`MissingUrl` / `MissingModel` / `MissingKey`, checked in that
+order — naming the key first for a row that also has nowhere to send a request
+would send the user to fetch a key they still could not use). `pick_provider`
+skips anything that is not `Ready`, and writes the index it landed on back to
+`active`, so the "in use" badge names the provider actually being called.
+
+That also removes a gap in the add form: it demanded an API key, which made a
+provider whose key lives in `.env` as `TRANSLATE_<NAME>_API_KEY` impossible to
+add through the UI. Adding without a key is now allowed, because the result is
+a visible row saying 缺金鑰 rather than one that silently never appears.
+
+The wording is duplicated on purpose: `Readiness::reason()` is English for the
+logs, and the panel writes its own Chinese from the enum. One string serving
+both would have to pick a language and be wrong somewhere.
+
+## ADR-0020 — Rolling translation context expires
+
+The worker feeds the last three (source, translation) pairs back as prior chat
+turns, which is what keeps names and topic consistent across subtitles. Those
+turns are re-rendered with the *current* `[source→target]` tag, so carrying
+them across a language or mode change labels a Korean line as English — a
+context that states something false is worse than none at all.
+
+`context_survives` drops the history on any change of source language or
+subtitle mode, and after 30 s of silence, on the grounds that a gap that long
+usually means a different scene or speaker, where stale names bias the
+translation rather than steady it. Extracted as a free function purely so the
+rule is unit-testable; the loop it serves is not.
+

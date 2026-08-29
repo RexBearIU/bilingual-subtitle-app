@@ -129,6 +129,12 @@ interface ProviderInfo {
   baseUrl: string;
   /** `env` = the key came from TRANSLATE_<NAME>_API_KEY, not from Settings. */
   keySource: "settings" | "env";
+  /**
+   * Whether this entry can be called. Anything but `ready` is still listed —
+   * it is shown so it can be fixed or deleted — but is skipped when
+   * translating, and never appears as `translateActive`.
+   */
+  readiness: "ready" | "missingKey" | "missingUrl" | "missingModel";
 }
 
 /**

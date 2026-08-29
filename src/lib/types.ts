@@ -41,6 +41,9 @@ export type ClickThroughMode = "off" | "auto" | "on";
 /** Where a provider's API key was found. */
 export type KeySource = "settings" | "env";
 
+/** Whether a provider can actually be called, and if not, why. */
+export type Readiness = "ready" | "missingKey" | "missingUrl" | "missingModel";
+
 /** A configured translation endpoint. Never carries the API key. */
 export interface ProviderInfo {
   /** The identity: keys the stored API key and TRANSLATE_<NAME>_API_KEY. */
@@ -51,6 +54,8 @@ export interface ProviderInfo {
   baseUrl: string;
   /** `env` = supplied by TRANSLATE_<NAME>_API_KEY rather than typed in Settings. */
   keySource: KeySource;
+  /** Anything but `ready` means this entry is shown but skipped when translating. */
+  readiness: Readiness;
 }
 
 /**
