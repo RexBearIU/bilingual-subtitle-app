@@ -759,6 +759,23 @@ fn is_hallucination(text: &str) -> bool {
         "thank you for watching",
         "like and subscribe",
         "please subscribe",
+        "see you in the next video",
+        // Korean. Measured on one session of Korean music: these four were the
+        // FOUR MOST FREQUENT outputs of any kind, 46 lines between them, more
+        // than any real sentence — and none of them was said. Whisper has the
+        // stock credits of Korean-subtitled YouTube memorised and reaches for
+        // them whenever singing gives it nothing else to transcribe.
+        //
+        // They were also being accepted, which put them into the rolling
+        // initial_prompt, where they primed the next chunk to produce them
+        // again. Suppressing happens before the prompt is updated, so this
+        // breaks that loop as well as hiding the line.
+        "한글자막",              // "Korean subtitles by …" — a credit, never speech
+        "한효정",                // the name the credit is memorised with
+        "다음 영상에서 만나요",   // "see you in the next video"
+        "시청해주셔서 감사합니다",
+        "시청해 주셔서 감사합니다",
+        "구독과 좋아요",         // "subscribe and like"
         // Whisper event markers that leak out of bracket detection
         "[music]",
         "[blank_audio]",
@@ -905,6 +922,33 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn korean_youtube_credits_are_hallucinations() {
+        // Verbatim from the log, including both terminal punctuations whisper
+        // alternated between.
+        for text in [
+            "한글자막 by 한효정",
+            "다음 영상에서 만나요.",
+            "다음 영상에서 만나요!",
+            "시청해주셔서 감사합니다.",
+        ] {
+            assert!(is_hallucination(text), "{text} should be suppressed");
+        }
+    }
+
+    #[test]
+    fn real_korean_speech_is_not_suppressed() {
+        // From the same session, spoken by an actual person.
+        for text in [
+            "약간 직설적인 스타일이 잘 맞는 것 같아요",
+            "사람을 사귈 때도 은근 엄청 가려요",
+            "너무 예민해요 진짜 저는",
+            "아 그럼 뭔 상관이에요",
+        ] {
+            assert!(!is_hallucination(text), "{text} should be kept");
+        }
+    }
+
     #[test]
     fn a_context_never_lengthens_the_prompt() {
         // The whole point: whisper's prompt costs time per request, so adding

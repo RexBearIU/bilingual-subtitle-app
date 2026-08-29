@@ -578,6 +578,19 @@ data that is 4 of 4 caught with no false positive.
 Length, not a stock-phrase blocklist: the Spanish line is in no such list, and
 a switch of language worth showing runs longer than two seconds.
 
+**Corroborated later, at scale.** A session of Korean music produced 46 lines
+of memorised YouTube credits — `한글자막 by 한효정`, `다음 영상에서 만나요`,
+`시청해주셔서 감사합니다` — which were the four most frequent outputs of any
+kind, more than any real sentence. Every one of them scored
+`no_speech_prob = 0.00`: the model was maximally certain there was speech while
+transcribing something nobody said. None were caught by the 0.7 gate.
+
+That session also showed the loop the gate cannot see. Each accepted credit
+entered the rolling `initial_prompt`, which told the next chunk it was in the
+outro of a video, which produced another credit at 0.00. Suppression happens
+before the prompt is updated, so a blocklist entry breaks the loop as well as
+hiding the line.
+
 "Established" is a strict majority of the last five *accepted* finals, not the
 previous final's language. The single-value version had a measured failure of
 its own — one `Bye.` that slipped through became the reference, and the next
