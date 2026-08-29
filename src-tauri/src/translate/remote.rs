@@ -49,10 +49,11 @@ pub fn start_translate_worker(
     app: AppHandle,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    transcript: Arc<translate::summarize::Transcript>,
 ) {
     std::thread::Builder::new()
         .name("translate-worker".into())
-        .spawn(move || translate_loop(rx, &app, &stop, &active))
+        .spawn(move || translate_loop(rx, &app, &stop, &active, &transcript))
         .expect("spawn translate-worker thread");
 }
 
@@ -63,6 +64,7 @@ fn translate_loop(
     app: &AppHandle,
     stop: &Arc<AtomicBool>,
     active: &Arc<AtomicUsize>,
+    transcript: &Arc<translate::summarize::Transcript>,
 ) {
     set_tl_status(app, "loading");
 
@@ -207,6 +209,14 @@ fn translate_loop(
             log::info!("TL: backlog — skipped {skipped} stale preview(s), translating newest");
         }
 
+        // Feed the summariser. Finals only — a preview is a fragment of a line
+        // that is about to arrive complete, and counting both would fill the
+        // window with half-sentences. Before the mode branches below, so the
+        // summary still builds when translation is switched off entirely.
+        if !req.is_partial && !req.source_text.trim().is_empty() {
+            transcript.push(&req.source_text);
+        }
+
         // "No translation" mode — just promote source text to final subtitle.
         if req.mode == SubtitleMode::NoTranslate {
             let mut subtitles = crate::types::SubtitleTexts::default();
@@ -270,7 +280,7 @@ fn translate_loop(
             consecutive_failures = 0;
             counting_for = idx;
         }
-        let context = state::read_state(app, |s| s.context.clone()).unwrap_or_default();
+        let context = state::read_state(app, crate::state::effective_context).unwrap_or_default();
         match call_translate(
             &agent, &provider, &req.source_lang, &req.source_text, req.mode, &prev, &context,
         ) {
@@ -553,7 +563,7 @@ fn call_translate(
 /// usually clear immediately; one fast retry recovers the subtitle without
 /// stalling the pipeline.  4xx other than 429 are permanent — fail straight
 /// through so the error reaches the log instead of being retried pointlessly.
-fn post_with_retry(
+pub(super) fn post_with_retry(
     agent: &ureq::Agent,
     provider: &Provider,
     body: &serde_json::Value,
@@ -631,7 +641,7 @@ fn post_with_retry(
 }
 
 /// Remove `<think>…</think>` blocks; take everything after the last `</think>`.
-fn strip_think_tags(s: &str) -> String {
+pub(super) fn strip_think_tags(s: &str) -> String {
     if let Some(pos) = s.rfind("</think>") {
         return s[pos + "</think>".len()..].trim().to_string();
     }

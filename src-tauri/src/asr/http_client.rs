@@ -167,7 +167,7 @@ fn asr_loop(
         // This is the half of the context that matters most: a name whisper
         // never heard right cannot be repaired downstream, however good the
         // translation prompt is.
-        let context = state::read_state(app, |s| s.context.clone()).unwrap_or_default();
+        let context = state::read_state(app, crate::state::effective_context).unwrap_or_default();
         let prompt_buf = compose_prompt(&context, last_prompt.as_deref());
         let effective_prompt = prompt_buf.as_deref();
 

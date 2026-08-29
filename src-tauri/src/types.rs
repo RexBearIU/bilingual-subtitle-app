@@ -150,6 +150,10 @@ pub struct EngineStatus {
     /// Subtitle background opacity (0.0–1.0).
     pub subtitle_opacity: f64,
     /// Translation providers in preference order, without their API keys.
+    /// Context the summariser derived from the transcript, so the panel can
+    /// show what is actually being fed to the models. Empty when a note was
+    /// typed by hand, since that one wins.
+    pub auto_context: String,
     pub translate_providers: Vec<ProviderInfo>,
     /// Index into `translate_providers` the worker is currently using.
     pub translate_active: usize,
@@ -183,6 +187,7 @@ impl EngineStatus {
             click_through_active: s.click_through_active,
             always_on_top: s.always_on_top,
             subtitle_opacity: s.subtitle_opacity,
+            auto_context: s.auto_context.clone(),
             translate_providers: s.translate_providers.clone(),
             translate_active: s.translate_active.load(std::sync::atomic::Ordering::Relaxed),
             speech_threshold: s.speech_threshold,

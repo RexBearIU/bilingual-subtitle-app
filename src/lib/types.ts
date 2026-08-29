@@ -96,6 +96,8 @@ export interface EngineStatus {
   alwaysOnTop: boolean;
   subtitleOpacity: number;   // 0.0–1.0, controls subtitle box background alpha
   /** Configured providers in preference order; index 0 is tried first. */
+  /** What the summariser inferred from the transcript; empty if a note was typed. */
+  autoContext: string;
   translateProviders: ProviderInfo[];
   /** Index into `translateProviders` currently in use. */
   translateActive: number;

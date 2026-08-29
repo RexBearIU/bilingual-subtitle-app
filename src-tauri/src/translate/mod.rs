@@ -12,6 +12,7 @@
 //! place to keep API keys out of the settings file — see `resolve_key`.
 
 pub mod remote;
+pub mod summarize;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

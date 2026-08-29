@@ -93,6 +93,9 @@ interface EngineStatus {
   clickThroughActive: boolean; // whether the mouse is passing through right now
   alwaysOnTop: boolean;
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
+  /** What the summariser inferred from the transcript. Empty when a note
+   *  was typed by hand, which wins outright. Never persisted. */
+  autoContext: string;
   translateProviders: ProviderInfo[]; // preference order; index 0 is tried first
   translateActive: number;    // index currently in use (moves on failover too)
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
@@ -190,6 +193,8 @@ interface PersistSettings {
   overlay: { x: number; y: number; w: number; h: number };
   clickThrough: ClickThroughMode;
   /** The ordered provider list. Every `apiKey` is ALWAYS returned as "". */
+  /** What this audio is about, in the user's words. "" = derive it. */
+  context: string;
   providers: { name: string; label: string; baseUrl: string; apiKey: string; model: string }[];
   openrouterApiKey: string;   // legacy, ALWAYS ""; migrated into `providers` on first launch
   openrouterModel: string;    // legacy, superseded by `providers`

@@ -583,3 +583,38 @@ previous final's language. The single-value version had a measured failure of
 its own — one `Bye.` that slipped through became the reference, and the next
 three correct Korean lines were then read as the language flip.
 
+## ADR-0022 — The context note is derived from transcript, not audio
+
+A note describing what is playing — the show, the teams, the names — measurably
+helps both halves of the pipeline, and helps ASR most: a name whisper never
+heard right cannot be repaired downstream, however good the translation prompt
+is. But nobody types one before every stream, so an unused field would have
+been the whole feature.
+
+The obvious reading of "summarise the audio" does not work: no model in this
+pipeline takes sound. The transcript is available instead, and is the better
+input anyway — it is exactly what the two consumers of the note are working on,
+errors and all.
+
+So the first eight final lines are sent once to the same provider that does the
+translating, asking for a short paragraph of topic and recurring proper nouns.
+The answer becomes the note, rebuilt every five minutes from the most recent
+forty lines so that changing video catches up within a few subtitles.
+
+Three things this deliberately is not:
+
+- **Not on the translate worker.** That worker is serial, so a summary call
+  made there would sit in front of a subtitle. Its own thread cannot delay
+  anything.
+- **Not merged with a typed note.** A typed note wins outright. The user knows
+  what they are watching; the summariser is inferring it from imperfect
+  transcript, and two descriptions that disagree are worse guidance than
+  either alone.
+- **Not persisted.** It describes what is playing right now. Restoring last
+  night's summary would prime tonight's session wrongly, so it is cleared when
+  captioning starts.
+
+It is shown in the Settings panel under the empty field. A note that silently
+primes both models while the user cannot see it is one they cannot correct
+when it is wrong — and it is built from ASR output, so sometimes it will be.
+

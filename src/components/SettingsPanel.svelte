@@ -12,6 +12,7 @@
   let sensevoicePrecision = $derived(status?.sensevoicePrecision ?? 'int8');
   let providers   = $derived(status?.translateProviders   ?? []);
   let activeIdx   = $derived(status?.translateActive ?? 0);
+  let autoContext = $derived(status?.autoContext ?? '');
 
   // Fetched once rather than carried on EngineStatus: that is re-broadcast on
   // every RMS update, and this is a few hundred characters that almost never
@@ -93,10 +94,14 @@
         onblur={saveContext}
       ></textarea>
       <p class="ctx-hint">
-        {#if contextSaved}
-          同時餵給辨識和翻譯。人名、隊名先寫在這裡，辨識才聽得對 —— 聽錯的字翻譯救不回來。
-        {:else}
+        {#if !contextSaved}
           點一下外面就會儲存
+        {:else if context.trim()}
+          同時餵給辨識和翻譯。清空的話，開始播之後會自動從字幕內容推斷。
+        {:else if autoContext}
+          <span class="ctx-auto-tag">自動</span>{autoContext}
+        {:else}
+          留空就好 —— 開始播之後會自動聽出這是什麼、有哪些人名，再拿來校準辨識和翻譯。
         {/if}
       </p>
     </div>
@@ -198,6 +203,19 @@
   }
   .ctx-input:focus { outline: none; border-color: #3a5591; }
   .ctx-input::placeholder { color: #4e5a65; }
+  /* Marks the hint as the machine's own words rather than instructions. */
+  .ctx-auto-tag {
+    display: inline-block;
+    margin-right: 5px;
+    padding: 0 4px;
+    border: 1px solid #39434f;
+    border-radius: 3px;
+    color: #7a869a;
+    font-size: 8px;
+    letter-spacing: 0.06em;
+    vertical-align: 1px;
+  }
+
   .ctx-hint {
     margin: 4px 0 0;
     font-size: 10px;
@@ -263,8 +281,11 @@
     padding: 0 0 8px;
     /* Every tab is the same height, so switching one does not resize the panel
        under the cursor. Sized to the tallest page; shorter pages leave space at
-       the bottom rather than making the window jump. */
-    min-height: 268px;
+       the bottom rather than making the window jump.
+       Raised from 268 when the context note joined the translate tab and made
+       it the tallest — measured at 281 CSS px, so the others were snapping
+       13 px shorter on every switch. */
+    min-height: 288px;
     box-sizing: border-box;
   }
 

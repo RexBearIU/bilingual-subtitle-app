@@ -46,6 +46,11 @@ pub struct AppState {
     /// wants it on every request, and a file read in that path would put I/O
     /// between the audio and the transcription.
     pub context: String,
+    /// Context derived from the transcript by `translate::summarize`.
+    ///
+    /// Deliberately not persisted: it describes what is playing right now, and
+    /// restoring last night's summary would prime tonight's session wrongly.
+    pub auto_context: String,
     pub font_size: u32,
     pub click_through: ClickThrough,
     /// Whether the mouse is being passed through right now. Owned by the
@@ -99,6 +104,7 @@ impl Default for AppState {
             mode: SubtitleMode::default(),
             source_hint: SourceHint::default(),
             context: String::new(),
+            auto_context: String::new(),
             font_size: 28,
             click_through: ClickThrough::default(),
             click_through_active: false,
@@ -134,5 +140,49 @@ impl Drop for AsrProc {
             let _ = c.kill();
             log::info!("AsrProc: asr-srv killed on exit");
         }
+    }
+}
+
+/// The context note actually sent to ASR and translation.
+///
+/// A typed note wins outright rather than being merged with the derived one:
+/// the user knows what they are watching, the summariser is inferring it from
+/// imperfect transcript, and two descriptions that disagree are worse guidance
+/// than either alone.
+pub fn effective_context(s: &AppState) -> String {
+    if s.context.trim().is_empty() {
+        s.auto_context.clone()
+    } else {
+        s.context.clone()
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    fn with(context: &str, auto: &str) -> AppState {
+        AppState {
+            context: context.into(),
+            auto_context: auto.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_typed_note_wins_over_the_derived_one() {
+        assert_eq!(effective_context(&with("typed", "derived")), "typed");
+    }
+
+    #[test]
+    fn the_derived_note_fills_in_when_nothing_was_typed() {
+        assert_eq!(effective_context(&with("", "derived")), "derived");
+        // Whitespace is not a note.
+        assert_eq!(effective_context(&with("   ", "derived")), "derived");
+    }
+
+    #[test]
+    fn neither_set_is_no_context() {
+        assert_eq!(effective_context(&AppState::default()), "");
     }
 }

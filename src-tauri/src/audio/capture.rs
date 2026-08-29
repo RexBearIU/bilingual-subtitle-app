@@ -54,8 +54,12 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     // that utterance instead of waiting for a pause or the hard cap.
     let cut_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Clear any stale loopback error from a previous session.
-    state::update_and_emit(&app, |s| s.loopback_error = None);
+    // Clear any stale loopback error from a previous session, and last
+    // session's derived context — it described whatever was playing then.
+    state::update_and_emit(&app, |s| {
+        s.loopback_error = None;
+        s.auto_context = String::new();
+    });
 
     // A missing API key must not take the whole pipeline down: ASR still runs
     // and emits source-only subtitles, which is the same degraded mode we fall
@@ -73,7 +77,22 @@ pub fn start_loopback_capture(app: AppHandle, stop: Arc<AtomicBool>) {
     } else {
         let active = state::read_state(&app, |s| Arc::clone(&s.translate_active))
             .expect("AppState available at pipeline start");
-        translate::remote::start_translate_worker(tl_rx, app.clone(), Arc::clone(&stop), active);
+        // Shared with the summariser, which turns the first minute of subtitles
+        // into the context note that primes ASR and translation from then on.
+        let transcript = Arc::new(translate::summarize::Transcript::default());
+        translate::remote::start_translate_worker(
+            tl_rx,
+            app.clone(),
+            Arc::clone(&stop),
+            Arc::clone(&active),
+            Arc::clone(&transcript),
+        );
+        translate::summarize::start_summary_worker(
+            app.clone(),
+            Arc::clone(&stop),
+            active,
+            transcript,
+        );
     }
     asr::http_client::start_asr_worker(
         asr_rx, app.clone(), asr_port, Arc::clone(&stop), tl_tx, Arc::clone(&cut_request),
