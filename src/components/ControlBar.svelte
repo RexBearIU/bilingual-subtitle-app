@@ -3,6 +3,7 @@
   import * as cmd from "../lib/commands";
   import type { ClickThroughMode, EngineStatus, SourceHint, SubtitleMode, SubtitleUpdate } from "../lib/types";
   import ProcessPicker from "./ProcessPicker.svelte";
+  import Icon, { type IconName } from "./Icon.svelte";
 
   let { status, subsHidden = false, onToggleSubs, onSettingsOpen }: {
     status: EngineStatus | null;
@@ -31,16 +32,23 @@
   // clickable while the empty parts of the overlay stop swallowing clicks meant
   // for whatever is playing behind it.
   const CT_ORDER: ClickThroughMode[] = ["off", "auto", "on"];
-  const CT_LABEL: Record<ClickThroughMode, string> = {
-    off:  "● 互動",
-    auto: "◑ 自動",
-    on:   "⊙ 穿透",
+  const CT_ICON: Record<ClickThroughMode, IconName> = {
+    off:  "mouse-off",
+    auto: "mouse-auto",
+    on:   "mouse-on",
   };
   const CT_TITLE: Record<ClickThroughMode, string> = {
     off:  "互動：整個視窗都接滑鼠，空白處也會擋住下層。點一下切到「自動」",
     auto: "自動：只有控制列跟設定接滑鼠，字幕區域直接穿透。點一下切到「穿透」",
     on:   "穿透：整個視窗都不接滑鼠（托盤或 Ctrl+Alt+P 可解除）。點一下切到「互動」",
   };
+  // Once captioning is running the bar has done its job, so it folds down to
+  // the one control still worth reaching — stop — plus the status lights.
+  // Hovering brings the rest back, which keeps every setting reachable without
+  // leaving a full row of buttons sitting over whatever is playing behind it.
+  let hovered = $state(false);
+  let collapsed = $derived(running && !hovered);
+
   function cycleClickThrough() {
     const next = CT_ORDER[(CT_ORDER.indexOf(clickThrough) + 1) % CT_ORDER.length];
     return cmd.setClickThrough(next);
@@ -128,16 +136,33 @@
      longer takes the mouse, so it can no longer be dragged. `onpointerdown` on
      every container with bare surface, because the handler must see the press
      land on the container itself — a press on a child button is that button's. -->
-<div class="bar" role="toolbar" tabindex="-1" aria-label="字幕控制列" onpointerdown={startDrag}>
+<div
+  class="bar"
+  class:collapsed
+  role="toolbar"
+  tabindex="-1"
+  aria-label="字幕控制列"
+  onpointerdown={startDrag}
+  onmouseenter={() => (hovered = true)}
+  onmouseleave={() => (hovered = false)}
+>
 
   <!-- 左側：可縮放的控制群 -->
   <div class="left-group" role="presentation" onpointerdown={startDrag}>
 
     <!-- ① Start / Stop -->
-    <button class="run" class:on={running} onclick={toggleRun}>
-      {running ? "■ 停止" : "▶ 開始"}
+    <button
+      class="run"
+      class:on={running}
+      onclick={toggleRun}
+      title={running ? "停止" : "開始"}
+      aria-label={running ? "停止" : "開始"}
+    >
+      <Icon name={running ? "stop" : "play"} />
+      {#if !collapsed}<span class="run-label">{running ? "停止" : "開始"}</span>{/if}
     </button>
 
+    {#if !collapsed}
     <div class="sep"></div>
 
     <!-- ② 語言：接收 → 翻譯 -->
@@ -169,37 +194,45 @@
     <!-- ④ 視窗控制 -->
     <button class="icon-btn" class:active={alwaysOnTop}
       onclick={() => cmd.setAlwaysOnTop(!alwaysOnTop)}
+      aria-label="視窗置頂"
       title={alwaysOnTop ? "置頂：開（再按關閉）" : "置頂：關"}>
-      📌
+      <Icon name="pin" />
     </button>
 
     <button
-      class="txt-btn passthru ct-{clickThrough}"
+      class="icon-btn passthru ct-{clickThrough}"
       onclick={cycleClickThrough}
+      aria-label="滑鼠穿透模式"
       title={CT_TITLE[clickThrough]}
-    >{CT_LABEL[clickThrough]}</button>
+    ><Icon name={CT_ICON[clickThrough]} /></button>
 
     <button
-      class="txt-btn"
+      class="icon-btn"
       class:dim={subsHidden}
       onclick={() => onToggleSubs()}
+      aria-label="顯示或隱藏字幕"
       title={subsHidden ? "字幕已隱藏（點擊顯示）" : "隱藏字幕"}>
-      字幕
+      <Icon name="captions" />
     </button>
+    {/if}
 
   </div>
 
-  <!-- Drag handle. Needs to be visible and a real target: with the bar this
-       full, an unmarked gap between two button groups is neither. -->
   <div class="spacer"></div>
 
   <!-- 右側：永遠固定在右邊 -->
   <div class="right-group" role="presentation" onpointerdown={startDrag}>
+    {#if !collapsed}
     <div class="sep"></div>
 
     <!-- ⑤ 設定 / Dev -->
-    <button class="icon-btn" onclick={() => onSettingsOpen()} title="設定">⚙️</button>
-    <button class="dev" onclick={injectSample} title="注入測試字幕 (dev)">✦</button>
+    <button class="icon-btn" onclick={() => onSettingsOpen()} aria-label="設定" title="設定">
+      <Icon name="gear" />
+    </button>
+    <button class="dev" onclick={injectSample} aria-label="注入測試字幕" title="注入測試字幕 (dev)">
+      <Icon name="spark" size={12} />
+    </button>
+    {/if}
 
     <!-- ⑥ 狀態指示 -->
     <div class="status" title="音訊 · 語音 · 翻譯">
@@ -228,6 +261,7 @@
     user-select: none;
     width: 100%;
     box-sizing: border-box;
+    transition: width 0.12s ease;
     height: 36px;
   }
 
@@ -259,14 +293,30 @@
   button:hover { background: #2e3740; border-color: #444f5e; }
 
   /* 圖示按鈕（正方形） */
-  .icon-btn { width: 28px; padding: 0; font-size: 14px; }
+  .icon-btn {
+    width: 28px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
   .icon-btn.active { background: #223040; border-color: #2f6fed; }
 
   /* 文字按鈕（有 padding） */
   .txt-btn { padding: 0 9px; }
 
   /* ── Start / Stop ────────────────────────────── */
-  .run { padding: 0 14px; font-weight: 700; font-size: 12px; letter-spacing: 0.3px; }
+  .run {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 12px;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.3px;
+  }
+  /* Collapsed: the icon alone, square like the other icon buttons. */
+  .bar.collapsed .run { padding: 0; width: 28px; justify-content: center; }
   .run.on { background: #6e1e2a; border-color: #903040; color: #ffd0d0; }
   .run:hover { background: #2e3740; }
   .run.on:hover { background: #7e2233; }
@@ -299,13 +349,12 @@
   .lang-arrow { font-size: 11px; color: #4a5566; flex-shrink: 0; }
 
   /* ── 置頂 ────────────────────────────────────── */
-  .icon-btn.active[title*="置頂"] {
+  .icon-btn.active[aria-label="視窗置頂"] {
     background: #1a3a28;
     border-color: #2a6040;
   }
 
   /* ── 穿透 ────────────────────────────────────── */
-  .passthru { min-width: 62px; }
   .passthru.ct-auto { background: #14263a; border-color: #2a5f88; color: #86c5ea; }
   .passthru.ct-on   { background: #0f2035; border-color: #1e5080; color: #7ab8f0; }
 
@@ -314,11 +363,35 @@
   .dim:hover { color: #c8d0da; border-color: #343d4a; }
 
   /* ── 設定 / Dev ──────────────────────────────── */
-  .dev { opacity: 0.3; width: 22px; border-color: transparent; background: transparent; font-size: 11px; }
+  .dev {
+    opacity: 0.3;
+    width: 22px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-color: transparent;
+    background: transparent;
+  }
   .dev:hover { opacity: 0.7; background: #242b34; border-color: #343d4a; }
 
   /* ── 左右群組 ───────────────────────────────── */
   .bar:active { cursor: grabbing; }
+
+  /* Folded down while captioning runs.
+     `fit-content`, not `auto`: the bar is a block-level flex container, so
+     `auto` still resolves to the full width of the row and the spacer shoves
+     the stop button and the status lights to opposite edges. */
+  .bar.collapsed {
+    width: fit-content;
+    margin: 0 auto;
+    padding: 4px 8px;
+    gap: 8px;
+  }
+  .bar.collapsed .spacer,
+  .bar.collapsed .sep {
+    display: none;
+  }
 
   .left-group {
     display: flex;
