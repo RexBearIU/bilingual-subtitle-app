@@ -78,6 +78,10 @@ fn asr_loop(
     // Track which utterance_id had a partial sent, so the following final chunk
     // is not incorrectly flagged as a consecutive repeat of the partial's text.
     let mut last_partial_utterance_id: Option<u64> = None;
+    // When the last preview translation was requested, per utterance. Resets
+    // with the utterance, so every long one gets previews and no short one
+    // pays for a call it does not need.
+    let mut last_preview: Option<(u64, std::time::Instant)> = None;
     // Languages of the last few ACCEPTED finals. A window with a majority
     // vote, not simply "the language of the last final": one hallucination that
     // gets through would otherwise become the reference, and then every correct
@@ -293,7 +297,37 @@ fn asr_loop(
                         cut_request.store(chunk.utterance_id, Ordering::Relaxed);
                         log::debug!("ASR u{subtitle_id}: sentence boundary — early cut requested");
                     }
-                    log::debug!("ASR u{subtitle_id}: partial — translation skipped");
+
+                    // 2c. Translate the preview, so the target language appears
+                    //     while the speaker is still talking.
+                    //
+                    //     Measured on a fast Korean sample: an utterance that
+                    //     ran to the 6 s cap showed its translation 7 s after
+                    //     the speaker began, of which the API call was 0.5 s.
+                    //     The first partial was already transcribed at 1 s, so
+                    //     nearly all of that wait bought nothing.
+                    //
+                    //     Throttled rather than one call per partial. Short
+                    //     utterances are cut by the sentence flush at ~2 s and
+                    //     never need a preview; only the long ones do, and they
+                    //     need one every few seconds, not every 1.5 s. This
+                    //     costs roughly two extra calls on a 6 s utterance and
+                    //     nothing at all on a short one.
+                    let long_enough = chunk.samples.len() >= PREVIEW_MIN_SAMPLES;
+                    let due = match last_preview {
+                        Some((id, at)) if id == chunk.utterance_id => {
+                            at.elapsed() >= PREVIEW_MIN_GAP
+                        }
+                        _ => true,
+                    };
+                    if long_enough && due {
+                        last_preview = Some((chunk.utterance_id, std::time::Instant::now()));
+                        send_translation(
+                            &translate_tx, app, subtitle_id, &text, &lang, &chunk, true,
+                        );
+                    } else {
+                        log::debug!("ASR u{subtitle_id}: preview translation not due");
+                    }
                     continue;
                 }
                 // Clear the partial tracker now that the final has arrived.
@@ -305,25 +339,7 @@ fn asr_loop(
                 }
                 recent_langs.push_back(lang.clone());
 
-                let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
-
-                let req = TranslationRequest {
-                    id: format!("asr_{subtitle_id}"),
-                    source_lang: lang,
-                    source_text: text,
-                    mode,
-                    started_at_ms: chunk.started_at_ms,
-                    ended_at_ms: chunk.ended_at_ms,
-                };
-                match translate_tx.try_send(req) {
-                    Ok(_) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                        log::warn!("ASR u{subtitle_id}: translation channel full, skipping");
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        log::warn!("ASR u{subtitle_id}: translation channel closed");
-                    }
-                }
+                send_translation(&translate_tx, app, subtitle_id, &text, &lang, &chunk, false);
             }
             Err(e) => log::warn!("ASR chunk {chunk_seq} [u{}] error: {e}", chunk.utterance_id),
         }
@@ -495,6 +511,17 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
     body
 }
 
+/// An utterance shorter than this resolves on its own before a preview
+/// translation could arrive, so it never gets one.
+const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 2; // 2 s
+
+/// Minimum spacing between preview translations of the same utterance.
+///
+/// Partials arrive every 1.5 s. Translating each one triples the call count
+/// for no benefit the eye can use — the text barely changes between two of
+/// them, and the subtitle would rewrite itself faster than it can be read.
+const PREVIEW_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How many recent accepted finals decide "the language being spoken".
 const LANG_WINDOW: usize = 5;
 
@@ -513,6 +540,43 @@ fn established_lang(recent: &std::collections::VecDeque<String>) -> Option<&str>
     let best = recent.iter().max_by_key(|c| recent.iter().filter(|x| x == c).count())?;
     let n = recent.iter().filter(|x| *x == best).count();
     (n * 2 > recent.len()).then_some(best.as_str())
+}
+
+/// Queue one translation request, dropping it if the worker is behind.
+///
+/// Dropping rather than blocking, for both previews and finals: the ASR worker
+/// is the only thing feeding the on-screen source text, and stalling it to wait
+/// on a translation would freeze the subtitle that is already readable.
+#[allow(clippy::too_many_arguments)]
+fn send_translation(
+    tx: &std::sync::mpsc::SyncSender<TranslationRequest>,
+    app: &AppHandle,
+    subtitle_id: u64,
+    text: &str,
+    lang: &str,
+    chunk: &AudioChunk,
+    is_partial: bool,
+) {
+    let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
+    let req = TranslationRequest {
+        id: format!("asr_{subtitle_id}"),
+        source_lang: lang.to_string(),
+        source_text: text.to_string(),
+        mode,
+        is_partial,
+        started_at_ms: chunk.started_at_ms,
+        ended_at_ms: chunk.ended_at_ms,
+    };
+    let kind = if is_partial { "preview" } else { "final" };
+    match tx.try_send(req) {
+        Ok(()) => log::debug!("ASR u{subtitle_id}: {kind} translation queued"),
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            log::warn!("ASR u{subtitle_id}: translation channel full, {kind} skipped");
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            log::warn!("ASR u{subtitle_id}: translation channel closed");
+        }
+    }
 }
 
 /// Return `true` if `text` looks like a Whisper hallucination that should be

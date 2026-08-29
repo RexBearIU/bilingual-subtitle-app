@@ -163,6 +163,9 @@ fn translate_loop(
     const CTX_PAIRS: usize = 3;
     let mut history: std::collections::VecDeque<(String, String)> =
         std::collections::VecDeque::with_capacity(CTX_PAIRS);
+    // Set when coalescing passed over a request to finish a final first. The
+    // channel has no push-back, so it is held here until the next iteration.
+    let mut deferred: Option<TranslationRequest> = None;
     // What the history was collected under. The prior turns are re-rendered
     // with the CURRENT `[source→target]` tag, so carrying them across a change
     // tells the model a Korean line was English.
@@ -173,23 +176,35 @@ fn translate_loop(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let mut req = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(r) => r,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        let mut req = match deferred.take() {
+            Some(r) => r,
+            None => match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(r) => r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
         };
-        // If we fell behind, translate only the NEWEST request — the older
-        // subtitles are already scrolling away, and the visible line going
-        // untranslated is worse than an old line keeping its source text.
-        // This matters more with a hosted model than it did locally: network
-        // latency is spikier than a warm GPU, so backlogs form more often.
+        // If we fell behind, drop stale PREVIEWS and translate the newest
+        // request — an old preview is worthless, since the line it previewed
+        // has already been spoken to the end.
+        //
+        // A final is never dropped this way. It is the version that stays on
+        // screen and the only one allowed to become context, so skipping it
+        // would leave that subtitle in its source language for good. When a
+        // final is passed over in favour of something newer, it is translated
+        // first and the newer request is put back at the front of the queue.
         let mut skipped = 0u32;
         while let Ok(newer) = rx.try_recv() {
+            let (now, later) = coalesce(req, newer);
+            req = now;
+            if later.is_some() {
+                deferred = later;
+                break;
+            }
             skipped += 1;
-            req = newer;
         }
         if skipped > 0 {
-            log::info!("TL: backlog — skipped {skipped} stale request(s), translating newest");
+            log::info!("TL: backlog — skipped {skipped} stale preview(s), translating newest");
         }
 
         // "No translation" mode — just promote source text to final subtitle.
@@ -206,7 +221,7 @@ fn translate_loop(
                 source_text: req.source_text.clone(),
                 mode: req.mode,
                 subtitles,
-                is_final: true,
+                is_final: !req.is_partial,
                 started_at_ms: Some(req.started_at_ms),
                 ended_at_ms: Some(req.ended_at_ms),
             };
@@ -215,7 +230,8 @@ fn translate_loop(
         }
 
         let target = req.mode.target_lang();
-        log::info!("TL [{}→{}]: {:?}", req.source_lang, target, req.source_text);
+        let kind = if req.is_partial { "preview" } else { "final" };
+        log::info!("TL [{}→{} {kind}]: {:?}", req.source_lang, target, req.source_text);
 
         // Source is already in the target language — nothing to translate.
         if req.source_lang == target {
@@ -260,12 +276,21 @@ fn translate_loop(
             Ok(translated) => {
                 consecutive_failures = 0;
                 let tl_ms = t_tl.elapsed().as_millis();
-                log::info!("TL [{} → {}] {tl_ms}ms → {:?}", req.source_lang, req.mode.target_lang(), translated);
-                if history.len() == CTX_PAIRS {
-                    history.pop_front();
+                log::info!(
+                    "TL [{} → {} {kind}] {tl_ms}ms → {:?}",
+                    req.source_lang, req.mode.target_lang(), translated,
+                );
+                // Previews are fragments of a sentence still being spoken.
+                // Feeding one back as a completed turn would teach the model
+                // that half-sentences are what a finished translation looks
+                // like, and every later subtitle would inherit that.
+                if !req.is_partial {
+                    if history.len() == CTX_PAIRS {
+                        history.pop_front();
+                    }
+                    history.push_back((req.source_text.clone(), translated.clone()));
+                    ctx_end_ms = req.ended_at_ms;
                 }
-                history.push_back((req.source_text.clone(), translated.clone()));
-                ctx_end_ms = req.ended_at_ms;
                 emit_translated(app, &req, translated);
             }
             Err(e) => {
@@ -301,6 +326,24 @@ fn translate_loop(
 
     set_tl_status(app, "unloaded");
     log::info!("translate worker exited");
+}
+
+/// Choose between the request in hand and a newer one waiting behind it.
+///
+/// Returns `(translate now, keep for later)`. A preview in hand is dropped for
+/// the newer request: the line it previewed has already been spoken to the end,
+/// so translating it buys nothing. A final in hand is never dropped — it is the
+/// version that stays on screen and the only one allowed to become context, so
+/// losing it would leave that subtitle in its source language permanently.
+fn coalesce(
+    current: TranslationRequest,
+    newer: TranslationRequest,
+) -> (TranslationRequest, Option<TranslationRequest>) {
+    if current.is_partial {
+        (newer, None)
+    } else {
+        (current, Some(newer))
+    }
 }
 
 /// Whether the rolling context still applies to the request about to be sent.
@@ -604,7 +647,7 @@ fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
         source_text: req.source_text.clone(),
         mode,
         subtitles,
-        is_final: true,
+        is_final: !req.is_partial,
         started_at_ms: Some(req.started_at_ms),
         ended_at_ms: Some(req.ended_at_ms),
     };
@@ -619,6 +662,34 @@ fn set_tl_status(app: &AppHandle, status: &str) {
 
 #[cfg(test)]
 mod tests {
+    fn req(id: &str, is_partial: bool) -> TranslationRequest {
+        TranslationRequest {
+            id: id.into(),
+            source_lang: "ko".into(),
+            source_text: "x".into(),
+            mode: SubtitleMode::Zh,
+            is_partial,
+            started_at_ms: 0,
+            ended_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_stale_preview_is_dropped_for_the_newer_request() {
+        let (now, later) = coalesce(req("old", true), req("new", true));
+        assert_eq!(now.id, "new");
+        assert!(later.is_none(), "nothing to come back to");
+    }
+
+    #[test]
+    fn a_final_is_never_dropped_by_coalescing() {
+        // The invariant that matters: skipping a final leaves that subtitle in
+        // its source language for good, because nothing sends it again.
+        let (now, later) = coalesce(req("final", false), req("newer", true));
+        assert_eq!(now.id, "final");
+        assert_eq!(later.expect("deferred").id, "newer");
+    }
+
     #[test]
     fn context_is_kept_within_one_conversation() {
         let k = ("ko".to_string(), SubtitleMode::Zh);
