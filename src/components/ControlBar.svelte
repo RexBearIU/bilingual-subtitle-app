@@ -49,24 +49,61 @@
   // `data-tauri-drag-region` does not fire in this window, so the drag is
   // started explicitly. Doing it by hand is better anyway: it is greppable,
   // and it can refuse the drag when the press did not start on the handle.
-  async function startDrag(e: PointerEvent) {
-    if (e.button !== 0) return;
-    // `pointerdown` bubbles, so a press on a button reaches the bar too — and
-    // if that started a drag, the OS move loop would swallow the click the
-    // button was waiting for. Refuse only presses that landed on a control.
-    //
-    // This used to demand `e.target === e.currentTarget`, an exact hit on bare
-    // container, which left so little grabbable surface that a dedicated
-    // dotted strip had to be carved out of the row for it. Excluding the
-    // controls instead makes every gap, every group's padding, and the bar's
-    // own margin draggable, which is far more area than that strip ever was.
-    if ((e.target as HTMLElement).closest("button, select")) return;
-    e.preventDefault();
+  /** Movement, in px, that turns a press into a drag rather than a click. */
+  const DRAG_THRESHOLD = 5;
+
+  async function beginWindowDrag() {
     try {
       await getCurrentWindow().startDragging();
     } catch (err) {
       console.warn("startDragging failed", err);
     }
+  }
+
+  /**
+   * Let a press on a button become a drag, without costing it its click.
+   *
+   * `startDragging` hands the mouse to the OS move loop, which never returns
+   * the `pointerup` — so a button that starts a drag on `pointerdown` can
+   * never fire, which is exactly how these buttons broke once before. Waiting
+   * for real movement first separates the two intents: a press that travels is
+   * a drag, one that does not is a click, and the click is left alone because
+   * nothing here calls `preventDefault` until the drag actually starts.
+   */
+  function armDragThreshold(e: PointerEvent) {
+    const x0 = e.clientX;
+    const y0 = e.clientY;
+    const stop = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+    const onMove = (m: PointerEvent) => {
+      if (Math.hypot(m.clientX - x0, m.clientY - y0) < DRAG_THRESHOLD) return;
+      stop();
+      void beginWindowDrag();
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+  }
+
+  async function startDrag(e: PointerEvent) {
+    if (e.button !== 0) return;
+    const el = e.target as HTMLElement;
+
+    // A `select` opens its menu on pointerdown, so its press is never ours.
+    if (el.closest("select")) return;
+
+    // A button keeps its click unless the press turns out to be a drag.
+    if (el.closest("button")) {
+      armDragThreshold(e);
+      return;
+    }
+
+    // Bare bar: nothing else wants this press, so take it immediately.
+    e.preventDefault();
+    await beginWindowDrag();
   }
 
   function dot(s: string | undefined) {
@@ -180,8 +217,8 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    /* The whole bar is the drag handle now. The controls set `cursor: pointer`
-       themselves, so this shows up only over the surface that actually drags. */
+    /* Every part of the bar drags, buttons included — they keep `cursor:
+       pointer` because a press there is a click until it starts moving. */
     cursor: grab;
     padding: 4px 10px;
     background: rgba(14, 18, 24, 0.94);
