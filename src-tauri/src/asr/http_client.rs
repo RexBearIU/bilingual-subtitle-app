@@ -78,9 +78,13 @@ fn asr_loop(
     // Track which utterance_id had a partial sent, so the following final chunk
     // is not incorrectly flagged as a consecutive repeat of the partial's text.
     let mut last_partial_utterance_id: Option<u64> = None;
-    // Language of the last final. Guards the sentence-boundary early cut: see
-    // the check below for why a mid-utterance language flip is not trustworthy.
-    let mut last_final_lang: Option<String> = None;
+    // Languages of the last few ACCEPTED finals. A window with a majority
+    // vote, not simply "the language of the last final": one hallucination that
+    // gets through would otherwise become the reference, and then every correct
+    // line after it reads as the flip. Measured — a single stray `Bye.` marked
+    // the next three Korean chunks as language changes.
+    let mut recent_langs: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(LANG_WINDOW);
 
     // Backlog of chunks pulled off the channel but not yet transcribed.
     let mut pending: std::collections::VecDeque<AudioChunk> = std::collections::VecDeque::new();
@@ -182,6 +186,39 @@ fn asr_loop(
                     continue;
                 }
 
+                // Tertiary filter: a short chunk in a different language.
+                //
+                // This is the one the no_speech filter above cannot catch.
+                // Measured on Korean audio: the same 1.2 s chunk scores
+                // no_speech=0.90 on its own but 0.00 once an initial_prompt is
+                // attached — the prompt convinces the model that speech
+                // continues here. A rolling prompt is attached to almost every
+                // request, so in practice the 0.7 gate is far weaker than it
+                // looks, and short hallucinations sail past it.
+                //
+                // What stays reliable is that Whisper invents when there is too
+                // little audio to anchor it, and what it invents tends to be in
+                // another language. On the sample that produced this rule, the
+                // pair caught 4 of 4 hallucinations (`you`, `Bye.`, `yeah`,
+                // `¡Bienvenidos a la secundita!`) with no false positive across
+                // 52 requests.
+                //
+                // Length rather than a stock-phrase blocklist on purpose: the
+                // Spanish one is in no such list, and real code-switching worth
+                // showing — a whole sentence in another language — runs longer
+                // than this.
+                let chunk_secs = chunk.samples.len() as f64 / crate::pipeline::chunker::SAMPLE_RATE as f64;
+                if let Some(est) = established_lang(&recent_langs) {
+                    if lang != est && chunk_secs <= SHORT_FLIP_SECS {
+                        log::info!(
+                            "ASR [u{}]: {chunk_secs:.1}s of {lang:?} inside {est:?} — \
+                             hallucination suppressed ({infer_ms}ms): {text:?}",
+                            chunk.utterance_id,
+                        );
+                        continue;
+                    }
+                }
+
                 // Consecutive-repeat detection (initial_prompt feedback loop).
                 // ONE exact repeat is allowed — quick echoed replies between
                 // speakers ("네." / "네.") are real speech.  A second consecutive
@@ -246,11 +283,11 @@ fn asr_loop(
                     //     the language flip separated every bad trigger from
                     //     every good one, and the cost of being wrong here is a
                     //     subtitle cut mid-sentence.
-                    let lang_flip = last_final_lang.as_deref().is_some_and(|l| l != lang);
-                    if lang_flip {
+                    let established = established_lang(&recent_langs);
+                    if established.is_some_and(|l| l != lang) {
                         log::debug!(
-                            "ASR u{subtitle_id}: partial lang {lang:?} != {:?} — no early cut",
-                            last_final_lang,
+                            "ASR u{subtitle_id}: partial lang {lang:?} != {established:?} \
+                             — no early cut",
                         );
                     } else if looks_complete(&text) {
                         cut_request.store(chunk.utterance_id, Ordering::Relaxed);
@@ -263,7 +300,10 @@ fn asr_loop(
                 if is_completing_partial {
                     last_partial_utterance_id = None;
                 }
-                last_final_lang = Some(lang.clone());
+                if recent_langs.len() == LANG_WINDOW {
+                    recent_langs.pop_front();
+                }
+                recent_langs.push_back(lang.clone());
 
                 let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
 
@@ -455,6 +495,26 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
     body
 }
 
+/// How many recent accepted finals decide "the language being spoken".
+const LANG_WINDOW: usize = 5;
+
+/// A chunk no longer than this, in a different language, is a hallucination.
+///
+/// Every measured false transcription sat at or below 1.2 s. Two seconds keeps
+/// margin without reaching the length a real switch of language needs.
+const SHORT_FLIP_SECS: f64 = 2.0;
+
+/// The language currently being spoken, or `None` while that is unclear.
+///
+/// A strict majority of the window, so one outlier cannot move the reference
+/// and a genuine change of language takes a few finals to take effect — which
+/// is the right way round: the reference exists to judge single odd chunks.
+fn established_lang(recent: &std::collections::VecDeque<String>) -> Option<&str> {
+    let best = recent.iter().max_by_key(|c| recent.iter().filter(|x| x == c).count())?;
+    let n = recent.iter().filter(|x| *x == best).count();
+    (n * 2 > recent.len()).then_some(best.as_str())
+}
+
 /// Return `true` if `text` looks like a Whisper hallucination that should be
 /// silently dropped.
 ///
@@ -631,6 +691,40 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    fn window(langs: &[&str]) -> std::collections::VecDeque<String> {
+        langs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn established_lang_needs_a_strict_majority() {
+        assert_eq!(established_lang(&window(&["ko", "ko", "ko"])), Some("ko"));
+        // Two of four is not a majority: with the window split, there is no
+        // reference, so nothing gets judged a flip.
+        assert_eq!(established_lang(&window(&["ko", "ko", "en", "en"])), None);
+        assert_eq!(established_lang(&window(&[])), None);
+    }
+
+    #[test]
+    fn one_stray_language_cannot_become_the_reference() {
+        // The measured cascade: a single hallucinated `Bye.` used to make `en`
+        // the reference and marked every following Korean line as the flip.
+        assert_eq!(established_lang(&window(&["ko", "ko", "en", "ko", "ko"])), Some("ko"));
+    }
+
+    #[test]
+    fn a_real_change_of_language_eventually_takes_over() {
+        assert_eq!(established_lang(&window(&["ko", "en", "en", "en"])), Some("en"));
+    }
+
+    #[test]
+    fn short_flip_threshold_covers_every_measured_hallucination() {
+        // Durations of the four false transcriptions measured on the Korean
+        // sample: `you`, `Bye.`, `yeah`, and the Spanish one.
+        for secs in [1.00, 1.20, 1.00, 1.00] {
+            assert!(secs <= SHORT_FLIP_SECS, "{secs}s should be suppressed");
+        }
+    }
+
     use super::*;
 
     #[test]

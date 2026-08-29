@@ -29,7 +29,7 @@ use std::time::Instant;
 use crate::asr::AudioChunk;
 use crate::audio::meter::rms;
 
-const SAMPLE_RATE: usize = 16_000;
+pub const SAMPLE_RATE: usize = 16_000;
 
 /// Hard cap for video / stream capture.  Only reached when speech never
 /// pauses (fast talkers, no gaps) — more context per chunk is exactly what

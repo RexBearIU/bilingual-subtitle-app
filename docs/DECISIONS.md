@@ -548,3 +548,38 @@ usually means a different scene or speaker, where stale names bias the
 translation rather than steady it. Extracted as a free function purely so the
 rule is unit-testable; the loop it serves is not.
 
+## ADR-0021 — `initial_prompt` disarms the no_speech filter
+
+The first line of defence against Whisper hallucinations is
+`no_speech_prob >= 0.7`: the model's own estimate that a chunk contains no
+speech. Measuring it on `bench/sample.wav` showed it is far weaker in practice
+than on paper.
+
+The same 1.2 s chunk, transcribed as `Bye.` in the middle of Korean audio:
+
+| request | initial_prompt | no_speech |
+| --- | --- | --- |
+| final chunk, standalone | none | **0.902** |
+| same audio, as the app sends it | rolling context | **0.000** |
+
+The prompt convinces the model that speech continues, and the score collapses.
+Since a rolling prompt is attached to nearly every request, the 0.7 gate almost
+never fires on exactly the chunks it exists for. Across 52 replayed requests,
+four hallucinations got through — `you`, `Bye.`, `yeah`, and
+`¡Bienvenidos a la secundita!` — all at 1.0–1.2 s.
+
+Dropping the prompt is not the answer: it is what keeps names and spelling
+stable across chunks. Instead, a third filter uses what stays reliable —
+Whisper invents when there is too little audio to anchor it, and what it
+invents tends to be in another language. **A chunk of 2 s or less whose
+language differs from the established one is suppressed.** On the measured
+data that is 4 of 4 caught with no false positive.
+
+Length, not a stock-phrase blocklist: the Spanish line is in no such list, and
+a switch of language worth showing runs longer than two seconds.
+
+"Established" is a strict majority of the last five *accepted* finals, not the
+previous final's language. The single-value version had a measured failure of
+its own — one `Bye.` that slipped through became the reference, and the next
+three correct Korean lines were then read as the language flip.
+
