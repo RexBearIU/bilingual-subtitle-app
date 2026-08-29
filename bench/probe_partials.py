@@ -93,6 +93,9 @@ def main() -> int:
                          "or CUDA is missing and every inference returns 500")
     ap.add_argument("--script", type=Path, default=repo_root / "asr_srv.py")
     ap.add_argument("--load-timeout", type=float, default=600.0)
+    ap.add_argument("--no-fast-partials", action="store_true",
+                    help="send partials WITHOUT the server's `fast` flag, to measure what "
+                         "faster-whisper's temperature fallback costs on repetitive audio")
     args = ap.parse_args()
 
     if not args.audio.exists():
@@ -137,6 +140,10 @@ def main() -> int:
             for k, end in enumerate(cuts):
                 is_partial = k < len(cuts) - 1
                 fields = {"response_format": "verbose_json", "beam_size": "1"}
+                # Partials ask the server to skip the temperature-fallback
+                # retries, exactly as the app does.
+                if is_partial and not args.no_fast_partials:
+                    fields["fast"] = "true"
                 if args.lang:
                     fields["language"] = args.lang
                 if prompt:

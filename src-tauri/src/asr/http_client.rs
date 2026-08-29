@@ -66,6 +66,19 @@ fn asr_loop(
     set_asr_status(app, "ready");
 
     let infer_url = format!("{base}/inference");
+
+    // Separate agents so a partial can be abandoned while a final is not.
+    //
+    // A partial is a disposable preview: once it is later than the final it
+    // was previewing, waiting on it only holds up the queue behind it. A final
+    // is the subtitle, so it gets a generous ceiling that exists only to stop
+    // a wedged server hanging the pipeline for good.
+    let agent_partial = ureq::AgentBuilder::new()
+        .timeout_read(PARTIAL_INFER_TIMEOUT)
+        .build();
+    let agent_final = ureq::AgentBuilder::new()
+        .timeout_read(FINAL_INFER_TIMEOUT)
+        .build();
     let mut chunk_seq: u64 = 0; // for log messages only
     // Rolling prompt: last transcribed sentence passed back to whisper as
     // initial_prompt so it can maintain continuity across chunks (names,
@@ -160,8 +173,11 @@ fn asr_loop(
             duration_s,
             effective_prompt.map_or(0, |p| p.len()),
         );
+        let agent = if chunk.is_partial { &agent_partial } else { &agent_final };
         let t_infer = std::time::Instant::now();
-        match transcribe(&infer_url, &chunk, effective_prompt, lang_hint.as_deref(), beam_size) {
+        match transcribe(
+            agent, &infer_url, &chunk, effective_prompt, lang_hint.as_deref(), beam_size,
+        ) {
             Ok((text, lang, no_speech_prob)) => {
                 let infer_ms = t_infer.elapsed().as_millis();
                 let text = text.trim().to_string();
@@ -409,6 +425,7 @@ fn looks_complete(text: &str) -> bool {
 /// noise, or music without lyrics — the caller should discard such results.
 /// Returns 0.0 when the field is absent.
 fn transcribe(
+    agent: &ureq::Agent,
     url: &str,
     chunk: &AudioChunk,
     prompt: Option<&str>,
@@ -416,10 +433,11 @@ fn transcribe(
     beam_size: Option<u32>,
 ) -> Result<(String, String, f32), String> {
     let wav = encode_wav_16bit(&chunk.samples);
-    let body = build_multipart(&wav, prompt, lang_hint, beam_size);
+    let body = build_multipart(&wav, prompt, lang_hint, beam_size, chunk.is_partial);
     let ct = format!("multipart/form-data; boundary={BOUNDARY}");
 
-    let response = ureq::post(url)
+    let response = agent
+        .post(url)
         .set("Content-Type", &ct)
         .send_bytes(&body)
         .map_err(|e| e.to_string())?;
@@ -478,7 +496,13 @@ fn transcribe(
 
 /// Build a `multipart/form-data` body with the WAV bytes, `verbose_json` format,
 /// an optional `initial_prompt` for continuity, and an optional `language` hint.
-fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, beam_size: Option<u32>) -> Vec<u8> {
+fn build_multipart(
+    wav: &[u8],
+    prompt: Option<&str>,
+    lang_hint: Option<&str>,
+    beam_size: Option<u32>,
+    fast: bool,
+) -> Vec<u8> {
     let mut body = Vec::new();
 
     // Part 1: audio file
@@ -530,6 +554,21 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
         body.extend_from_slice(b.as_bytes());
     }
 
+    // `fast` asks the server to skip faster-whisper's temperature-fallback
+    // retries. Measured on bench/sample.wav, partial inference: p90 1078 ms ->
+    // 640 ms and max 9516 ms -> 2750 ms, with the median unchanged (562 -> 531).
+    // The whole cost is paid by repetitive audio - laughter, drawn-out vowels -
+    // which trips `compression_ratio_threshold` and gets decoded six times.
+    // Only partials use it; for a final the retry is what recovers a bad decode.
+    if fast {
+        let b = format!(
+            "\r\n--{BOUNDARY}\r\n\
+             Content-Disposition: form-data; name=\"fast\"\r\n\r\n\
+             true"
+        );
+        body.extend_from_slice(b.as_bytes());
+    }
+
     // Closing boundary
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     body
@@ -548,6 +587,19 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
 /// which is exactly the set that was waiting on the 6 s cap. The two long ones
 /// in that session — 4.93 s and 5.72 s — still qualify.
 const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 7 / 2; // 3.5 s
+
+/// How long to wait for a partial's transcription before abandoning it.
+///
+/// Measured over one session: median 328 ms, p90 1047 ms — but repetitive
+/// audio (laughter, drawn-out vowels) sent the same call to 2.9 s, and 7.9 s
+/// in an earlier one. A partial that late has already been overtaken by its
+/// own final, and because the worker is serial it delays everything behind it.
+const PARTIAL_INFER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The same ceiling for a final, but far higher: giving up on a final loses
+/// that subtitle outright, so this exists only to stop a wedged server hanging
+/// the pipeline forever.
+const FINAL_INFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Letters a preview needs before it is worth translating.
 ///

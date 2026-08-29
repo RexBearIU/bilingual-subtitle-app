@@ -132,11 +132,24 @@ def _load_whisper(model_id: str, compute_type_override: str | None = None) -> No
     _whisper_model = WhisperModel(model_id, device=device, compute_type=compute_type)
 
 
+# Whisper decodes repetitive audio slowly — measured 3.3 s for seven
+# characters of "이이이이이이!" against a 328 ms median. Output length is not
+# the cause: faster-whisper retries the WHOLE decode at six increasing
+# temperatures when a result trips `compression_ratio_threshold`, and
+# repetitive text trips it every time.
+#
+# `fast` pins the temperature, which disables that fallback. Partials use it:
+# they are disposable previews, and one slow call stalls everything queued
+# behind it on a serial worker. Finals keep the fallback, because for them the
+# retry is what recovers a bad decode.
+
+
 def _infer_whisper(
     tmp_path: str,
     language: str | None,
     prompt: str | None,
     beam_size: int,
+    fast: bool = False,
 ) -> tuple[str, str, float]:
     lang = language if language and language not in ("auto", "") else None
     segments_iter, info = _whisper_model.transcribe(
@@ -146,6 +159,8 @@ def _infer_whisper(
         beam_size=beam_size,
         condition_on_previous_text=True,
         vad_filter=False,
+        # A single temperature means no fallback retries.
+        temperature=0.0 if fast else [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         # Timestamps are discarded by the caller; skipping timestamp tokens is
         # faster and removes a hallucination source on short chunks.
         without_timestamps=True,
@@ -345,6 +360,7 @@ async def inference(
     initial_prompt: str | None = Form(None),
     language: str | None = Form(None),
     beam_size: int = Form(1),
+    fast: bool = Form(False),
 ):
     audio_data = await file.read()
 
@@ -361,7 +377,7 @@ async def inference(
             os.write(fd, audio_data)
             os.close(fd)
             text, lang, no_speech_prob = _infer_whisper(
-                tmp_path, language, initial_prompt, beam_size
+                tmp_path, language, initial_prompt, beam_size, fast
             )
         finally:
             try:
