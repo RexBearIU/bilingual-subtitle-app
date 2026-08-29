@@ -288,15 +288,19 @@ fn asr_loop(
                     //     every good one, and the cost of being wrong here is a
                     //     subtitle cut mid-sentence.
                     let established = established_lang(&recent_langs);
-                    if established.is_some_and(|l| l != lang) {
+                    let cutting = if established.is_some_and(|l| l != lang) {
                         log::debug!(
                             "ASR u{subtitle_id}: partial lang {lang:?} != {established:?} \
                              — no early cut",
                         );
+                        false
                     } else if looks_complete(&text) {
                         cut_request.store(chunk.utterance_id, Ordering::Relaxed);
                         log::debug!("ASR u{subtitle_id}: sentence boundary — early cut requested");
-                    }
+                        true
+                    } else {
+                        false
+                    };
 
                     // 2c. Translate the preview, so the target language appears
                     //     while the speaker is still talking.
@@ -313,23 +317,27 @@ fn asr_loop(
                     //     need one every few seconds, not every 1.5 s. This
                     //     costs roughly two extra calls on a 6 s utterance and
                     //     nothing at all on a short one.
-                    //     Three gates, and the text one is not optional:
-                    //     two seconds of audio can still transcribe to "아...",
-                    //     which costs a call to render as "啊……" and then
-                    //     flashes on screen until the real sentence replaces
-                    //     it. Measured — that is exactly what the first
-                    //     version did.
+                    //     Four gates. Each one exists because the version
+                    //     without it was measured spending a call for nothing:
+                    //
+                    //     - audio: see PREVIEW_MIN_SAMPLES.
+                    //     - text: two seconds of audio can still transcribe to
+                    //       "아...", which renders as "啊……" and flashes on
+                    //       screen until the real sentence replaces it.
+                    //     - due: re-translating text that has not moved on buys
+                    //       a rewrite of the same line and nothing else.
+                    //     - cutting: the sentence flush was just asked to end
+                    //       this utterance, so the final is milliseconds away
+                    //       and a preview of it can only arrive later.
                     let long_enough = chunk.samples.len() >= PREVIEW_MIN_SAMPLES;
                     let worth_reading = is_worth_previewing(&text);
                     let due = match &last_preview {
                         Some((id, at, shown)) if *id == chunk.utterance_id => {
-                            // Re-translating text that has not moved on buys a
-                            // rewrite of the same line and nothing else.
                             at.elapsed() >= PREVIEW_MIN_GAP && *shown != text
                         }
                         _ => true,
                     };
-                    if long_enough && worth_reading && due {
+                    if long_enough && worth_reading && due && !cutting {
                         last_preview = Some((
                             chunk.utterance_id,
                             std::time::Instant::now(),
@@ -341,7 +349,7 @@ fn asr_loop(
                     } else {
                         log::debug!(
                             "ASR u{subtitle_id}: no preview (audio={long_enough} \
-                             text={worth_reading} due={due})",
+                             text={worth_reading} due={due} cutting={cutting})",
                         );
                     }
                     continue;
@@ -529,7 +537,17 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
 
 /// An utterance shorter than this resolves on its own before a preview
 /// translation could arrive, so it never gets one.
-const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 2; // 2 s
+///
+/// Set from measurement, not taste. Over one session, eight of ten utterances
+/// ended between 2.88 s and 3.31 s, and partials fire at 1.0 / 2.5 / 4.0 s —
+/// so a 2 s threshold let the 2.5 s partial through on nearly every utterance,
+/// doubling the translation calls to gain, in half of them, nothing at all:
+/// the preview took 500 ms to come back and the final was already there.
+///
+/// At 3.5 s only utterances that have outlived the typical one get a preview,
+/// which is exactly the set that was waiting on the 6 s cap. The two long ones
+/// in that session — 4.93 s and 5.72 s — still qualify.
+const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 7 / 2; // 3.5 s
 
 /// Letters a preview needs before it is worth translating.
 ///
@@ -788,6 +806,43 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// Prefix lengths the chunker flushes as partials, in samples.
+    fn partials_of(utterance_secs: f64) -> Vec<usize> {
+        use crate::pipeline::chunker::{PARTIAL_FLUSH_SAMPLES, PARTIAL_REFRESH_SAMPLES};
+        let total = (utterance_secs * crate::pipeline::chunker::SAMPLE_RATE as f64) as usize;
+        let mut out = Vec::new();
+        let mut n = PARTIAL_FLUSH_SAMPLES;
+        while n < total {
+            out.push(n);
+            n += PARTIAL_REFRESH_SAMPLES;
+        }
+        out
+    }
+
+    /// Partials that clear the audio gate — the ones that can become previews.
+    fn eligible_previews(utterance_secs: f64) -> usize {
+        partials_of(utterance_secs).into_iter().filter(|&n| n >= PREVIEW_MIN_SAMPLES).count()
+    }
+
+    #[test]
+    fn a_typical_utterance_never_reaches_the_preview_threshold() {
+        // Measured over one session. Partials fire at 1.0 / 2.5 / 4.0 s, so an
+        // utterance this length only ever produces partials below the gate —
+        // and each of these finished before a preview could have come back.
+        for ended in [2.88, 3.09, 3.31, 3.71] {
+            assert_eq!(eligible_previews(ended), 0, "{ended}s should not preview");
+        }
+    }
+
+    #[test]
+    fn an_utterance_that_runs_long_gets_a_preview() {
+        // The two from that session that were actually worth previewing: one
+        // cut by silence at 4.93 s, one that ran into the 6 s cap.
+        for ended in [4.93, 5.72] {
+            assert!(eligible_previews(ended) >= 1, "{ended}s should preview");
+        }
+    }
+
     #[test]
     fn an_interjection_is_not_worth_previewing() {
         // Measured: 2.0 s of audio transcribed to this, was translated as
