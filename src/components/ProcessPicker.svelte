@@ -48,7 +48,12 @@
   }
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<!-- Also on blur: while the list is open the whole window takes the mouse, so
+     clicking away onto whatever is playing behind it neither reaches the
+     backdrop nor closes the list — and the overlay goes on blocking the
+     cursor. Losing focus is that gesture, and it is the one people reach for
+     when they opened the list and changed their mind. -->
+<svelte:window onkeydown={onKeydown} onblur={() => (open = false)} />
 
 <div class="picker">
   <button
@@ -65,10 +70,14 @@
   {/if}
 
   {#if open}
-    <!-- backdrop -->
+    <!-- Backdrop, and the window's hit region while the list is open. The
+         list is positioned above the bar, outside the control bar's own
+         rectangle, so in `auto` click-through the mouse passed straight
+         through it and the entries could not be clicked. `data-hit` on a
+         full-window backdrop is the same fix the settings panel uses. -->
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="backdrop" onclick={() => open = false}></div>
+    <div class="backdrop" data-hit onclick={() => open = false}></div>
 
     <div class="dropdown">
       <div class="dropdown-header">選擇捕捉來源</div>

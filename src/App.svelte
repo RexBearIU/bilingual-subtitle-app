@@ -103,6 +103,7 @@
   }
 
   let pushQueued = false;
+  let lastPushed = "";
   function pushHitRegions() {
     // After layout, not during it: $effect runs before the browser has
     // recalculated the geometry we are about to measure.
@@ -110,7 +111,14 @@
     pushQueued = true;
     requestAnimationFrame(() => {
       pushQueued = false;
-      setHitRegions(collectHitRegions()).catch((e) =>
+      const regions = collectHitRegions();
+      // The observer below fires on every subtitle update. Comparing before
+      // sending keeps that from becoming an IPC call per frame; the rectangles
+      // only actually move when something opens, closes or resizes.
+      const key = JSON.stringify(regions);
+      if (key === lastPushed) return;
+      lastPushed = key;
+      setHitRegions(regions).catch((e) =>
         console.warn("setHitRegions failed", e),
       );
     });
@@ -130,7 +138,34 @@
     // no Svelte state changed.
     const ro = new ResizeObserver(pushHitRegions);
     ro.observe(document.documentElement);
-    return () => ro.disconnect();
+
+    // A `data-hit` element can appear without App knowing: the audio-source
+    // list is a child component's own state. Watching the DOM rather than
+    // adding another prop means the next popup cannot forget to say so —
+    // which is how the source list ended up unclickable in `auto` mode.
+    const mo = new MutationObserver((records) => {
+      const touchesHitRegion = records.some((r) => {
+        if (r.type === "attributes") return true;
+        const nodes = [...r.addedNodes, ...r.removedNodes];
+        return nodes.some(
+          (n) =>
+            n instanceof HTMLElement &&
+            (n.hasAttribute("data-hit") || n.querySelector("[data-hit]") !== null),
+        );
+      });
+      if (touchesHitRegion) pushHitRegions();
+    });
+    mo.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-hit"],
+    });
+
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
   });
 
   // ── settings window sizing ─────────────────────────────────────────────────

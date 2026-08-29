@@ -408,6 +408,14 @@ pub fn set_click_through(mode: ClickThrough, state: Db, app: AppHandle) -> Resul
 /// coordinates, since it is the side that knows the position and DPI scale.
 #[tauri::command]
 pub fn set_hit_regions(regions: Vec<HitRect>, app: AppHandle) -> Result<(), String> {
+    log::debug!(
+        "hit regions: [{}]",
+        regions
+            .iter()
+            .map(|r| format!("{:.0}x{:.0}@{:.0},{:.0}", r.w, r.h, r.x, r.y))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     hittest::set_regions(&app, regions);
     Ok(())
 }
