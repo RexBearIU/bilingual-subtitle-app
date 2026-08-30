@@ -18,8 +18,9 @@
 //!    utterance_id (`is_partial = false`) so the frontend replaces the
 //!    partial in-place with the final transcription + translation.
 //!
-//! ## Music mode
-//! Fixed 10 s chunks; no partial or silence detection.
+//! This is the only segmentation policy.  A separate music mode (fixed 10 s
+//! chunks, no partials) used to compete with it for this code path and was
+//! removed with ADR-0015.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};

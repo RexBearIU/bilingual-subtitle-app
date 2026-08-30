@@ -101,8 +101,6 @@ The chunker (`pipeline/chunker.rs`) accumulates resampled 16 kHz mono samples.
    window** in the last 1.5 s (not mid-word); the remainder seeds the next
    utterance.
 
-**Music mode:** fixed 10 s chunks, no partial flush, beam_size=3 + "Song lyrics:" prompt.
-
 Pure-silence buffers are discarded without an ASR call. A stop-flush sends any
 accumulator ≥ 0.5 s when `stop_captioning` is called. The `speech_threshold`
 setting is retained in IPC types for API compatibility but is no longer read.
@@ -117,8 +115,7 @@ is enabled (timestamps unused downstream, fewer hallucinations).
 
 **beam_size strategy:**
 - Partial chunks → beam_size=1 (greedy, fast preview)
-- Final chunks (video) → beam_size=5 (accurate)
-- Music mode → beam_size=3
+- Final chunks → beam_size=5 (accurate)
 
 **Script-based language correction:** Whisper's per-chunk language claim is
 unreliable on short audio (Korean text labeled "en"). The dominant script of the
@@ -130,10 +127,18 @@ disagree, so translation prompts always carry the right source language.
 Calls OpenRouter's `/v1/chat/completions` (ADR-0011). The last **3
 (source → translation) pairs** are replayed as chat turns for cross-subtitle
 continuity (names, loanwords, omitted Korean subjects). The system prompt covers
-ASR-error tolerance (no fragment completion), multi-speaker dash separation, and
-a lyric register in music mode. Korean source adds loanword/name/register rules.
+ASR-error tolerance (no fragment completion) and multi-speaker dash separation.
+Korean source adds loanword/name/register rules.
 Requests set `reasoning.enabled = false`; `strip_think_tags` is kept as a
 safety net for models that emit a `<think>` block anyway.
+
+**Translation cache** (64 lines, LRU, keyed on source_lang + mode + source
+text): a preview and its final carry identical text whenever speech stops
+before the wording changes, and repeated lines (choruses, catchphrases,
+surviving hallucinations) recur on their own. Re-asking costs a round-trip and
+can come back worded differently, which rewrites a subtitle already on screen.
+The key omits the rolling context on purpose — on screen, stability beats
+context-tuning. A hit still enters the history, so context stays complete.
 
 Failure handling, in order of cheapness:
 - Punctuation-only input, or source language == target → no request at all.
@@ -161,16 +166,30 @@ system loopback with the error stored in `AppState.loopback_error` for the UI.
 
 ## Hallucination filtering
 
-The ASR worker applies three layers before emitting any subtitle:
+The ASR worker applies four layers before emitting any subtitle:
 
 1. **`no_speech_prob` filter** — faster-whisper returns a per-segment probability
    that the audio contains no speech. Segments with mean ≥ 0.7 are dropped.
+   Weaker than it looks: an `initial_prompt` is attached to nearly every
+   request, and it talks the model into scoring invented speech at 0.00.
 2. **Blocklist filter** — known hallucination phrases (YouTube credits, `[Music]`,
    `[BLANK_AUDIO]`, etc.) are blocked by substring match.
 3. **Repeat-loop filter** — *one* consecutive exact repeat is allowed (real
    echoed replies like "네." / "네." between speakers); the second consecutive
    repeat (< 60 chars) marks an `initial_prompt` feedback loop and is suppressed.
-   Finals completing a partial of the same utterance are exempt.
+   A final completing a partial of the same utterance skips the check but
+   **holds** the count — clearing it there let a hallucination repeat forever,
+   because every utterance is a partial then a final and the reset landed
+   between each pair.
+4. **Decoder-loop filter** — one token repeated ≥ 6 times in a row is a broken
+   decode, not speech (measured: `"너무"` ×200 in a single result). Words only,
+   not characters: `하하하하하하` and `오오오오오` are real.
+
+A blocklist cannot win on its own. Across four Korean-music sessions each
+blocked phrase was simply replaced by another the next session
+(`한글자막 by 한효정` → `다음 영상에서 만나요` → `감사합니다` →
+`자막 제공 및 광고를 포함하고 있습니다`). Layers 3 and 4 are the ones that
+generalise: they recognise the *shape* of a broken decode in any language.
 
 ## Backend module layout
 
@@ -209,11 +228,49 @@ src/
 ├─ main.ts
 ├─ lib/
 │  ├─ subtitles.svelte.ts     # OverlayStore: subscribe to events, hold render state
+│  ├─ subtitle-lines.ts       # line order + clipboard text, shared by view and copy
 │  ├─ commands.ts             # typed wrappers over invoke()
 │  └─ types.ts                # IPC types (mirrors src-tauri/src/types.rs)
 └─ components/
-   ├─ SubtitleView.svelte     # stacked bilingual subtitle display
+   ├─ SubtitleView.svelte     # stacked bilingual subtitle display + per-line copy
    ├─ ControlBar.svelte       # start/stop, mode, status, settings trigger
    ├─ ProcessPicker.svelte    # per-process audio capture selector
-   └─ SettingsPanel.svelte    # settings overlay (opacity, GPU layers)
+   ├─ Icon.svelte             # the bar's stroked 16-unit icon set
+   └─ SettingsPanel.svelte    # settings overlay (size, opacity, engine, providers)
 ```
+
+### Copying a subtitle
+
+Each subtitle carries its own copy button. It is the only part of the caption
+tagged `data-hit`, so the bubble it sits on still lets clicks through to the
+video (ADR-0012) while the button itself is reachable — the whole caption as a
+hit target would hand the overlay back the clicks it exists to avoid.
+
+Two consequences fall out of the same constraint:
+
+- The button **cannot** be revealed on hover-of-the-caption, because the caption
+  never receives the mouse. It is always present and always clickable, just
+  dim until pointed at.
+- Resting on it **pauses that segment's expiry**, and its eviction by the
+  `MAX_SEGMENTS` cap. Without this the line disappears mid-reach: the button is
+  at the edge of a bubble that is already seconds old by the time anyone
+  decides to copy it. Leaving restarts the full window rather than resuming the
+  remainder, which would be a fraction of a second and read as a glitch.
+
+The clipboard write happens in Rust (`copy_to_clipboard`), not through
+`navigator.clipboard`: Chromium refuses one while the document is unfocused,
+which is this overlay's normal state.
+
+### Sizing
+
+The control bar's sizes all derive from tokens on `.bar` (`--btn`, `--fs`,
+`--pad-x`, `--gap`), each of them a base value times `--ui-scale`. `--ui-scale`
+is not a setting of its own — `App.svelte` derives it from the caption font
+size (`fontSize / 28`, clamped 0.8–1.6) so one slider moves both. The clamp is
+because the two do not share a usable range: captions work from 14 to 64 px,
+but a bar at 64/28 would eat the screen and one at 14/28 would be unclickable.
+
+`ProcessPicker` reads the same tokens by inheritance. Anything in the bar that
+hardcodes a pixel size will silently stop matching the rest as soon as the
+slider moves — which is exactly how the audio-source button ended up visibly
+smaller than its neighbours.

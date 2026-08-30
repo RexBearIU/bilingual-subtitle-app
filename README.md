@@ -14,7 +14,7 @@ Zipformer), translates it via **OpenRouter**, and renders
   that plays through the Windows default output device.
 - **Subtitle modes:** translate to `zh` / `ko` / `en`, or `none` (source text only).
 - **Per-process capture:** target a single app (e.g. a game) instead of all system audio.
-- **Music mode:** bypasses VAD for continuous lyrics captioning.
+- **Copy a line:** every subtitle carries a copy button; the caption stays click-through.
 
 > Status: **feature-complete MVP** — overlay · system & per-process capture ·
 > graduated chunking · ASR (whisper/SenseVoice/Zipformer-KO) · translation · settings ·
