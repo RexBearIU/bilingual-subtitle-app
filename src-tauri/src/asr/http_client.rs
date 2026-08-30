@@ -256,12 +256,21 @@ fn asr_loop(
                 // Skip the check for a final chunk that completes a partial of
                 // the same utterance — the partial already set last_valid_text
                 // to the same sentence.
+                //
+                // The exemption skips the check but must NOT clear the count.
+                // Every utterance is a partial followed by a final, so a reset
+                // here lands between every pair and the count can never reach
+                // 2.  Measured on Korean music: whisper emitted a bare
+                // "감사합니다." as its own utterance eight times in a row and
+                // all eight were accepted and translated.  The phrase is real
+                // speech in conversation, so a blocklist entry is the wrong
+                // tool; noticing that it never stops is the right one.
                 let is_completing_partial =
                     !chunk.is_partial && last_partial_utterance_id == Some(chunk.utterance_id);
                 let is_repeat = !is_completing_partial
                     && text.chars().count() < 60
                     && last_valid_text.as_deref().is_some_and(|prev| prev.trim() == text);
-                repeat_count = if is_repeat { repeat_count + 1 } else { 0 };
+                repeat_count = next_repeat_count(repeat_count, is_repeat, is_completing_partial);
                 if repeat_count >= 2 {
                     log::info!(
                         "ASR [u{}]: repeated {}× consecutively — suppressed ({infer_ms}ms): {text:?}",
@@ -729,6 +738,50 @@ fn send_translation(
     }
 }
 
+/// Advance the consecutive-repeat counter.
+///
+/// `is_completing_partial` holds the count where it is rather than resetting
+/// it: a final that completes its own partial repeats that partial's text by
+/// construction, so it is evidence neither for a loop nor against one.
+fn next_repeat_count(prev: u32, is_repeat: bool, is_completing_partial: bool) -> u32 {
+    if is_completing_partial {
+        prev
+    } else if is_repeat {
+        prev + 1
+    } else {
+        0
+    }
+}
+
+/// The longest run of one token repeated back-to-back.
+///
+/// Whisper's decoder sometimes falls into a repetition loop and emits the same
+/// word until it runs out of budget. Measured on Korean music with large-v3:
+/// one final chunk came back as "너무" about two hundred times, and took
+/// 2727 ms against a ~380 ms median — a repetitive result trips
+/// `compression_ratio_threshold`, so faster-whisper re-ran the whole decode at
+/// all six fallback temperatures and got the same loop every time.
+///
+/// Whitespace-separated tokens only. Runs of one CHARACTER are deliberately
+/// not counted: "하하하하하하" and "오오오오오" appear in the same logs as real
+/// laughter and real singing.
+fn longest_token_run(text: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    let mut prev: Option<&str> = None;
+    for tok in text.split_whitespace() {
+        run = if prev == Some(tok) { run + 1 } else { 1 };
+        longest = longest.max(run);
+        prev = Some(tok);
+    }
+    longest
+}
+
+/// A token repeated this many times in a row is a decoder loop, not speech.
+/// The measured loop ran to ~200; the longest genuine repeat in the same logs
+/// was four ("으 으 으 으"), so there is a wide margin either side.
+const MAX_TOKEN_RUN: usize = 6;
+
 /// Return `true` if `text` looks like a Whisper hallucination that should be
 /// silently dropped.
 ///
@@ -786,7 +839,14 @@ fn is_hallucination(text: &str) -> bool {
         "[박수]",   // Korean [Applause]
     ];
     let lower = t.to_lowercase();
-    DENY.iter().any(|&h| lower.contains(h))
+    if DENY.iter().any(|&h| lower.contains(h)) {
+        return true;
+    }
+
+    // 3. A decoder repetition loop. Unlike the list above this needs no
+    //    per-phrase knowledge — it recognises the shape of a broken decode,
+    //    whatever language it broke in.
+    longest_token_run(t) >= MAX_TOKEN_RUN
 }
 
 /// Detect the dominant script of `text` and map it to a language code.
@@ -934,6 +994,52 @@ mod tests {
         ] {
             assert!(is_hallucination(text), "{text} should be suppressed");
         }
+    }
+
+    #[test]
+    fn a_decoder_loop_is_a_hallucination() {
+        // Shortened from the measured case, which ran to about two hundred.
+        let loop_text = "너무 ".repeat(30);
+        assert!(is_hallucination(&loop_text));
+        assert_eq!(longest_token_run(&loop_text), 30);
+    }
+
+    #[test]
+    fn emphasis_and_laughter_survive() {
+        // All from the logs, all real: repetition is normal in speech and in
+        // singing, and only becomes a signal well past what a person does.
+        for text in ["너무 너무 너무 좋아요", "으 으 으 으", "하하하하하하", "오오오오오"] {
+            assert!(!is_hallucination(text), "{text} should be kept");
+        }
+    }
+
+    #[test]
+    fn a_run_has_to_be_consecutive() {
+        assert_eq!(longest_token_run("가 나 가 나 가 나 가 나"), 1);
+        assert_eq!(longest_token_run(""), 0);
+    }
+
+    #[test]
+    fn a_repeat_survives_the_partial_final_pair_between_it() {
+        // The loop whisper actually produced: each "감사합니다." was its own
+        // utterance, so a partial and a final alternate all the way down.
+        // Suppression must arrive despite the finals in between.
+        let mut n = 0;
+        n = next_repeat_count(n, false, false); // u7 partial, first sighting
+        assert_eq!(n, 0, "first sighting is not a repeat");
+        n = next_repeat_count(n, false, true); // u7 final, completing
+        n = next_repeat_count(n, true, false); // u8 partial — the one allowed repeat
+        assert_eq!(n, 1);
+        n = next_repeat_count(n, false, true); // u8 final, completing
+        assert_eq!(n, 1, "a completing final must not clear the evidence");
+        n = next_repeat_count(n, true, false); // u9 partial — a loop
+        assert!(n >= 2, "the third sighting should be suppressed, got {n}");
+    }
+
+    #[test]
+    fn a_different_sentence_clears_the_count() {
+        let n = next_repeat_count(3, false, false);
+        assert_eq!(n, 0);
     }
 
     #[test]
