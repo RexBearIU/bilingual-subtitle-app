@@ -25,6 +25,15 @@ export const setClickThrough = (mode: ClickThroughMode) =>
 export const setHitRegions = (regions: HitRect[]) =>
   invoke<void>("set_hit_regions", { regions });
 
+/**
+ * Put `text` on the system clipboard.
+ *
+ * Rust does the write, not `navigator.clipboard`: Chromium refuses one while
+ * the document is unfocused, which is the normal state for this overlay.
+ */
+export const copyToClipboard = (text: string) =>
+  invoke<void>("copy_to_clipboard", { text });
+
 /** Switch the active translation provider. Takes effect on the next subtitle. */
 export const setTranslateProvider = (index: number) =>
   invoke<void>("set_translate_provider", { index });

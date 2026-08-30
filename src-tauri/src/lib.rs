@@ -59,6 +59,10 @@ pub fn run() {
         .manage(Mutex::new(state::AsrProc(None)))
         .manage(Mutex::new(settings::SettingsPath(std::path::PathBuf::new())))
         .manage(translate::Registry::default())
+        // Registered here rather than in `setup` because `app.clipboard()`
+        // resolves plugin state: without this the copy command compiles and
+        // then panics the first time it is called.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             commands::start_captioning,
             commands::stop_captioning,
@@ -77,6 +81,7 @@ pub fn run() {
             commands::update_settings,
             commands::list_audio_processes,
             commands::set_capture_process,
+            commands::copy_to_clipboard,
         ])
         .setup(move |app| {
             // First, so the rest of setup can log. Everything below — the

@@ -15,6 +15,7 @@
     | "stop"
     | "pin"
     | "captions"
+    | "copy"
     | "gear"
     | "spark"
     | "mouse-off"
@@ -51,6 +52,11 @@
   {:else if name === "captions"}
     <rect x="1.8" y="3.4" width="12.4" height="9.2" rx="2" />
     <path d="M6.4 6.9a1.9 1.9 0 1 0 0 2.2M11.4 6.9a1.9 1.9 0 1 0 0 2.2" />
+  {:else if name === "copy"}
+    <!-- Two offset sheets. A clipboard-with-clip was tried and its clip
+         disappears at 14 px, leaving a shape indistinguishable from "captions". -->
+    <rect x="5.4" y="5.4" width="8.2" height="8.2" rx="1.6" />
+    <path d="M10.6 3.2a1.6 1.6 0 0 0-1.6-1.6H4a1.6 1.6 0 0 0-1.6 1.6v5a1.6 1.6 0 0 0 1.6 1.6" />
   {:else if name === "gear"}
     <!-- Sliders, not a gear. A gear's teeth collapse into a sun at 14 px;
          three tracks with knobs stay readable and say "settings" just as well. -->

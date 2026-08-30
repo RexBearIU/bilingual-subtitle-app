@@ -406,6 +406,23 @@ pub fn set_click_through(mode: ClickThrough, state: Db, app: AppHandle) -> Resul
 /// Called by the frontend whenever its layout changes. In CSS pixels relative
 /// to the window's client area; the hit-test thread converts to screen
 /// coordinates, since it is the side that knows the position and DPI scale.
+/// Put `text` on the system clipboard.
+///
+/// The write happens here rather than through `navigator.clipboard` in the
+/// webview on purpose: Chromium refuses a clipboard write while the document
+/// is unfocused, and the whole point of the copy hotkey is to reach a subtitle
+/// while the user is looking at the video in another window.
+#[tauri::command]
+pub fn copy_to_clipboard(text: String, app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let chars = text.chars().count();
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("clipboard write failed: {e}"))?;
+    log::info!("copied {chars} chars of subtitle to the clipboard");
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_hit_regions(regions: Vec<HitRect>, app: AppHandle) -> Result<(), String> {
     log::debug!(
