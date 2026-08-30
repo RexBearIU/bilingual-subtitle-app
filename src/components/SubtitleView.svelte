@@ -1,23 +1,11 @@
 <script lang="ts">
-  import type { Lang, SubtitleUpdate } from "../lib/types";
+  import type { SubtitleUpdate } from "../lib/types";
+  import { linesFor } from "../lib/subtitle-lines";
+  import { overlay } from "../lib/subtitles.svelte";
+  import Icon from "./Icon.svelte";
 
   let { segments, fontSize }: { segments: SubtitleUpdate[]; fontSize: number } =
     $props();
-
-  // Order: source-language line first (original), then the translation(s).
-  const LANG_ORDER: Lang[] = ["zh", "ko", "en"];
-
-  function linesFor(update: SubtitleUpdate) {
-    const out: { lang: Lang; text: string; primary: boolean }[] = [];
-    const subs = update.subtitles;
-    const src = update.sourceLang as Lang;
-    // Translation first (white, prominent), source below (gray, small).
-    for (const l of LANG_ORDER) {
-      if (l !== src && subs[l]) out.push({ lang: l, text: subs[l]!, primary: false });
-    }
-    if (subs[src]) out.push({ lang: src, text: subs[src]!, primary: true });
-    return out;
-  }
 </script>
 
 <div class="subtitle-stack" style:font-size="{fontSize}px">
@@ -43,6 +31,20 @@
             {line.text}
           </div>
         {/each}
+        <!-- `data-hit` is what makes this clickable at all: the overlay passes
+             the mouse straight through everything untagged (ADR-0012). Only
+             this button's own rectangle is registered, so the subtitle it sits
+             on keeps letting clicks reach the video underneath. -->
+        <button
+          class="copy"
+          class:copied={overlay.copiedId === seg.id}
+          data-hit
+          onclick={() => overlay.copySegment(seg.id)}
+          onpointerenter={() => overlay.hold(seg.id)}
+          onpointerleave={() => overlay.hold(null)}
+          aria-label="複製這句"
+          title={overlay.copiedId === seg.id ? "已複製" : "複製這句"}
+        ><Icon name="copy" size={18} /></button>
       </div>
     {/each}
   {/if}
@@ -59,12 +61,15 @@
   }
 
   .segment {
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 0.15em;
     align-items: center;
     text-align: center;
-    padding: 0.35em 0.9em;
+    /* Right padding leaves the copy button a lane of its own, so a long line
+       cannot run underneath it. */
+    padding: 0.35em 2.6em 0.35em 0.9em;
     border-radius: 14px;
     /* --subtitle-bg-opacity is set by App.svelte from the saved settings (default 0.55). */
     background: rgba(0, 0, 0, var(--subtitle-bg-opacity, 0.55));
@@ -93,6 +98,41 @@
   .secondary {
     color: #ffffff;
     font-weight: 600;
+  }
+
+  /* Sits inside the bubble, dim until pointed at. It cannot be revealed on
+     hover-of-the-segment the way a normal web UI would: the segment itself
+     never receives the mouse, only this button does. So it is always present
+     and always clickable, just quiet. */
+  /* Full-height rather than a small square in the corner. It is sized in `em`
+     off the subtitle text, so raising the caption font size makes the target
+     bigger too — and this is a target you reach for while the line is still on
+     screen, so it has to be hittable at a glance. */
+  .copy {
+    position: absolute;
+    top: 0.25em;
+    bottom: 0.25em;
+    right: 0.3em;
+    width: 2em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: none;
+    border-radius: 0.35em;
+    background: transparent;
+    color: #ffffff;
+    opacity: 0.22;
+    cursor: pointer;
+    transition: opacity 0.12s ease, background 0.12s ease;
+  }
+  .copy:hover {
+    opacity: 0.95;
+    background: rgba(255, 255, 255, 0.14);
+  }
+  .copy.copied {
+    opacity: 1;
+    color: #7fd18a;
   }
 
   .placeholder {

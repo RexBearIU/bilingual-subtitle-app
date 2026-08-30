@@ -79,6 +79,17 @@
   let fontSize     = $derived(overlay.status?.fontSize        ?? 28);
   let clickThrough = $derived(overlay.status?.clickThrough    ?? "auto");
   let opacity      = $derived(overlay.status?.subtitleOpacity ?? 0.55);
+  // The control bar rides the caption font size rather than having a control
+  // of its own. Two sliders for "make it bigger" is one too many, and in
+  // practice nobody wants 48px captions under a bar built for 28px ones.
+  //
+  // Clamped because the two do not want the same range: captions are usable
+  // from 14 to 64 px, but a bar at 64/28 would eat the screen and one at 14/28
+  // would have unclickable buttons.
+  const BAR_BASE_PX = 28; // the caption size the bar's own numbers were drawn for
+  let uiScale = $derived(
+    Math.min(1.6, Math.max(0.8, (overlay.status?.fontSize ?? BAR_BASE_PX) / BAR_BASE_PX)),
+  );
 
   // Controls stay interactive except in full click-through mode.
   // We do not rely on mouseenter/leave (unreliable on Tauri transparent windows).
@@ -103,6 +114,7 @@
   }
 
   let pushQueued = false;
+  let lastPushed = "";
   function pushHitRegions() {
     // After layout, not during it: $effect runs before the browser has
     // recalculated the geometry we are about to measure.
@@ -110,7 +122,14 @@
     pushQueued = true;
     requestAnimationFrame(() => {
       pushQueued = false;
-      setHitRegions(collectHitRegions()).catch((e) =>
+      const regions = collectHitRegions();
+      // The observer below fires on every subtitle update. Comparing before
+      // sending keeps that from becoming an IPC call per frame; the rectangles
+      // only actually move when something opens, closes or resizes.
+      const key = JSON.stringify(regions);
+      if (key === lastPushed) return;
+      lastPushed = key;
+      setHitRegions(regions).catch((e) =>
         console.warn("setHitRegions failed", e),
       );
     });
@@ -122,6 +141,13 @@
     void showControls;
     void settingsOpen;
     void subsHidden;
+    // Each subtitle now carries its own copy button, and the bubble it sits in
+    // is re-laid-out on every update — new text, a different width, a moved
+    // button. The MutationObserver below cannot see that: rewriting a line
+    // changes a text node, which is neither a `data-hit` element nor an
+    // attribute, so the rectangle would keep pointing at where the button used
+    // to be and the click would fall through to the video.
+    void overlay.segments;
     pushHitRegions();
   });
 
@@ -130,7 +156,34 @@
     // no Svelte state changed.
     const ro = new ResizeObserver(pushHitRegions);
     ro.observe(document.documentElement);
-    return () => ro.disconnect();
+
+    // A `data-hit` element can appear without App knowing: the audio-source
+    // list is a child component's own state. Watching the DOM rather than
+    // adding another prop means the next popup cannot forget to say so —
+    // which is how the source list ended up unclickable in `auto` mode.
+    const mo = new MutationObserver((records) => {
+      const touchesHitRegion = records.some((r) => {
+        if (r.type === "attributes") return true;
+        const nodes = [...r.addedNodes, ...r.removedNodes];
+        return nodes.some(
+          (n) =>
+            n instanceof HTMLElement &&
+            (n.hasAttribute("data-hit") || n.querySelector("[data-hit]") !== null),
+        );
+      });
+      if (touchesHitRegion) pushHitRegions();
+    });
+    mo.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-hit"],
+    });
+
+    return () => {
+      ro.disconnect();
+      mo.disconnect();
+    };
   });
 
   // ── settings window sizing ─────────────────────────────────────────────────
@@ -183,11 +236,17 @@
 
 <main
   class="overlay"
-  style="--subtitle-bg-opacity: {opacity};"
+  style="--subtitle-bg-opacity: {opacity}; --ui-scale: {uiScale};"
   role="application"
 >
   {#if settingsOpen}
     <SettingsPanel status={overlay.status} onClose={closeSettings} />
+  {/if}
+
+  <!-- Deliberately NOT `data-hit`: a toast that swallowed clicks for a second
+       and a half after every copy would be worse than no toast. -->
+  {#if overlay.copiedNote}
+    <div class="toast">{overlay.copiedNote}</div>
   {/if}
 
   <!-- subtitles sit ABOVE the control bar so the bar stays at the bottom edge -->
@@ -233,6 +292,24 @@
   }
   .controls.visible:hover {
     opacity: 1;
+  }
+
+  .toast {
+    align-self: center;
+    margin-bottom: 6px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: rgba(20, 44, 26, 0.92);
+    border: 1px solid #2f6b3c;
+    color: #b8f0c2;
+    font-size: 12px;
+    font-weight: 600;
+    pointer-events: none;
+    animation: toast-in 0.14s ease;
+  }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: none; }
   }
 
   .stage {

@@ -66,6 +66,19 @@ fn asr_loop(
     set_asr_status(app, "ready");
 
     let infer_url = format!("{base}/inference");
+
+    // Separate agents so a partial can be abandoned while a final is not.
+    //
+    // A partial is a disposable preview: once it is later than the final it
+    // was previewing, waiting on it only holds up the queue behind it. A final
+    // is the subtitle, so it gets a generous ceiling that exists only to stop
+    // a wedged server hanging the pipeline for good.
+    let agent_partial = ureq::AgentBuilder::new()
+        .timeout_read(PARTIAL_INFER_TIMEOUT)
+        .build();
+    let agent_final = ureq::AgentBuilder::new()
+        .timeout_read(FINAL_INFER_TIMEOUT)
+        .build();
     let mut chunk_seq: u64 = 0; // for log messages only
     // Rolling prompt: last transcribed sentence passed back to whisper as
     // initial_prompt so it can maintain continuity across chunks (names,
@@ -78,6 +91,10 @@ fn asr_loop(
     // Track which utterance_id had a partial sent, so the following final chunk
     // is not incorrectly flagged as a consecutive repeat of the partial's text.
     let mut last_partial_utterance_id: Option<u64> = None;
+    // When the last preview translation was requested, per utterance. Resets
+    // with the utterance, so every long one gets previews and no short one
+    // pays for a call it does not need.
+    let mut last_preview: Option<(u64, std::time::Instant, String)> = None;
     // Languages of the last few ACCEPTED finals. A window with a majority
     // vote, not simply "the language of the last final": one hallucination that
     // gets through would otherwise become the reference, and then every correct
@@ -142,7 +159,17 @@ fn asr_loop(
         let lang_hint = state::read_state(app, |s| s.source_hint.lang_code().map(str::to_string))
             .unwrap_or(None);
 
-        let effective_prompt = last_prompt.as_deref();
+        // Whisper's prompt window is small and its cost is paid per request,
+        // so the context does not extend the prompt — it takes the front of it,
+        // and the rolling transcript keeps whatever is left. Total length is
+        // unchanged, and so is inference time.
+        //
+        // This is the half of the context that matters most: a name whisper
+        // never heard right cannot be repaired downstream, however good the
+        // translation prompt is.
+        let context = state::read_state(app, crate::state::effective_context).unwrap_or_default();
+        let prompt_buf = compose_prompt(&context, last_prompt.as_deref());
+        let effective_prompt = prompt_buf.as_deref();
 
         // Partial chunks are throw-away previews — greedy (1) is fast enough.
         // Final chunks get beam=5 for accuracy; Korean especially benefits from this.
@@ -156,8 +183,11 @@ fn asr_loop(
             duration_s,
             effective_prompt.map_or(0, |p| p.len()),
         );
+        let agent = if chunk.is_partial { &agent_partial } else { &agent_final };
         let t_infer = std::time::Instant::now();
-        match transcribe(&infer_url, &chunk, effective_prompt, lang_hint.as_deref(), beam_size) {
+        match transcribe(
+            agent, &infer_url, &chunk, effective_prompt, lang_hint.as_deref(), beam_size,
+        ) {
             Ok((text, lang, no_speech_prob)) => {
                 let infer_ms = t_infer.elapsed().as_millis();
                 let text = text.trim().to_string();
@@ -226,12 +256,21 @@ fn asr_loop(
                 // Skip the check for a final chunk that completes a partial of
                 // the same utterance — the partial already set last_valid_text
                 // to the same sentence.
+                //
+                // The exemption skips the check but must NOT clear the count.
+                // Every utterance is a partial followed by a final, so a reset
+                // here lands between every pair and the count can never reach
+                // 2.  Measured on Korean music: whisper emitted a bare
+                // "감사합니다." as its own utterance eight times in a row and
+                // all eight were accepted and translated.  The phrase is real
+                // speech in conversation, so a blocklist entry is the wrong
+                // tool; noticing that it never stops is the right one.
                 let is_completing_partial =
                     !chunk.is_partial && last_partial_utterance_id == Some(chunk.utterance_id);
                 let is_repeat = !is_completing_partial
                     && text.chars().count() < 60
                     && last_valid_text.as_deref().is_some_and(|prev| prev.trim() == text);
-                repeat_count = if is_repeat { repeat_count + 1 } else { 0 };
+                repeat_count = next_repeat_count(repeat_count, is_repeat, is_completing_partial);
                 if repeat_count >= 2 {
                     log::info!(
                         "ASR [u{}]: repeated {}× consecutively — suppressed ({infer_ms}ms): {text:?}",
@@ -284,16 +323,70 @@ fn asr_loop(
                     //     every good one, and the cost of being wrong here is a
                     //     subtitle cut mid-sentence.
                     let established = established_lang(&recent_langs);
-                    if established.is_some_and(|l| l != lang) {
+                    let cutting = if established.is_some_and(|l| l != lang) {
                         log::debug!(
                             "ASR u{subtitle_id}: partial lang {lang:?} != {established:?} \
                              — no early cut",
                         );
+                        false
                     } else if looks_complete(&text) {
                         cut_request.store(chunk.utterance_id, Ordering::Relaxed);
                         log::debug!("ASR u{subtitle_id}: sentence boundary — early cut requested");
+                        true
+                    } else {
+                        false
+                    };
+
+                    // 2c. Translate the preview, so the target language appears
+                    //     while the speaker is still talking.
+                    //
+                    //     Measured on a fast Korean sample: an utterance that
+                    //     ran to the 6 s cap showed its translation 7 s after
+                    //     the speaker began, of which the API call was 0.5 s.
+                    //     The first partial was already transcribed at 1 s, so
+                    //     nearly all of that wait bought nothing.
+                    //
+                    //     Throttled rather than one call per partial. Short
+                    //     utterances are cut by the sentence flush at ~2 s and
+                    //     never need a preview; only the long ones do, and they
+                    //     need one every few seconds, not every 1.5 s. This
+                    //     costs roughly two extra calls on a 6 s utterance and
+                    //     nothing at all on a short one.
+                    //     Four gates. Each one exists because the version
+                    //     without it was measured spending a call for nothing:
+                    //
+                    //     - audio: see PREVIEW_MIN_SAMPLES.
+                    //     - text: two seconds of audio can still transcribe to
+                    //       "아...", which renders as "啊……" and flashes on
+                    //       screen until the real sentence replaces it.
+                    //     - due: re-translating text that has not moved on buys
+                    //       a rewrite of the same line and nothing else.
+                    //     - cutting: the sentence flush was just asked to end
+                    //       this utterance, so the final is milliseconds away
+                    //       and a preview of it can only arrive later.
+                    let long_enough = chunk.samples.len() >= PREVIEW_MIN_SAMPLES;
+                    let worth_reading = is_worth_previewing(&text);
+                    let due = match &last_preview {
+                        Some((id, at, shown)) if *id == chunk.utterance_id => {
+                            at.elapsed() >= PREVIEW_MIN_GAP && *shown != text
+                        }
+                        _ => true,
+                    };
+                    if long_enough && worth_reading && due && !cutting {
+                        last_preview = Some((
+                            chunk.utterance_id,
+                            std::time::Instant::now(),
+                            text.clone(),
+                        ));
+                        send_translation(
+                            &translate_tx, app, subtitle_id, &text, &lang, &chunk, true,
+                        );
+                    } else {
+                        log::debug!(
+                            "ASR u{subtitle_id}: no preview (audio={long_enough} \
+                             text={worth_reading} due={due} cutting={cutting})",
+                        );
                     }
-                    log::debug!("ASR u{subtitle_id}: partial — translation skipped");
                     continue;
                 }
                 // Clear the partial tracker now that the final has arrived.
@@ -305,25 +398,7 @@ fn asr_loop(
                 }
                 recent_langs.push_back(lang.clone());
 
-                let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
-
-                let req = TranslationRequest {
-                    id: format!("asr_{subtitle_id}"),
-                    source_lang: lang,
-                    source_text: text,
-                    mode,
-                    started_at_ms: chunk.started_at_ms,
-                    ended_at_ms: chunk.ended_at_ms,
-                };
-                match translate_tx.try_send(req) {
-                    Ok(_) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                        log::warn!("ASR u{subtitle_id}: translation channel full, skipping");
-                    }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                        log::warn!("ASR u{subtitle_id}: translation channel closed");
-                    }
-                }
+                send_translation(&translate_tx, app, subtitle_id, &text, &lang, &chunk, false);
             }
             Err(e) => log::warn!("ASR chunk {chunk_seq} [u{}] error: {e}", chunk.utterance_id),
         }
@@ -369,6 +444,7 @@ fn looks_complete(text: &str) -> bool {
 /// noise, or music without lyrics — the caller should discard such results.
 /// Returns 0.0 when the field is absent.
 fn transcribe(
+    agent: &ureq::Agent,
     url: &str,
     chunk: &AudioChunk,
     prompt: Option<&str>,
@@ -376,10 +452,11 @@ fn transcribe(
     beam_size: Option<u32>,
 ) -> Result<(String, String, f32), String> {
     let wav = encode_wav_16bit(&chunk.samples);
-    let body = build_multipart(&wav, prompt, lang_hint, beam_size);
+    let body = build_multipart(&wav, prompt, lang_hint, beam_size, chunk.is_partial);
     let ct = format!("multipart/form-data; boundary={BOUNDARY}");
 
-    let response = ureq::post(url)
+    let response = agent
+        .post(url)
         .set("Content-Type", &ct)
         .send_bytes(&body)
         .map_err(|e| e.to_string())?;
@@ -438,7 +515,13 @@ fn transcribe(
 
 /// Build a `multipart/form-data` body with the WAV bytes, `verbose_json` format,
 /// an optional `initial_prompt` for continuity, and an optional `language` hint.
-fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, beam_size: Option<u32>) -> Vec<u8> {
+fn build_multipart(
+    wav: &[u8],
+    prompt: Option<&str>,
+    lang_hint: Option<&str>,
+    beam_size: Option<u32>,
+    fast: bool,
+) -> Vec<u8> {
     let mut body = Vec::new();
 
     // Part 1: audio file
@@ -490,10 +573,103 @@ fn build_multipart(wav: &[u8], prompt: Option<&str>, lang_hint: Option<&str>, be
         body.extend_from_slice(b.as_bytes());
     }
 
+    // `fast` asks the server to skip faster-whisper's temperature-fallback
+    // retries. Measured on bench/sample.wav, partial inference: p90 1078 ms ->
+    // 640 ms and max 9516 ms -> 2750 ms, with the median unchanged (562 -> 531).
+    // The whole cost is paid by repetitive audio - laughter, drawn-out vowels -
+    // which trips `compression_ratio_threshold` and gets decoded six times.
+    // Only partials use it; for a final the retry is what recovers a bad decode.
+    if fast {
+        let b = format!(
+            "\r\n--{BOUNDARY}\r\n\
+             Content-Disposition: form-data; name=\"fast\"\r\n\r\n\
+             true"
+        );
+        body.extend_from_slice(b.as_bytes());
+    }
+
     // Closing boundary
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
     body
 }
+
+/// An utterance shorter than this resolves on its own before a preview
+/// translation could arrive, so it never gets one.
+///
+/// Set from measurement, not taste. Over one session, eight of ten utterances
+/// ended between 2.88 s and 3.31 s, and partials fire at 1.0 / 2.5 / 4.0 s —
+/// so a 2 s threshold let the 2.5 s partial through on nearly every utterance,
+/// doubling the translation calls to gain, in half of them, nothing at all:
+/// the preview took 500 ms to come back and the final was already there.
+///
+/// At 3.5 s only utterances that have outlived the typical one get a preview,
+/// which is exactly the set that was waiting on the 6 s cap. The two long ones
+/// in that session — 4.93 s and 5.72 s — still qualify.
+const PREVIEW_MIN_SAMPLES: usize = crate::pipeline::chunker::SAMPLE_RATE * 7 / 2; // 3.5 s
+
+/// Total characters of `initial_prompt` sent to whisper.
+///
+/// Unchanged from when the prompt was the rolling transcript alone, which is
+/// what keeps inference time where it was.
+const PROMPT_BUDGET: usize = 200;
+
+/// The share of that budget the user's context may take.
+///
+/// Half: enough for the names and the setting, while leaving the transcript
+/// enough room to carry a sentence across a chunk boundary.
+const CONTEXT_SHARE: usize = PROMPT_BUDGET / 2;
+
+/// Build whisper's `initial_prompt` from the user's context and recent text.
+///
+/// Context first, because whisper weights the beginning of the prompt most,
+/// and it is the part that does not change. Both halves are trimmed on char
+/// boundaries — a byte slice panics inside a multi-byte character, and Korean
+/// runs three bytes each.
+fn compose_prompt(context: &str, recent: Option<&str>) -> Option<String> {
+    let ctx: String = context.trim().chars().take(CONTEXT_SHARE).collect();
+    let room = PROMPT_BUDGET - ctx.chars().count();
+    let tail: String = match recent {
+        Some(r) => {
+            let n = r.chars().count();
+            r.chars().skip(n.saturating_sub(room)).collect()
+        }
+        None => String::new(),
+    };
+    let joined = match (ctx.is_empty(), tail.is_empty()) {
+        (true, true) => return None,
+        (false, true) => ctx,
+        (true, false) => tail,
+        (false, false) => format!("{ctx} {tail}"),
+    };
+    Some(joined)
+}
+
+/// How long to wait for a partial's transcription before abandoning it.
+///
+/// Measured over one session: median 328 ms, p90 1047 ms — but repetitive
+/// audio (laughter, drawn-out vowels) sent the same call to 2.9 s, and 7.9 s
+/// in an earlier one. A partial that late has already been overtaken by its
+/// own final, and because the worker is serial it delays everything behind it.
+const PARTIAL_INFER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The same ceiling for a final, but far higher: giving up on a final loses
+/// that subtitle outright, so this exists only to stop a wedged server hanging
+/// the pipeline forever.
+const FINAL_INFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Letters a preview needs before it is worth translating.
+///
+/// Counted over alphabetic characters, so trailing dots and quotes do not
+/// stand in for content. Four is enough to clear interjections — "아", "어",
+/// "음" — while passing any real clause, including a short Korean one.
+const PREVIEW_MIN_CHARS: usize = 4;
+
+/// Minimum spacing between preview translations of the same utterance.
+///
+/// Partials arrive every 1.5 s. Translating each one triples the call count
+/// for no benefit the eye can use — the text barely changes between two of
+/// them, and the subtitle would rewrite itself faster than it can be read.
+const PREVIEW_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How many recent accepted finals decide "the language being spoken".
 const LANG_WINDOW: usize = 5;
@@ -514,6 +690,97 @@ fn established_lang(recent: &std::collections::VecDeque<String>) -> Option<&str>
     let n = recent.iter().filter(|x| *x == best).count();
     (n * 2 > recent.len()).then_some(best.as_str())
 }
+
+/// Whether a preview says enough to be worth a translation call.
+///
+/// Length of audio is not a proxy for this: a two-second chunk of someone
+/// drawing breath transcribes to a single syllable, and translating it spends
+/// a call to put a word on screen that the real sentence overwrites a moment
+/// later.
+fn is_worth_previewing(text: &str) -> bool {
+    text.chars().filter(|c| c.is_alphabetic()).count() >= PREVIEW_MIN_CHARS
+}
+
+/// Queue one translation request, dropping it if the worker is behind.
+///
+/// Dropping rather than blocking, for both previews and finals: the ASR worker
+/// is the only thing feeding the on-screen source text, and stalling it to wait
+/// on a translation would freeze the subtitle that is already readable.
+#[allow(clippy::too_many_arguments)]
+fn send_translation(
+    tx: &std::sync::mpsc::SyncSender<TranslationRequest>,
+    app: &AppHandle,
+    subtitle_id: u64,
+    text: &str,
+    lang: &str,
+    chunk: &AudioChunk,
+    is_partial: bool,
+) {
+    let mode = state::read_state(app, |s| s.mode).unwrap_or_default();
+    let req = TranslationRequest {
+        id: format!("asr_{subtitle_id}"),
+        source_lang: lang.to_string(),
+        source_text: text.to_string(),
+        mode,
+        is_partial,
+        started_at_ms: chunk.started_at_ms,
+        ended_at_ms: chunk.ended_at_ms,
+    };
+    let kind = if is_partial { "preview" } else { "final" };
+    match tx.try_send(req) {
+        Ok(()) => log::debug!("ASR u{subtitle_id}: {kind} translation queued"),
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            log::warn!("ASR u{subtitle_id}: translation channel full, {kind} skipped");
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            log::warn!("ASR u{subtitle_id}: translation channel closed");
+        }
+    }
+}
+
+/// Advance the consecutive-repeat counter.
+///
+/// `is_completing_partial` holds the count where it is rather than resetting
+/// it: a final that completes its own partial repeats that partial's text by
+/// construction, so it is evidence neither for a loop nor against one.
+fn next_repeat_count(prev: u32, is_repeat: bool, is_completing_partial: bool) -> u32 {
+    if is_completing_partial {
+        prev
+    } else if is_repeat {
+        prev + 1
+    } else {
+        0
+    }
+}
+
+/// The longest run of one token repeated back-to-back.
+///
+/// Whisper's decoder sometimes falls into a repetition loop and emits the same
+/// word until it runs out of budget. Measured on Korean music with large-v3:
+/// one final chunk came back as "너무" about two hundred times, and took
+/// 2727 ms against a ~380 ms median — a repetitive result trips
+/// `compression_ratio_threshold`, so faster-whisper re-ran the whole decode at
+/// all six fallback temperatures and got the same loop every time.
+///
+/// Whitespace-separated tokens only. Runs of one CHARACTER are deliberately
+/// not counted: "하하하하하하" and "오오오오오" appear in the same logs as real
+/// laughter and real singing.
+fn longest_token_run(text: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    let mut prev: Option<&str> = None;
+    for tok in text.split_whitespace() {
+        run = if prev == Some(tok) { run + 1 } else { 1 };
+        longest = longest.max(run);
+        prev = Some(tok);
+    }
+    longest
+}
+
+/// A token repeated this many times in a row is a decoder loop, not speech.
+/// The measured loop ran to ~200; the longest genuine repeat in the same logs
+/// was four ("으 으 으 으"), so there is a wide margin either side.
+const MAX_TOKEN_RUN: usize = 6;
 
 /// Return `true` if `text` looks like a Whisper hallucination that should be
 /// silently dropped.
@@ -545,6 +812,23 @@ fn is_hallucination(text: &str) -> bool {
         "thank you for watching",
         "like and subscribe",
         "please subscribe",
+        "see you in the next video",
+        // Korean. Measured on one session of Korean music: these four were the
+        // FOUR MOST FREQUENT outputs of any kind, 46 lines between them, more
+        // than any real sentence — and none of them was said. Whisper has the
+        // stock credits of Korean-subtitled YouTube memorised and reaches for
+        // them whenever singing gives it nothing else to transcribe.
+        //
+        // They were also being accepted, which put them into the rolling
+        // initial_prompt, where they primed the next chunk to produce them
+        // again. Suppressing happens before the prompt is updated, so this
+        // breaks that loop as well as hiding the line.
+        "한글자막",              // "Korean subtitles by …" — a credit, never speech
+        "한효정",                // the name the credit is memorised with
+        "다음 영상에서 만나요",   // "see you in the next video"
+        "시청해주셔서 감사합니다",
+        "시청해 주셔서 감사합니다",
+        "구독과 좋아요",         // "subscribe and like"
         // Whisper event markers that leak out of bracket detection
         "[music]",
         "[blank_audio]",
@@ -555,7 +839,14 @@ fn is_hallucination(text: &str) -> bool {
         "[박수]",   // Korean [Applause]
     ];
     let lower = t.to_lowercase();
-    DENY.iter().any(|&h| lower.contains(h))
+    if DENY.iter().any(|&h| lower.contains(h)) {
+        return true;
+    }
+
+    // 3. A decoder repetition loop. Unlike the list above this needs no
+    //    per-phrase knowledge — it recognises the shape of a broken decode,
+    //    whatever language it broke in.
+    longest_token_run(t) >= MAX_TOKEN_RUN
 }
 
 /// Detect the dominant script of `text` and map it to a language code.
@@ -691,6 +982,176 @@ fn encode_wav_16bit(samples: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn korean_youtube_credits_are_hallucinations() {
+        // Verbatim from the log, including both terminal punctuations whisper
+        // alternated between.
+        for text in [
+            "한글자막 by 한효정",
+            "다음 영상에서 만나요.",
+            "다음 영상에서 만나요!",
+            "시청해주셔서 감사합니다.",
+        ] {
+            assert!(is_hallucination(text), "{text} should be suppressed");
+        }
+    }
+
+    #[test]
+    fn a_decoder_loop_is_a_hallucination() {
+        // Shortened from the measured case, which ran to about two hundred.
+        let loop_text = "너무 ".repeat(30);
+        assert!(is_hallucination(&loop_text));
+        assert_eq!(longest_token_run(&loop_text), 30);
+    }
+
+    #[test]
+    fn emphasis_and_laughter_survive() {
+        // All from the logs, all real: repetition is normal in speech and in
+        // singing, and only becomes a signal well past what a person does.
+        for text in ["너무 너무 너무 좋아요", "으 으 으 으", "하하하하하하", "오오오오오"] {
+            assert!(!is_hallucination(text), "{text} should be kept");
+        }
+    }
+
+    #[test]
+    fn a_run_has_to_be_consecutive() {
+        assert_eq!(longest_token_run("가 나 가 나 가 나 가 나"), 1);
+        assert_eq!(longest_token_run(""), 0);
+    }
+
+    #[test]
+    fn a_repeat_survives_the_partial_final_pair_between_it() {
+        // The loop whisper actually produced: each "감사합니다." was its own
+        // utterance, so a partial and a final alternate all the way down.
+        // Suppression must arrive despite the finals in between.
+        let mut n = 0;
+        n = next_repeat_count(n, false, false); // u7 partial, first sighting
+        assert_eq!(n, 0, "first sighting is not a repeat");
+        n = next_repeat_count(n, false, true); // u7 final, completing
+        n = next_repeat_count(n, true, false); // u8 partial — the one allowed repeat
+        assert_eq!(n, 1);
+        n = next_repeat_count(n, false, true); // u8 final, completing
+        assert_eq!(n, 1, "a completing final must not clear the evidence");
+        n = next_repeat_count(n, true, false); // u9 partial — a loop
+        assert!(n >= 2, "the third sighting should be suppressed, got {n}");
+    }
+
+    #[test]
+    fn a_different_sentence_clears_the_count() {
+        let n = next_repeat_count(3, false, false);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn real_korean_speech_is_not_suppressed() {
+        // From the same session, spoken by an actual person.
+        for text in [
+            "약간 직설적인 스타일이 잘 맞는 것 같아요",
+            "사람을 사귈 때도 은근 엄청 가려요",
+            "너무 예민해요 진짜 저는",
+            "아 그럼 뭔 상관이에요",
+        ] {
+            assert!(!is_hallucination(text), "{text} should be kept");
+        }
+    }
+
+    #[test]
+    fn a_context_never_lengthens_the_prompt() {
+        // The whole point: whisper's prompt costs time per request, so adding
+        // context must displace transcript, not extend the prompt.
+        let ctx = "x".repeat(500);
+        let recent = "y".repeat(500);
+        let p = compose_prompt(&ctx, Some(&recent)).expect("some prompt");
+        assert!(
+            p.chars().count() <= PROMPT_BUDGET + 1, // +1 for the joining space
+            "{} chars exceeds the budget",
+            p.chars().count(),
+        );
+    }
+
+    #[test]
+    fn the_context_comes_first_and_the_transcript_keeps_its_tail() {
+        let p = compose_prompt("LPL 轉播", Some("...早先的字 最後這幾個字")).unwrap();
+        assert!(p.starts_with("LPL 轉播"), "{p:?}");
+        assert!(p.ends_with("最後這幾個字"), "{p:?}");
+    }
+
+    #[test]
+    fn either_half_may_be_missing() {
+        assert_eq!(compose_prompt("", None), None);
+        assert_eq!(compose_prompt("only ctx", None).as_deref(), Some("only ctx"));
+        assert_eq!(compose_prompt("", Some("only recent")).as_deref(), Some("only recent"));
+    }
+
+    #[test]
+    fn trimming_lands_on_char_boundaries() {
+        // Korean is three bytes a character; a byte slice here would panic.
+        let ctx = "한".repeat(300);
+        let recent = "국".repeat(300);
+        let p = compose_prompt(&ctx, Some(&recent)).unwrap();
+        assert!(p.chars().count() <= PROMPT_BUDGET + 1);
+    }
+
+    /// Prefix lengths the chunker flushes as partials, in samples.
+    fn partials_of(utterance_secs: f64) -> Vec<usize> {
+        use crate::pipeline::chunker::{PARTIAL_FLUSH_SAMPLES, PARTIAL_REFRESH_SAMPLES};
+        let total = (utterance_secs * crate::pipeline::chunker::SAMPLE_RATE as f64) as usize;
+        let mut out = Vec::new();
+        let mut n = PARTIAL_FLUSH_SAMPLES;
+        while n < total {
+            out.push(n);
+            n += PARTIAL_REFRESH_SAMPLES;
+        }
+        out
+    }
+
+    /// Partials that clear the audio gate — the ones that can become previews.
+    fn eligible_previews(utterance_secs: f64) -> usize {
+        partials_of(utterance_secs).into_iter().filter(|&n| n >= PREVIEW_MIN_SAMPLES).count()
+    }
+
+    #[test]
+    fn a_typical_utterance_never_reaches_the_preview_threshold() {
+        // Measured over one session. Partials fire at 1.0 / 2.5 / 4.0 s, so an
+        // utterance this length only ever produces partials below the gate —
+        // and each of these finished before a preview could have come back.
+        for ended in [2.88, 3.09, 3.31, 3.71] {
+            assert_eq!(eligible_previews(ended), 0, "{ended}s should not preview");
+        }
+    }
+
+    #[test]
+    fn an_utterance_that_runs_long_gets_a_preview() {
+        // The two from that session that were actually worth previewing: one
+        // cut by silence at 4.93 s, one that ran into the 6 s cap.
+        for ended in [4.93, 5.72] {
+            assert!(eligible_previews(ended) >= 1, "{ended}s should preview");
+        }
+    }
+
+    #[test]
+    fn an_interjection_is_not_worth_previewing() {
+        // Measured: 2.0 s of audio transcribed to this, was translated as
+        // "啊……", and was replaced one second later by the real sentence.
+        assert!(!is_worth_previewing("\u{c544}..."));
+        assert!(!is_worth_previewing("\u{c5b4}"));
+        assert!(!is_worth_previewing("..."));
+        assert!(!is_worth_previewing(""));
+    }
+
+    #[test]
+    fn a_real_clause_is_worth_previewing() {
+        // From the same session — the partial that produced a useful preview.
+        assert!(is_worth_previewing("\u{b9d0}\u{c740} \u{b2f9}\u{d588}..."));
+        assert!(is_worth_previewing("that works"));
+    }
+
+    #[test]
+    fn punctuation_does_not_count_towards_the_minimum() {
+        // Three letters dressed up with padding is still three letters.
+        assert!(!is_worth_previewing("\u{c544}\u{c544}\u{c544}!!!???\"\"\""));
+    }
+
     fn window(langs: &[&str]) -> std::collections::VecDeque<String> {
         langs.iter().map(|s| s.to_string()).collect()
     }

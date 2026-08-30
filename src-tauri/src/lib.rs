@@ -59,6 +59,10 @@ pub fn run() {
         .manage(Mutex::new(state::AsrProc(None)))
         .manage(Mutex::new(settings::SettingsPath(std::path::PathBuf::new())))
         .manage(translate::Registry::default())
+        // Registered here rather than in `setup` because `app.clipboard()`
+        // resolves plugin state: without this the copy command compiles and
+        // then panics the first time it is called.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             commands::start_captioning,
             commands::stop_captioning,
@@ -77,6 +81,7 @@ pub fn run() {
             commands::update_settings,
             commands::list_audio_processes,
             commands::set_capture_process,
+            commands::copy_to_clipboard,
         ])
         .setup(move |app| {
             // First, so the rest of setup can log. Everything below — the
@@ -86,6 +91,15 @@ pub fn run() {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
+                        // The default is a small file with KeepOne, which
+                        // TRUNCATES on overflow — a minute of captioning at
+                        // debug level overruns it, and every investigation
+                        // starts by finding only the last few seconds. Big
+                        // enough for a long session, and keep the previous
+                        // file so a restart does not erase what was just
+                        // reproduced.
+                        .max_file_size(5_000_000)
+                        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                         // Our own code: full debug
                         .level(log::LevelFilter::Debug)
                         // External crates: warn-only (suppress ureq/wasapi spam)
@@ -126,6 +140,7 @@ pub fn run() {
                 if let Ok(mut s) = st.lock() {
                     s.mode = cfg.mode;
                     s.source_hint = cfg.source_hint;
+                    s.context = cfg.context.clone();
                     s.font_size = cfg.font_size;
                     s.subtitle_opacity = cfg.subtitle_opacity;
                     s.click_through = cfg.click_through;

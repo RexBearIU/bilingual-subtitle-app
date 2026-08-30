@@ -18,8 +18,9 @@
 //!    utterance_id (`is_partial = false`) so the frontend replaces the
 //!    partial in-place with the final transcription + translation.
 //!
-//! ## Music mode
-//! Fixed 10 s chunks; no partial or silence detection.
+//! This is the only segmentation policy.  A separate music mode (fixed 10 s
+//! chunks, no partials) used to compete with it for this code path and was
+//! removed with ADR-0015.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -41,11 +42,11 @@ const CHUNK_SAMPLES: usize = 96_000; // 6 s
 const MIN_FLUSH_SAMPLES: usize = SAMPLE_RATE / 2; // 0.5 s
 
 /// Send the first partial chunk after this many samples (video mode).
-const PARTIAL_FLUSH_SAMPLES: usize = SAMPLE_RATE; // 1 s
+pub const PARTIAL_FLUSH_SAMPLES: usize = SAMPLE_RATE; // 1 s
 
 /// Re-send an updated partial every additional 1.5 s while the utterance keeps
 /// going, so long utterances show live text instead of a stale 1 s preview.
-const PARTIAL_REFRESH_SAMPLES: usize = SAMPLE_RATE * 3 / 2; // 1.5 s
+pub const PARTIAL_REFRESH_SAMPLES: usize = SAMPLE_RATE * 3 / 2; // 1.5 s
 
 /// RMS below this is considered silence (≈ −46 dBFS).
 /// Conservative — only catches genuine quiet moments, not brief level dips.

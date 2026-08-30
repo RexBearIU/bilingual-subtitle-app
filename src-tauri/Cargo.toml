@@ -26,6 +26,7 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.2", features = ["tray-icon"] }
 tauri-plugin-log = "2"
+tauri-plugin-clipboard-manager = "2"
 rubato = "0.15"
 ureq = { version = "2", features = ["json"] }
 

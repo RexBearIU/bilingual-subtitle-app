@@ -19,7 +19,8 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 | `set_translate_providers` | `{ providers: ProviderDraft[] }` | `Result<()>` | Replace the whole list — add, remove, edit and reorder in one call. Persisted to `settings.json` |
 | `translate_preset_names` | — | `{ name, label }[]` | Providers with a built-in base URL, model and display label, so the add form can ask only for a key |
 | `set_always_on_top` | `{ enabled: bool }` | `Result<()>` | Re-asserts topmost; re-stacks above other topmost windows |
-| `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120) |
+| `set_font_size` | `{ size: number }` | `Result<()>` | px (clamped 10–120). Also scales the control bar — see ARCHITECTURE.md §Sizing |
+| `copy_to_clipboard` | `{ text: string }` | `Result<()>` | Written from Rust: Chromium refuses `navigator.clipboard` while the document is unfocused, which is this overlay's normal state |
 | `list_audio_processes` | — | `AudioProcess[]` | Windows processes with active audio sessions (for process picker) |
 | `set_capture_process` | `{ pid: number, name: string }` | `Result<()>` | Target a specific process; `pid: 0` = system-wide loopback. Takes effect on next `start_captioning`. |
 | `get_settings` | — | `PersistSettings` | For settings UI hydration |
@@ -32,7 +33,9 @@ and `src/lib/commands.ts` / `src/lib/types.ts`.
 ### `subtitle_update`
 
 ```ts
-type SubtitleMode = "none" | "zh" | "ko" | "en";
+// `zh` is Traditional — the name it carried before Simplified was added,
+// kept so an existing settings.json still selects what it always did.
+type SubtitleMode = "none" | "zh" | "zh-hans" | "ko" | "en";
 type SourceLang   = "ko" | "en" | "zh";
 
 interface SubtitleTexts {
@@ -91,6 +94,9 @@ interface EngineStatus {
   clickThroughActive: boolean; // whether the mouse is passing through right now
   alwaysOnTop: boolean;
   subtitleOpacity: number;    // 0.0–1.0, subtitle box background alpha
+  /** What the summariser inferred from the transcript. Empty when a note
+   *  was typed by hand, which wins outright. Never persisted. */
+  autoContext: string;
   translateProviders: ProviderInfo[]; // preference order; index 0 is tried first
   translateActive: number;    // index currently in use (moves on failover too)
   speechThreshold: number;    // retained for API compat — no longer used (VAD removed, ADR-0009)
@@ -159,7 +165,9 @@ interface ProviderDraft {
 ### `SubtitleMode`
 
 ```ts
-type SubtitleMode = "none" | "zh" | "ko" | "en";
+// `zh` is Traditional — the name it carried before Simplified was added,
+// kept so an existing settings.json still selects what it always did.
+type SubtitleMode = "none" | "zh" | "zh-hans" | "ko" | "en";
 ```
 
 - `"none"` — show source text only, no translation
@@ -186,6 +194,8 @@ interface PersistSettings {
   overlay: { x: number; y: number; w: number; h: number };
   clickThrough: ClickThroughMode;
   /** The ordered provider list. Every `apiKey` is ALWAYS returned as "". */
+  /** What this audio is about, in the user's words. "" = derive it. */
+  context: string;
   providers: { name: string; label: string; baseUrl: string; apiKey: string; model: string }[];
   openrouterApiKey: string;   // legacy, ALWAYS ""; migrated into `providers` on first launch
   openrouterModel: string;    // legacy, superseded by `providers`

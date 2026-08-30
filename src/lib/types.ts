@@ -4,7 +4,8 @@
 export type SourceHint = "auto" | "zh" | "ko" | "en";
 
 /** Target translation language. "none" = show source text only, no translation. */
-export type SubtitleMode = "none" | "zh" | "ko" | "en";
+/** `zh` is Traditional — the name it had before Simplified was added. */
+export type SubtitleMode = "none" | "zh" | "zh-hans" | "ko" | "en";
 export type SourceLang = "ko" | "en" | "zh";
 export type Lang = "zh" | "ko" | "en";
 
@@ -95,6 +96,8 @@ export interface EngineStatus {
   alwaysOnTop: boolean;
   subtitleOpacity: number;   // 0.0–1.0, controls subtitle box background alpha
   /** Configured providers in preference order; index 0 is tried first. */
+  /** What the summariser inferred from the transcript; empty if a note was typed. */
+  autoContext: string;
   translateProviders: ProviderInfo[];
   /** Index into `translateProviders` currently in use. */
   translateActive: number;
@@ -117,6 +120,8 @@ export interface OverlayRect {
 export interface PersistSettings {
   mode: SubtitleMode;
   sourceHint: SourceHint;
+  /** What the audio is about, in the user's words. Primes ASR and translation. */
+  context: string;
   fontSize: number;
   subtitleOpacity: number;
   overlay: OverlayRect;

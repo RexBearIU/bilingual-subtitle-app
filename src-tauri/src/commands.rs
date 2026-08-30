@@ -406,8 +406,33 @@ pub fn set_click_through(mode: ClickThrough, state: Db, app: AppHandle) -> Resul
 /// Called by the frontend whenever its layout changes. In CSS pixels relative
 /// to the window's client area; the hit-test thread converts to screen
 /// coordinates, since it is the side that knows the position and DPI scale.
+/// Put `text` on the system clipboard.
+///
+/// The write happens here rather than through `navigator.clipboard` in the
+/// webview on purpose: Chromium refuses a clipboard write while the document
+/// is unfocused, and the whole point of the copy hotkey is to reach a subtitle
+/// while the user is looking at the video in another window.
+#[tauri::command]
+pub fn copy_to_clipboard(text: String, app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let chars = text.chars().count();
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("clipboard write failed: {e}"))?;
+    log::info!("copied {chars} chars of subtitle to the clipboard");
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_hit_regions(regions: Vec<HitRect>, app: AppHandle) -> Result<(), String> {
+    log::debug!(
+        "hit regions: [{}]",
+        regions
+            .iter()
+            .map(|r| format!("{:.0}x{:.0}@{:.0},{:.0}", r.w, r.h, r.x, r.y))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     hittest::set_regions(&app, regions);
     Ok(())
 }
@@ -569,6 +594,7 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
     Ok(PersistSettings {
         mode: s.mode,
         source_hint: s.source_hint,
+        context: s.context.clone(),
         font_size: s.font_size,
         subtitle_opacity: s.subtitle_opacity,
         overlay: saved.overlay,
@@ -617,6 +643,15 @@ pub fn update_settings(
             let clamped = op.clamp(0.0, 1.0);
             s.subtitle_opacity = clamped;
             saved.subtitle_opacity = clamped;
+        }
+        if let Some(ref ctx) = patch.context {
+            // Bounded on the way in, so neither prompt can be pushed out of
+            // shape by a paste: whisper's own prompt window is small, and the
+            // translation system prompt is re-sent on every subtitle.
+            let ctx = ctx.trim().chars().take(CONTEXT_MAX_CHARS).collect::<String>();
+            log::info!("context → {} chars", ctx.chars().count());
+            s.context = ctx.clone();
+            saved.context = ctx;
         }
         if let Some(ref backend) = patch.asr_backend {
             let backend = backend.trim().to_lowercase();
@@ -704,12 +739,20 @@ pub fn update_settings(
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub subtitle_opacity: Option<f64>,
+    pub context: Option<String>,
     pub asr_backend: Option<String>,
     pub whisper_model: Option<String>,
     pub sensevoice_precision: Option<String>,
     pub speech_threshold: Option<f32>,
     pub overlay: Option<crate::settings::OverlayRect>,
 }
+
+/// Ceiling on the user's context note.
+///
+/// Whisper's `initial_prompt` window is small and shared with the rolling
+/// transcript, and the translation system prompt goes out with every subtitle.
+/// Both stay predictable only if this cannot grow without limit.
+pub const CONTEXT_MAX_CHARS: usize = 400;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -725,6 +768,7 @@ pub fn save_current_settings(app: &AppHandle) {
     let mut cfg = PersistSettings::load(&sp.0);
     cfg.mode = s.mode;
     cfg.source_hint = s.source_hint;
+    cfg.context = s.context.clone();
     cfg.font_size = s.font_size;
     cfg.subtitle_opacity = s.subtitle_opacity;
     cfg.click_through = s.click_through;

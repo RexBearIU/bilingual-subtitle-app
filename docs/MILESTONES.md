@@ -74,7 +74,7 @@ Tauri hot-rebuild round-trip 6.6 s.
 ## M3 — Audio chunking  ✅
 
 Fixed-chunk accumulator (replaced original RMS VAD — see ADR-0009).
-16 kHz mono · 4 s video chunks · 10 s music-mode chunks · stop-flush ≥ 0.5 s.
+16 kHz mono · 4 s chunks · stop-flush ≥ 0.5 s.
 **Acceptance:** audio reaches ASR in regularly-sized chunks · silence handled
 by Whisper `no_speech_prob` · no memory growth over long sessions.
 
@@ -203,7 +203,9 @@ Separate worker threads + bounded channels · drop stale chunks under back-press
   chunks unconditionally. Silence filtered by Whisper `no_speech_prob ≥ 0.7`
   instead of RMS gating (more reliable for video/stream content — ADR-0009).
 - **Music mode** — fixed 10 s chunks + "Song lyrics:" prompt; beam_size=3 for
-  better lyric accuracy. Music mode is the only remaining chunk-size variant.
+  better lyric accuracy. _Removed by ADR-0015: it was a second segmentation
+  policy competing with the graduated chunker, and unused. There is no
+  music-specific path in the code today._
 - **Zombie sidecar cleanup** — `kill_port()` helper in `commands.rs` runs
   `netstat -ano` + `taskkill /F /PID` before each sidecar launch to evict
   leftover processes from a previous session that didn't clean up (e.g. after

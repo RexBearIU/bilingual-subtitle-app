@@ -49,10 +49,11 @@ pub fn start_translate_worker(
     app: AppHandle,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    transcript: Arc<translate::summarize::Transcript>,
 ) {
     std::thread::Builder::new()
         .name("translate-worker".into())
-        .spawn(move || translate_loop(rx, &app, &stop, &active))
+        .spawn(move || translate_loop(rx, &app, &stop, &active, &transcript))
         .expect("spawn translate-worker thread");
 }
 
@@ -63,6 +64,7 @@ fn translate_loop(
     app: &AppHandle,
     stop: &Arc<AtomicBool>,
     active: &Arc<AtomicUsize>,
+    transcript: &Arc<translate::summarize::Transcript>,
 ) {
     set_tl_status(app, "loading");
 
@@ -163,33 +165,57 @@ fn translate_loop(
     const CTX_PAIRS: usize = 3;
     let mut history: std::collections::VecDeque<(String, String)> =
         std::collections::VecDeque::with_capacity(CTX_PAIRS);
+    // Set when coalescing passed over a request to finish a final first. The
+    // channel has no push-back, so it is held here until the next iteration.
+    let mut deferred: Option<TranslationRequest> = None;
     // What the history was collected under. The prior turns are re-rendered
     // with the CURRENT `[source→target]` tag, so carrying them across a change
     // tells the model a Korean line was English.
     let mut ctx_for: Option<(String, SubtitleMode)> = None;
     let mut ctx_end_ms: u64 = 0;
+    let mut cache = TranslationCache::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let mut req = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(r) => r,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        let mut req = match deferred.take() {
+            Some(r) => r,
+            None => match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(r) => r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
         };
-        // If we fell behind, translate only the NEWEST request — the older
-        // subtitles are already scrolling away, and the visible line going
-        // untranslated is worse than an old line keeping its source text.
-        // This matters more with a hosted model than it did locally: network
-        // latency is spikier than a warm GPU, so backlogs form more often.
+        // If we fell behind, drop stale PREVIEWS and translate the newest
+        // request — an old preview is worthless, since the line it previewed
+        // has already been spoken to the end.
+        //
+        // A final is never dropped this way. It is the version that stays on
+        // screen and the only one allowed to become context, so skipping it
+        // would leave that subtitle in its source language for good. When a
+        // final is passed over in favour of something newer, it is translated
+        // first and the newer request is put back at the front of the queue.
         let mut skipped = 0u32;
         while let Ok(newer) = rx.try_recv() {
+            let (now, later) = coalesce(req, newer);
+            req = now;
+            if later.is_some() {
+                deferred = later;
+                break;
+            }
             skipped += 1;
-            req = newer;
         }
         if skipped > 0 {
-            log::info!("TL: backlog — skipped {skipped} stale request(s), translating newest");
+            log::info!("TL: backlog — skipped {skipped} stale preview(s), translating newest");
+        }
+
+        // Feed the summariser. Finals only — a preview is a fragment of a line
+        // that is about to arrive complete, and counting both would fill the
+        // window with half-sentences. Before the mode branches below, so the
+        // summary still builds when translation is switched off entirely.
+        if !req.is_partial && !req.source_text.trim().is_empty() {
+            transcript.push(&req.source_text);
         }
 
         // "No translation" mode — just promote source text to final subtitle.
@@ -206,7 +232,7 @@ fn translate_loop(
                 source_text: req.source_text.clone(),
                 mode: req.mode,
                 subtitles,
-                is_final: true,
+                is_final: !req.is_partial,
                 started_at_ms: Some(req.started_at_ms),
                 ended_at_ms: Some(req.ended_at_ms),
             };
@@ -215,10 +241,11 @@ fn translate_loop(
         }
 
         let target = req.mode.target_lang();
-        log::info!("TL [{}→{}]: {:?}", req.source_lang, target, req.source_text);
+        let kind = if req.is_partial { "preview" } else { "final" };
+        log::info!("TL [{}→{} {kind}]: {:?}", req.source_lang, target, req.source_text);
 
         // Source is already in the target language — nothing to translate.
-        if req.source_lang == target {
+        if is_noop_translation(&req.source_lang, target) {
             emit_translated(app, &req, req.source_text.clone());
             continue;
         }
@@ -231,12 +258,33 @@ fn translate_loop(
             continue;
         }
 
+        // Already translated this exact line — reuse it rather than pay for a
+        // round-trip that can come back worded differently.  Before the context
+        // bookkeeping below, which a cache hit still has to perform.
+        let cache_key = (req.source_lang.clone(), req.mode, req.source_text.clone());
+
         // Context is only useful while it is still the same conversation.
         let now = (req.source_lang.clone(), req.mode);
         if !context_survives(ctx_for.as_ref(), &now, req.started_at_ms.saturating_sub(ctx_end_ms)) {
             history.clear();
         }
         ctx_for = Some(now);
+
+        if let Some(hit) = cache.get(&cache_key) {
+            log::info!("TL [{} → {target} {kind}] cached → {hit:?}", req.source_lang);
+            // A cache hit is still a translated final, so it still becomes
+            // context. Skipping that would leave a hole in the history the
+            // next request is built from.
+            if !req.is_partial {
+                if history.len() == CTX_PAIRS {
+                    history.pop_front();
+                }
+                history.push_back((req.source_text.clone(), hit.clone()));
+                ctx_end_ms = req.ended_at_ms;
+            }
+            emit_translated(app, &req, hit);
+            continue;
+        }
 
         let prev: Vec<(&str, &str)> = history
             .iter()
@@ -254,18 +302,29 @@ fn translate_loop(
             consecutive_failures = 0;
             counting_for = idx;
         }
+        let context = state::read_state(app, crate::state::effective_context).unwrap_or_default();
         match call_translate(
-            &agent, &provider, &req.source_lang, &req.source_text, req.mode, &prev,
+            &agent, &provider, &req.source_lang, &req.source_text, req.mode, &prev, &context,
         ) {
             Ok(translated) => {
                 consecutive_failures = 0;
                 let tl_ms = t_tl.elapsed().as_millis();
-                log::info!("TL [{} → {}] {tl_ms}ms → {:?}", req.source_lang, req.mode.target_lang(), translated);
-                if history.len() == CTX_PAIRS {
-                    history.pop_front();
+                log::info!(
+                    "TL [{} → {} {kind}] {tl_ms}ms → {:?}",
+                    req.source_lang, req.mode.target_lang(), translated,
+                );
+                // Previews are fragments of a sentence still being spoken.
+                // Feeding one back as a completed turn would teach the model
+                // that half-sentences are what a finished translation looks
+                // like, and every later subtitle would inherit that.
+                if !req.is_partial {
+                    if history.len() == CTX_PAIRS {
+                        history.pop_front();
+                    }
+                    history.push_back((req.source_text.clone(), translated.clone()));
+                    ctx_end_ms = req.ended_at_ms;
                 }
-                history.push_back((req.source_text.clone(), translated.clone()));
-                ctx_end_ms = req.ended_at_ms;
+                cache.put(cache_key, translated.clone());
                 emit_translated(app, &req, translated);
             }
             Err(e) => {
@@ -301,6 +360,40 @@ fn translate_loop(
 
     set_tl_status(app, "unloaded");
     log::info!("translate worker exited");
+}
+
+/// Whether a request needs no translation because it is already in the target.
+///
+/// Chinese is deliberately included, and this is worth knowing before
+/// "fixing" it: "zh" is one code for two scripts, so a Chinese source under
+/// the 繁中 target can arrive in Simplified and stay that way. That is a
+/// product decision, not an oversight — a reader of Chinese reads both
+/// scripts, so paying an API call and its latency on every line to convert
+/// between them buys nothing.
+///
+/// The script targets still do their job where it matters: ko→繁中 and
+/// en→简中 are real translations and honour the script they name. Only a
+/// source that is already Chinese short-circuits.
+fn is_noop_translation(source_lang: &str, target: &str) -> bool {
+    source_lang == target
+}
+
+/// Choose between the request in hand and a newer one waiting behind it.
+///
+/// Returns `(translate now, keep for later)`. A preview in hand is dropped for
+/// the newer request: the line it previewed has already been spoken to the end,
+/// so translating it buys nothing. A final in hand is never dropped — it is the
+/// version that stays on screen and the only one allowed to become context, so
+/// losing it would leave that subtitle in its source language permanently.
+fn coalesce(
+    current: TranslationRequest,
+    newer: TranslationRequest,
+) -> (TranslationRequest, Option<TranslationRequest>) {
+    if current.is_partial {
+        (newer, None)
+    } else {
+        (current, Some(newer))
+    }
 }
 
 /// Whether the rolling context still applies to the request about to be sent.
@@ -350,7 +443,7 @@ fn check_credentials(agent: &ureq::Agent, provider: &Provider) -> Result<(), Cre
 
 // ── prompting ───────────────────────────────────────────────────────────────
 
-fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
+fn build_system_prompt(source_lang: &str, target_name: &str, context: &str) -> String {
     let mut p = format!(
         "You are a real-time subtitle translator. \
          Output ONLY the {target_name} translation — no explanations, no additions. \
@@ -373,12 +466,26 @@ fn build_system_prompt(source_lang: &str, target_name: &str) -> String {
         );
     }
 
+    // What the user says this audio is about. Byte-identical on every request,
+    // so a provider with prompt caching charges for it once; the note is capped
+    // at 400 chars where it is stored, which bounds the cost where it is not.
+    let context = context.trim();
+    if !context.is_empty() {
+        p.push_str(
+            " The following describes what is being watched. Use it for names, \
+             titles and terminology; it is background, never something to \
+             translate or mention: ",
+        );
+        p.push_str(context);
+    }
+
     p
 }
 
 /// Call OpenRouter and return the translation in the target language.
 /// `prev` holds the last few (source, translated) pairs, injected as prior
 /// chat turns to keep vocabulary, names, and topic continuity consistent.
+#[allow(clippy::too_many_arguments)]
 fn call_translate(
     agent: &ureq::Agent,
     provider: &Provider,
@@ -386,6 +493,7 @@ fn call_translate(
     text: &str,
     mode: crate::types::SubtitleMode,
     prev: &[(&str, &str)],
+    context: &str,
 ) -> Result<String, String> {
     let source_name = match source_lang {
         "ko" => "Korean",
@@ -396,7 +504,7 @@ fn call_translate(
     };
     let target_name = mode.target_name();
 
-    let system = build_system_prompt(source_lang, target_name);
+    let system = build_system_prompt(source_lang, target_name, context);
     let user = format!("[{source_name}→{target_name}] {text}");
 
     let mut messages = vec![serde_json::json!({ "role": "system", "content": &system })];
@@ -478,7 +586,7 @@ fn call_translate(
 /// usually clear immediately; one fast retry recovers the subtitle without
 /// stalling the pipeline.  4xx other than 429 are permanent — fail straight
 /// through so the error reaches the log instead of being retried pointlessly.
-fn post_with_retry(
+pub(super) fn post_with_retry(
     agent: &ureq::Agent,
     provider: &Provider,
     body: &serde_json::Value,
@@ -556,7 +664,7 @@ fn post_with_retry(
 }
 
 /// Remove `<think>…</think>` blocks; take everything after the last `</think>`.
-fn strip_think_tags(s: &str) -> String {
+pub(super) fn strip_think_tags(s: &str) -> String {
     if let Some(pos) = s.rfind("</think>") {
         return s[pos + "</think>".len()..].trim().to_string();
     }
@@ -564,6 +672,62 @@ fn strip_think_tags(s: &str) -> String {
 }
 
 /// Emit a `subtitle_update` event with the translation filled in.
+/// A line already translated, keyed by exactly what determines the request.
+type CacheKey = (String, SubtitleMode, String); // (source_lang, mode, source_text)
+
+/// Recently translated lines, newest first.
+///
+/// Two things produce the same source text twice, and both are common:
+///
+/// - **A preview and its final.**  When speech stops before the text changes,
+///   the final carries byte-identical text to the preview that just went out.
+///   Measured on one Korean session, 13% of all requests were this.
+/// - **A repeated line.**  Choruses, catchphrases, and the stock phrases
+///   whisper hallucinates when it has nothing to transcribe.
+///
+/// Re-asking costs a paid round-trip (~450 ms here) and, because the model is
+/// not deterministic, can come back *different* — the subtitle then visibly
+/// rewrites itself with no new audio behind the change.  Two of 35 repeated
+/// lines did exactly that in the measured log: "감사합니다." rendered as both
+/// 謝謝。 and 謝謝您。, and "센터 맞춰야지" as both 得對準中心才行 and 得對準中心.
+///
+/// The key deliberately omits the rolling context, which does influence a
+/// translation.  On screen, a line that reads the same as it did a minute ago
+/// is worth more than one that is marginally better tuned to the sentences
+/// around it — and the dominant hit here is the preview/final pair, where the
+/// context is the same anyway.
+struct TranslationCache {
+    entries: std::collections::VecDeque<(CacheKey, String)>,
+}
+
+impl TranslationCache {
+    /// Enough for a song's worth of repeated lines; small enough that the
+    /// linear scan below is cheaper than hashing these short strings.
+    const CAP: usize = 64;
+
+    fn new() -> Self {
+        Self { entries: std::collections::VecDeque::with_capacity(Self::CAP) }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<String> {
+        let i = self.entries.iter().position(|(k, _)| k == key)?;
+        let hit = self.entries.remove(i)?;
+        let text = hit.1.clone();
+        self.entries.push_front(hit);
+        Some(text)
+    }
+
+    fn put(&mut self, key: CacheKey, translated: String) {
+        if let Some(i) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(i);
+        }
+        if self.entries.len() == Self::CAP {
+            self.entries.pop_back();
+        }
+        self.entries.push_front((key, translated));
+    }
+}
+
 fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
     let mode = req.mode;
     let mut subtitles = SubtitleTexts::default();
@@ -604,7 +768,7 @@ fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
         source_text: req.source_text.clone(),
         mode,
         subtitles,
-        is_final: true,
+        is_final: !req.is_partial,
         started_at_ms: Some(req.started_at_ms),
         ended_at_ms: Some(req.ended_at_ms),
     };
@@ -619,6 +783,54 @@ fn set_tl_status(app: &AppHandle, status: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_language_needs_no_translation() {
+        assert!(is_noop_translation("ko", "ko"));
+        assert!(is_noop_translation("en", "en"));
+    }
+
+    #[test]
+    fn chinese_to_chinese_passes_straight_through() {
+        // Deliberate: whisper may hand back either script, and converting
+        // between them costs a call and its latency on every single line to
+        // produce something the reader could already read.
+        assert!(is_noop_translation("zh", "zh"));
+    }
+
+    #[test]
+    fn different_languages_always_translate() {
+        assert!(!is_noop_translation("ko", "zh"));
+        assert!(!is_noop_translation("en", "ko"));
+    }
+
+    fn req(id: &str, is_partial: bool) -> TranslationRequest {
+        TranslationRequest {
+            id: id.into(),
+            source_lang: "ko".into(),
+            source_text: "x".into(),
+            mode: SubtitleMode::Zh,
+            is_partial,
+            started_at_ms: 0,
+            ended_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_stale_preview_is_dropped_for_the_newer_request() {
+        let (now, later) = coalesce(req("old", true), req("new", true));
+        assert_eq!(now.id, "new");
+        assert!(later.is_none(), "nothing to come back to");
+    }
+
+    #[test]
+    fn a_final_is_never_dropped_by_coalescing() {
+        // The invariant that matters: skipping a final leaves that subtitle in
+        // its source language for good, because nothing sends it again.
+        let (now, later) = coalesce(req("final", false), req("newer", true));
+        assert_eq!(now.id, "final");
+        assert_eq!(later.expect("deferred").id, "newer");
+    }
+
     #[test]
     fn context_is_kept_within_one_conversation() {
         let k = ("ko".to_string(), SubtitleMode::Zh);
@@ -649,6 +861,53 @@ mod tests {
     }
 
     use super::*;
+
+    fn key(text: &str) -> CacheKey {
+        ("ko".into(), SubtitleMode::Zh, text.into())
+    }
+
+    #[test]
+    fn a_final_reuses_the_wording_its_preview_already_showed() {
+        let mut c = TranslationCache::new();
+        c.put(key("감사합니다."), "謝謝。".into());
+        assert_eq!(c.get(&key("감사합니다.")).as_deref(), Some("謝謝。"));
+    }
+
+    #[test]
+    fn the_target_language_is_part_of_the_key() {
+        let mut c = TranslationCache::new();
+        c.put(key("감사합니다."), "謝謝。".into());
+        let as_english = ("ko".to_string(), SubtitleMode::En, "감사합니다.".to_string());
+        assert_eq!(c.get(&as_english), None, "a zh translation must not answer an en request");
+    }
+
+    #[test]
+    fn the_oldest_line_is_the_one_evicted() {
+        // Note the cache is never read here: reading is what keeps a line
+        // alive, so a probe partway through would move the very entry the
+        // test is about back to the front and evict its neighbour instead.
+        let mut c = TranslationCache::new();
+        for i in 0..TranslationCache::CAP {
+            c.put(key(&format!("line {i}")), format!("第 {i} 行"));
+        }
+        c.put(key("one too many"), "多出來的一行".into());
+        assert_eq!(c.get(&key("line 0")), None, "the oldest should have gone");
+        assert!(c.get(&key("line 1")).is_some(), "the rest should still be there");
+        assert!(c.get(&key("one too many")).is_some());
+    }
+
+    #[test]
+    fn a_hit_keeps_a_recurring_line_alive() {
+        // A chorus line comes back long after CAP other lines have passed. It
+        // survives because reading it moves it back to the front.
+        let mut c = TranslationCache::new();
+        c.put(key("chorus"), "副歌".into());
+        for i in 0..TranslationCache::CAP - 1 {
+            c.put(key(&format!("verse {i}")), format!("第 {i} 句"));
+            assert!(c.get(&key("chorus")).is_some(), "refreshed on every read");
+        }
+        assert_eq!(c.get(&key("chorus")).as_deref(), Some("副歌"));
+    }
 
     #[test]
     fn strip_think_tags_removes_reasoning_preamble() {

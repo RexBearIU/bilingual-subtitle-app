@@ -578,8 +578,56 @@ data that is 4 of 4 caught with no false positive.
 Length, not a stock-phrase blocklist: the Spanish line is in no such list, and
 a switch of language worth showing runs longer than two seconds.
 
+**Corroborated later, at scale.** A session of Korean music produced 46 lines
+of memorised YouTube credits — `한글자막 by 한효정`, `다음 영상에서 만나요`,
+`시청해주셔서 감사합니다` — which were the four most frequent outputs of any
+kind, more than any real sentence. Every one of them scored
+`no_speech_prob = 0.00`: the model was maximally certain there was speech while
+transcribing something nobody said. None were caught by the 0.7 gate.
+
+That session also showed the loop the gate cannot see. Each accepted credit
+entered the rolling `initial_prompt`, which told the next chunk it was in the
+outro of a video, which produced another credit at 0.00. Suppression happens
+before the prompt is updated, so a blocklist entry breaks the loop as well as
+hiding the line.
+
 "Established" is a strict majority of the last five *accepted* finals, not the
 previous final's language. The single-value version had a measured failure of
 its own — one `Bye.` that slipped through became the reference, and the next
 three correct Korean lines were then read as the language flip.
+
+## ADR-0022 — The context note is derived from transcript, not audio
+
+A note describing what is playing — the show, the teams, the names — measurably
+helps both halves of the pipeline, and helps ASR most: a name whisper never
+heard right cannot be repaired downstream, however good the translation prompt
+is. But nobody types one before every stream, so an unused field would have
+been the whole feature.
+
+The obvious reading of "summarise the audio" does not work: no model in this
+pipeline takes sound. The transcript is available instead, and is the better
+input anyway — it is exactly what the two consumers of the note are working on,
+errors and all.
+
+So the first eight final lines are sent once to the same provider that does the
+translating, asking for a short paragraph of topic and recurring proper nouns.
+The answer becomes the note, rebuilt every five minutes from the most recent
+forty lines so that changing video catches up within a few subtitles.
+
+Three things this deliberately is not:
+
+- **Not on the translate worker.** That worker is serial, so a summary call
+  made there would sit in front of a subtitle. Its own thread cannot delay
+  anything.
+- **Not merged with a typed note.** A typed note wins outright. The user knows
+  what they are watching; the summariser is inferring it from imperfect
+  transcript, and two descriptions that disagree are worse guidance than
+  either alone.
+- **Not persisted.** It describes what is playing right now. Restoring last
+  night's summary would prime tonight's session wrongly, so it is cleared when
+  captioning starts.
+
+It is shown in the Settings panel under the empty field. A note that silently
+primes both models while the user cannot see it is one they cannot correct
+when it is wrong — and it is built from ASR output, so sometimes it will be.
 

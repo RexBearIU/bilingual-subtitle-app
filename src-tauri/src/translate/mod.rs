@@ -12,6 +12,7 @@
 //! place to keep API keys out of the settings file — see `resolve_key`.
 
 pub mod remote;
+pub mod summarize;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -569,6 +570,11 @@ pub struct TranslationRequest {
     pub source_text: String,
     /// Active subtitle display mode (drives which target language we need).
     pub mode: SubtitleMode,
+    /// A preview of an utterance still being spoken. Translated so the target
+    /// language appears while the speaker is still talking, but never allowed
+    /// to become context for later subtitles — a fragment translated as if it
+    /// were a whole sentence would bias everything after it.
+    pub is_partial: bool,
     pub started_at_ms: u64,
     pub ended_at_ms: u64,
 }
