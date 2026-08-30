@@ -3,6 +3,36 @@
 Short, dated records of non-obvious choices and *why*. Append new ones; don't
 rewrite history — supersede instead.
 
+This file is ~33 KB and grows with every decision. **Use the index**: find the
+question you are actually asking, then read that one ADR — each is 10–50 lines.
+Reading the whole file is almost never the right move.
+
+| # | Decision | The question it settles | Note |
+|---|----------|-------------------------|------|
+| 0001 | Sidecar-first for native engines | Link engines into the binary, or run them as processes? | ASR half superseded by 0006, translation half by 0011 |
+| 0002 | WASAPI loopback, not cpal | How to capture what the speakers are playing | |
+| 0003 | Windows-native only; no WSL | Why the build refuses to live in WSL | |
+| 0004 | Svelte + Vite, no SvelteKit | Frontend stack, and why no router/SSR | |
+| 0005 | Dev injection, not a mock stage | How to test the pipeline before the engines exist | |
+| 0006 | faster-whisper over whisper.cpp | Why the ASR sidecar is Python | Supersedes 0001 (ASR) |
+| 0007 | SubtitleMode: single-language target | Why `zh-ko`/`zh-en` became `none`/`zh`/`ko`/`en` | |
+| 0007b | SourceHint for Whisper language lock | Telling Whisper what language to expect | |
+| 0008 | Per-process audio capture | Capturing one app instead of the whole device | |
+| 0009 | Fixed-chunk accumulator, not RMS VAD | Why there is no voice-activity detector | Superseded in part by 0015 |
+| 0010 | SenseVoice via sherpa-onnx | The alternative Korean ASR backend | |
+| 0011 | Hosted translation via OpenRouter | Why there is no local LLM any more | Supersedes 0001 (translation) |
+| 0012 | Cursor-driven click-through | Why the overlay ignores the mouse, and how anything stays clickable | |
+| 0013 | Provider switching from the UI | Changing translation endpoint without a restart | Ownership half superseded by 0017 |
+| 0014 | Settings paginates | Why the settings window tops up instead of growing | |
+| 0015 | Sentence-boundary flush | The chunker cutting on text, not only on time | Removed music mode |
+| 0016 | Explicit `startDragging()` | Why `data-tauri-drag-region` is not used | |
+| 0017 | Provider list lives in `settings.json` | Who owns the list, UI or environment | Supersedes 0013 (ownership) |
+| 0018 | A display name is not an identity | Why renaming a provider does not repoint it | |
+| 0019 | An unusable provider is shown, not dropped | Why a keyless provider still appears in the list | |
+| 0020 | Rolling translation context expires | Why context is dropped after a silence or a mode change | |
+| 0021 | `initial_prompt` disarms the no_speech filter | Why the 0.7 gate is weaker than it looks | Read before touching hallucination filtering |
+| 0022 | Context note derived from transcript | Why nobody has to type what the audio is about | |
+
 ---
 
 ## ADR-0001 — Sidecar-first for native engines (whisper.cpp / llama.cpp)

@@ -1,5 +1,15 @@
 # Milestones
 
+**A historical record, not current truth.** Every milestone below is done, and
+the code has moved since several of them were written. For how anything behaves
+today read [ARCHITECTURE.md](ARCHITECTURE.md); for why, the ADR index in
+[DECISIONS.md](DECISIONS.md). This file is worth opening for one thing: what was
+tried and measured at the time, which the other two do not carry.
+
+It is deliberately **not** updated when behaviour changes later — a milestone
+says what was true when it shipped. Superseding notes are added only where the
+old text would otherwise be read as current.
+
 Status legend: ⬜ not started · 🟡 in progress · ✅ done
 
 | # | Milestone | Status |
@@ -199,13 +209,9 @@ Separate worker threads + bounded channels · drop stale chunks under back-press
 - **RMS log → debug** — audio meter was logging at INFO every 200 ms (5 lines/s).
   Changed to DEBUG to keep the log readable during normal use.
 - **Fixed-chunk pipeline (replaces VAD)** — `pipeline/vad.rs` and
-  `audio/ring_buffer.rs` deleted. New `pipeline/chunker.rs` emits fixed 4 s
-  chunks unconditionally. Silence filtered by Whisper `no_speech_prob ≥ 0.7`
-  instead of RMS gating (more reliable for video/stream content — ADR-0009).
-- **Music mode** — fixed 10 s chunks + "Song lyrics:" prompt; beam_size=3 for
-  better lyric accuracy. _Removed by ADR-0015: it was a second segmentation
-  policy competing with the graduated chunker, and unused. There is no
-  music-specific path in the code today._
+  `audio/ring_buffer.rs` deleted in favour of `pipeline/chunker.rs` (ADR-0009).
+  Segmentation has changed twice since; ARCHITECTURE § Chunking is current.
+  A music mode added here was removed by ADR-0015.
 - **Zombie sidecar cleanup** — `kill_port()` helper in `commands.rs` runs
   `netstat -ano` + `taskkill /F /PID` before each sidecar launch to evict
   leftover processes from a previous session that didn't clean up (e.g. after
