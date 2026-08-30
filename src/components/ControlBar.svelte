@@ -159,7 +159,6 @@
       aria-label={running ? "停止" : "開始"}
     >
       <Icon name={running ? "stop" : "play"} />
-      {#if !collapsed}<span class="run-label">{running ? "停止" : "開始"}</span>{/if}
     </button>
 
     {#if !collapsed}
@@ -250,28 +249,48 @@
 <style>
   /* ── 整體列 ─────────────────────────────────── */
   .bar {
+    /* One place to resize the whole bar. Everything below is expressed in
+       these, so the row cannot end up with a 24px button in a 36px bar — which
+       is what happened every previous time a size was nudged by hand. */
+    /* Every size below is one of these times --ui-scale (a saved setting,
+       0.7-1.8), so the whole row grows and shrinks together instead of the
+       buttons outrunning the text. */
+    --btn: calc(24px * var(--ui-scale, 1));   /* button edge; the row's tallest element */
+    --fs: calc(11px * var(--ui-scale, 1));    /* label and control text */
+    --pad-x: calc(6px * var(--ui-scale, 1));  /* bar's own side padding */
+    --gap: calc(3px * var(--ui-scale, 1));
+
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--gap);
     /* Every part of the bar drags, buttons included — they keep `cursor:
        pointer` because a press there is a click until it starts moving. */
     cursor: grab;
-    padding: 4px 10px;
+    padding: calc(3px * var(--ui-scale, 1)) var(--pad-x);
     background: rgba(14, 18, 24, 0.94);
-    border-radius: 10px;
-    font-size: 12px;
+    border-radius: 9px;
+    font-size: var(--fs);
     color: #d7dee6;
     user-select: none;
-    width: 100%;
+    /* Hug the controls. The bar used to span the window with a flexible
+       `.spacer` shoving the two groups to opposite edges, which on a wide
+       overlay is mostly empty bar sitting on top of the video. Nothing needed
+       that slack once the whole bar became draggable (ADR-0016) - the spacer
+       had been the grab handle. */
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 auto;
     box-sizing: border-box;
     transition: width 0.12s ease;
-    height: 36px;
+    /* Derived, not chosen: the button plus its padding, so the bar is exactly
+       as tall as it needs to be. */
+    height: calc(var(--btn) + 5px);
   }
 
   /* ── 分隔線 ─────────────────────────────────── */
   .sep {
     width: 1px;
-    height: 16px;
+    height: calc(var(--btn) * 0.58);
     background: #2e3740;
     flex-shrink: 0;
     margin: 0 2px;
@@ -282,12 +301,12 @@
     background: #242b34;
     color: #c8d0da;
     border: 1px solid #343d4a;
-    border-radius: 6px;
+    border-radius: 5px;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs);
     white-space: nowrap;
     flex-shrink: 0;
-    height: 26px;
+    height: var(--btn);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -297,7 +316,7 @@
 
   /* 圖示按鈕（正方形） */
   .icon-btn {
-    width: 28px;
+    width: var(--btn);
     padding: 0;
     display: inline-flex;
     align-items: center;
@@ -305,21 +324,19 @@
   }
   .icon-btn.active { background: #223040; border-color: #2f6fed; }
 
-  /* 文字按鈕（有 padding） */
-  .txt-btn { padding: 0 9px; }
-
   /* ── Start / Stop ────────────────────────────── */
+  /* Icon only. The play/stop pair is the most universally read symbol on the
+     bar, and the word beside it was the widest thing in the row — it also had
+     to be conditionally hidden when the bar collapsed, which is a whole
+     behaviour that stops existing once the label does. The tooltip and
+     aria-label still say 開始 / 停止. */
   .run {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 0 12px;
-    font-weight: 700;
-    font-size: 12px;
-    letter-spacing: 0.3px;
+    justify-content: center;
+    width: var(--btn);
+    padding: 0;
   }
-  /* Collapsed: the icon alone, square like the other icon buttons. */
-  .bar.collapsed .run { padding: 0; width: 28px; justify-content: center; }
   .run.on { background: #6e1e2a; border-color: #903040; color: #ffd0d0; }
   .run:hover { background: #2e3740; }
   .run.on:hover { background: #7e2233; }
@@ -328,7 +345,7 @@
   .lang-group {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--gap);
     flex-shrink: 0;
   }
   .lang-sel {
@@ -336,20 +353,20 @@
     color: #c8d0da;
     border: 1px solid #343d4a;
     border-radius: 5px;
-    height: 26px;
+    height: var(--btn);
     padding: 0 2px;
-    font-size: 12px;
+    font-size: var(--fs);
     cursor: pointer;
     outline: none;
     flex-shrink: 0;
-    width: 62px;
+    width: calc(62px * var(--ui-scale, 1));
     text-align-last: center;
     appearance: auto;
   }
   .lang-sel option { text-align: center; }
   .lang-sel:hover  { border-color: #4a5566; }
   .lang-sel:focus  { border-color: #2f6fed; }
-  .lang-arrow { font-size: 11px; color: #4a5566; flex-shrink: 0; }
+  .lang-arrow { font-size: var(--fs); color: #4a5566; flex-shrink: 0; }
 
   /* ── 置頂 ────────────────────────────────────── */
   .icon-btn.active[aria-label="視窗置頂"] {
@@ -368,7 +385,7 @@
   /* ── 設定 / Dev ──────────────────────────────── */
   .dev {
     opacity: 0.3;
-    width: 22px;
+    width: calc(var(--btn) * 0.9);
     padding: 0;
     display: inline-flex;
     align-items: center;
@@ -386,12 +403,8 @@
      `auto` still resolves to the full width of the row and the spacer shoves
      the stop button and the status lights to opposite edges. */
   .bar.collapsed {
-    width: fit-content;
-    margin: 0 auto;
-    padding: 4px 8px;
-    gap: 8px;
+    gap: calc(var(--gap) * 2);
   }
-  .bar.collapsed .spacer,
   .bar.collapsed .sep {
     display: none;
   }
@@ -399,7 +412,7 @@
   .left-group {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--gap);
     /* Shrinks when the bar is narrow, but does NOT grow — the slack belongs to
        `.spacer`, which keeps the settings group pinned to the right edge. */
     flex: 0 1 auto;
@@ -408,26 +421,30 @@
   .right-group {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--gap);
     flex-shrink: 0;
   }
 
   /* ── Spacer + 狀態 ───────────────────────────── */
   /* Holds the two groups apart. Nothing is drawn in it: the whole bar drags
      now, so it does not have to advertise itself as the one place that does. */
+  /* Was `flex: 1` - the empty middle of a full-width bar. Kept as a fixed
+     breath between the two groups now that the bar hugs its content. */
   .spacer {
-    flex: 1 1 auto;
-    align-self: stretch;
+    width: calc(var(--gap) * 2);
+    flex: 0 0 auto;
   }
 
   .status {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--gap);
     flex-shrink: 0;
   }
   .dot {
-    width: 6px; height: 6px; border-radius: 50%;
+    width: calc(6px * var(--ui-scale, 1));
+    height: calc(6px * var(--ui-scale, 1));
+    border-radius: 50%;
     display: inline-block; background: #3a4450;
     flex-shrink: 0;
   }

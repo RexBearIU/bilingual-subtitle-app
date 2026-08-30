@@ -156,10 +156,11 @@
     {#if tab === 'look'}
     <!-- ── 外觀 ───────────────────────────────────────────────────── -->
     <div class="row">
-      <span class="label">A 字體大小</span>
+      <span class="label">A 整體大小</span>
       <input class="slider" type="range" min="14" max="64" value={fontSize} oninput={onFont} />
       <span class="val">{fontSize} px</span>
     </div>
+    <p class="hint left">控制列跟著一起縮放。</p>
 
     <div class="row">
       <span class="label">◐ 字幕透明度</span>
