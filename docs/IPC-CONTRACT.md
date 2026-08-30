@@ -5,6 +5,12 @@ work and all model access live in Rust. This contract is the stable boundary;
 keep it in sync with `src-tauri/src/commands.rs`, `src-tauri/src/types.rs`,
 and `src/lib/commands.ts` / `src/lib/types.ts`.
 
+Four sections, each independently readable:
+[Commands](#commands-frontend--rust-via-invoke) ·
+[Events](#events-rust--frontend-via-emit) ·
+[Types](#types) ·
+[Settings shape](#settings-shape)
+
 ## Commands (frontend → Rust, via `invoke`)
 
 | Command | Args | Returns | Notes |

@@ -1,5 +1,21 @@
 # Architecture
 
+How the system behaves **today**. Where this and [MILESTONES.md](MILESTONES.md)
+disagree, this file is right. For *why* a thing is the way it is, see the ADR
+index in [DECISIONS.md](DECISIONS.md).
+
+| Section | Covers |
+|---------|--------|
+| [Pipeline](#pipeline) · [Thread / channel model](#thread--channel-model) · [Process topology](#process-topology) | Where audio goes, on which thread, in which process |
+| [Subtitle mode logic](#subtitle-mode-logic) | What gets translated into what |
+| [Chunking](#chunking-graduated-silence-flush--rolling-partials) | How an utterance's boundaries are decided |
+| [ASR worker](#asr-worker) | Models, beam sizes, prompts, language correction |
+| [Hallucination filtering](#hallucination-filtering) | The four layers, and why a blocklist alone loses |
+| [Translation worker](#translation-worker) | Prompt, rolling context, failover, the cache |
+| [Per-process capture](#per-process-capture) | Targeting one app's audio |
+| [Backend module layout](#backend-module-layout) · [Frontend layout](#frontend-layout) | Which file holds what |
+| [Copying a subtitle](#copying-a-subtitle) · [Sizing](#sizing) | Overlay UI behaviour and its click-through constraints |
+
 ## Pipeline
 
 ```text
