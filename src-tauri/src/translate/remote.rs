@@ -173,6 +173,7 @@ fn translate_loop(
     // tells the model a Korean line was English.
     let mut ctx_for: Option<(String, SubtitleMode)> = None;
     let mut ctx_end_ms: u64 = 0;
+    let mut cache = TranslationCache::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -257,12 +258,33 @@ fn translate_loop(
             continue;
         }
 
+        // Already translated this exact line — reuse it rather than pay for a
+        // round-trip that can come back worded differently.  Before the context
+        // bookkeeping below, which a cache hit still has to perform.
+        let cache_key = (req.source_lang.clone(), req.mode, req.source_text.clone());
+
         // Context is only useful while it is still the same conversation.
         let now = (req.source_lang.clone(), req.mode);
         if !context_survives(ctx_for.as_ref(), &now, req.started_at_ms.saturating_sub(ctx_end_ms)) {
             history.clear();
         }
         ctx_for = Some(now);
+
+        if let Some(hit) = cache.get(&cache_key) {
+            log::info!("TL [{} → {target} {kind}] cached → {hit:?}", req.source_lang);
+            // A cache hit is still a translated final, so it still becomes
+            // context. Skipping that would leave a hole in the history the
+            // next request is built from.
+            if !req.is_partial {
+                if history.len() == CTX_PAIRS {
+                    history.pop_front();
+                }
+                history.push_back((req.source_text.clone(), hit.clone()));
+                ctx_end_ms = req.ended_at_ms;
+            }
+            emit_translated(app, &req, hit);
+            continue;
+        }
 
         let prev: Vec<(&str, &str)> = history
             .iter()
@@ -302,6 +324,7 @@ fn translate_loop(
                     history.push_back((req.source_text.clone(), translated.clone()));
                     ctx_end_ms = req.ended_at_ms;
                 }
+                cache.put(cache_key, translated.clone());
                 emit_translated(app, &req, translated);
             }
             Err(e) => {
@@ -649,6 +672,62 @@ pub(super) fn strip_think_tags(s: &str) -> String {
 }
 
 /// Emit a `subtitle_update` event with the translation filled in.
+/// A line already translated, keyed by exactly what determines the request.
+type CacheKey = (String, SubtitleMode, String); // (source_lang, mode, source_text)
+
+/// Recently translated lines, newest first.
+///
+/// Two things produce the same source text twice, and both are common:
+///
+/// - **A preview and its final.**  When speech stops before the text changes,
+///   the final carries byte-identical text to the preview that just went out.
+///   Measured on one Korean session, 13% of all requests were this.
+/// - **A repeated line.**  Choruses, catchphrases, and the stock phrases
+///   whisper hallucinates when it has nothing to transcribe.
+///
+/// Re-asking costs a paid round-trip (~450 ms here) and, because the model is
+/// not deterministic, can come back *different* — the subtitle then visibly
+/// rewrites itself with no new audio behind the change.  Two of 35 repeated
+/// lines did exactly that in the measured log: "감사합니다." rendered as both
+/// 謝謝。 and 謝謝您。, and "센터 맞춰야지" as both 得對準中心才行 and 得對準中心.
+///
+/// The key deliberately omits the rolling context, which does influence a
+/// translation.  On screen, a line that reads the same as it did a minute ago
+/// is worth more than one that is marginally better tuned to the sentences
+/// around it — and the dominant hit here is the preview/final pair, where the
+/// context is the same anyway.
+struct TranslationCache {
+    entries: std::collections::VecDeque<(CacheKey, String)>,
+}
+
+impl TranslationCache {
+    /// Enough for a song's worth of repeated lines; small enough that the
+    /// linear scan below is cheaper than hashing these short strings.
+    const CAP: usize = 64;
+
+    fn new() -> Self {
+        Self { entries: std::collections::VecDeque::with_capacity(Self::CAP) }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<String> {
+        let i = self.entries.iter().position(|(k, _)| k == key)?;
+        let hit = self.entries.remove(i)?;
+        let text = hit.1.clone();
+        self.entries.push_front(hit);
+        Some(text)
+    }
+
+    fn put(&mut self, key: CacheKey, translated: String) {
+        if let Some(i) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(i);
+        }
+        if self.entries.len() == Self::CAP {
+            self.entries.pop_back();
+        }
+        self.entries.push_front((key, translated));
+    }
+}
+
 fn emit_translated(app: &AppHandle, req: &TranslationRequest, zh: String) {
     let mode = req.mode;
     let mut subtitles = SubtitleTexts::default();
@@ -782,6 +861,53 @@ mod tests {
     }
 
     use super::*;
+
+    fn key(text: &str) -> CacheKey {
+        ("ko".into(), SubtitleMode::Zh, text.into())
+    }
+
+    #[test]
+    fn a_final_reuses_the_wording_its_preview_already_showed() {
+        let mut c = TranslationCache::new();
+        c.put(key("감사합니다."), "謝謝。".into());
+        assert_eq!(c.get(&key("감사합니다.")).as_deref(), Some("謝謝。"));
+    }
+
+    #[test]
+    fn the_target_language_is_part_of_the_key() {
+        let mut c = TranslationCache::new();
+        c.put(key("감사합니다."), "謝謝。".into());
+        let as_english = ("ko".to_string(), SubtitleMode::En, "감사합니다.".to_string());
+        assert_eq!(c.get(&as_english), None, "a zh translation must not answer an en request");
+    }
+
+    #[test]
+    fn the_oldest_line_is_the_one_evicted() {
+        // Note the cache is never read here: reading is what keeps a line
+        // alive, so a probe partway through would move the very entry the
+        // test is about back to the front and evict its neighbour instead.
+        let mut c = TranslationCache::new();
+        for i in 0..TranslationCache::CAP {
+            c.put(key(&format!("line {i}")), format!("第 {i} 行"));
+        }
+        c.put(key("one too many"), "多出來的一行".into());
+        assert_eq!(c.get(&key("line 0")), None, "the oldest should have gone");
+        assert!(c.get(&key("line 1")).is_some(), "the rest should still be there");
+        assert!(c.get(&key("one too many")).is_some());
+    }
+
+    #[test]
+    fn a_hit_keeps_a_recurring_line_alive() {
+        // A chorus line comes back long after CAP other lines have passed. It
+        // survives because reading it moves it back to the front.
+        let mut c = TranslationCache::new();
+        c.put(key("chorus"), "副歌".into());
+        for i in 0..TranslationCache::CAP - 1 {
+            c.put(key(&format!("verse {i}")), format!("第 {i} 句"));
+            assert!(c.get(&key("chorus")).is_some(), "refreshed on every read");
+        }
+        assert_eq!(c.get(&key("chorus")).as_deref(), Some("副歌"));
+    }
 
     #[test]
     fn strip_think_tags_removes_reasoning_preamble() {
