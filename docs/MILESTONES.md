@@ -83,174 +83,101 @@ Tauri hot-rebuild round-trip 6.6 s.
 
 ## M3 — Audio chunking  ✅
 
-Fixed-chunk accumulator (replaced original RMS VAD — see ADR-0009).
+Fixed-chunk accumulator, replacing the original RMS VAD (ADR-0009).
 16 kHz mono · 4 s chunks · stop-flush ≥ 0.5 s.
+
 **Acceptance:** audio reaches ASR in regularly-sized chunks · silence handled
 by Whisper `no_speech_prob` · no memory growth over long sessions.
 
-**Implemented:** `pipeline/chunker.rs` — simple fixed-size accumulator.
-`capture.rs` resamples WASAPI output to 16 kHz mono via `audio/resample.rs`
-(rubato SincFixedIn) and forwards 200 ms blocks to chunker via unbounded
-`mpsc::channel`. Chunker emits complete chunks to ASR via `sync_channel(4)`.
-`pipeline/mod.rs` declares `pub mod chunker`.
+## M4 — ASR  ✅
 
-## M4 — ASR (whisper.cpp)  ✅
+Sidecar ASR, loaded once, returning text plus a detected language, with prior
+context carried across chunks. Began as a `whisper-server` binary (ADR-0001)
+and became the Python `asr_srv.py` during M8 (ADR-0006).
 
-`whisper-server` sidecar (ADR-0001). Model `ggml-medium.bin`, later
-`large-v3-turbo`. Load once. Return text + detected lang (ko/en/zh) + timestamps.
-Keep prior context/prompt for continuity.
-**Acceptance:** ko/en/zh transcribed · lang auto-detect · source subtitle emitted
-without translation.
+**Acceptance:** ko/en/zh transcribed · language auto-detected · source subtitle
+emitted without waiting for translation.
 
-**Implemented:** `asr/mod.rs` (`AudioChunk` type) + `asr/http_client.rs`
-(HTTP client with multipart WAV upload, verbose_json response parsing,
-`normalize_lang` mapping, `encode_wav_16bit`, `subtitle_update` emission).
-`commands.rs` launches `asr_srv.py` (Python) via `std::process::Command`
-on `start_captioning` (env-configurable: `PYTHON_BIN`, `ASR_BACKEND`,
-`ASR_SERVER_SCRIPT`, `WHISPER_MODEL`, `SENSEVOICE_MODEL`, `ASR_PORT`).
-`state.rs` adds `asr_status` + `AsrProc` managed state. ASR worker polls
-for server readiness (300 s — allows first-run model download), then streams
-chunks from VAD → WAV → POST → `subtitle_update`. `ureq` v2 used for synchronous
-HTTP (no tokio conflict).
-
-**ASR quality filters** (in `http_client.rs`):
-- `no_speech_prob ≥ 0.7` suppresses silence/noise chunks
-- Hallucination blocklist (YouTube credits, `[Music]`, etc.)
-- Consecutive-repeat detection (initial_prompt feedback loop guard)
-
-**Backends** (`ASR_BACKEND` env var):
-- `whisper` (default): faster-whisper + CTranslate2, GPU via CUDA
-- `sensevoice`: SenseVoice ONNX via sherpa-onnx, better Korean accuracy (ADR-0010)
-
-**To activate:** `pip install faster-whisper fastapi uvicorn sherpa-onnx` and
-set env vars — see `docs/SETUP.md`.
+**Worth keeping:** `ureq` v2 was chosen for the HTTP client specifically
+because it is synchronous — an async client would have dragged tokio into a
+crate that has no other use for it. Server readiness is polled for 300 s, which
+looks absurd until the first run downloads a 1.5 GB model.
 
 ## M5 — Translation  ✅
 
-`llama-server` sidecar. Models: Qwen2.5-1.5B-Instruct Q4_K_M; upgrade to Qwen3-4B
-if quality insufficient. Output subtitle text only · Traditional Chinese · natural
-subtitle style · preserve names/brands/common English tech terms · no explanations.
-Mode logic in [ARCHITECTURE.md](ARCHITECTURE.md).
-**Acceptance:** ko→zh-en · en→zh-ko · zh→zh-en/zh-ko · acceptable latency.
+Subtitle-style translation: output the line and nothing else, natural register,
+keep names and common English technical terms, no explanations. Shipped against
+a local `llama-server` sidecar running Qwen3-4B.
 
-**Implemented:** `translate/mod.rs` (`TranslationRequest` boundary type) +
-`translate/llama_server.rs` (HTTP client calling OpenAI-compatible
-`/v1/chat/completions`). Qwen3 `/no_think` directive used to suppress
-chain-of-thought and get direct translation output. `strip_think_tags` safety-net
-strips any residual `<think>…</think>` blocks. `state.rs` adds `translation_status`
-+ `LlamaProc` managed state. `commands.rs` launches `llama-server` on
-`start_captioning` (env-configurable: `LLAMA_SERVER_BIN`, `LLAMA_MODEL`,
-`LLAMA_PORT`, `LLAMA_GPU_LAYERS`; defaults: PATH, `models/Qwen3-4B-Q4_K_M.gguf`,
-9002, 36 GPU layers). ASR worker emits source-only subtitle immediately
-(`is_final=false`), then enqueues a `TranslationRequest`; translation worker emits
-updated event with same `id` and `zh` slot filled (`is_final=true`). Pipeline:
-WASAPI → VAD → ASR → [translate channel] → Translation → `subtitle_update`.
+**Acceptance:** ko→zh · en→zh · zh→ko/en · latency low enough to read.
 
-> **Superseded by [ADR-0011](DECISIONS.md) (2026-08-27).** The local
-> `llama-server` sidecar is gone — translation now calls OpenRouter over HTTPS.
-> `translate/llama_server.rs` → `translate/openrouter.rs`; `LlamaProc`,
-> `launch_llama_server`, the `LLAMA_*` env vars and `llama_gpu_layers` are all
-> removed. The channel boundary, prompt design, rolling 3-pair context, and the
-> source-first-then-translation emit sequence described above are unchanged.
+> **Superseded by [ADR-0011](DECISIONS.md) (2026-08-27).** The local sidecar is
+> gone; translation is an HTTPS call. The channel boundary, the prompt design,
+> the rolling context and the source-first-then-translation emit order all
+> survived the move unchanged.
+
+**Worth keeping:** Qwen3 needed an explicit `/no_think` directive or it spent
+its token budget reasoning and returned an empty translation.
+`strip_think_tags` remains as a safety net for any model that emits a `<think>`
+block regardless.
 
 ## M6 — Subtitle state manager  ✅
 
-`SubtitleSegment` store: dedup · merge fragments · expire after 3–5s · partial &
-final · keep last N segments as translation context.
-**Acceptance:** no flicker · no duplicate text · subtitles disappear naturally.
+Dedup by id, merge partial into final, expire after a few seconds, cap how many
+show at once, keep the last N as translation context.
 
-**Implemented:** `subtitles.svelte.ts` — `OverlayStore.segments: SubtitleUpdate[]`
-(Svelte 5 `$state`). `_handleUpdate()`: dedup by `id` (splice-replace in-place) +
-merge partial→final (same slot). `_expiry: Map<id, number|null>` tracks
-per-segment expiry timestamp (set when `is_final=true`, null while still partial).
-`_prune()` runs every 500ms via `setInterval`, removes segments past their expiry.
-`MAX_SEGMENTS=3` caps the display count; oldest are evicted when over limit.
-`SubtitleView.svelte` now accepts `segments: SubtitleUpdate[]` and stacks them
-oldest-first; partial segments get `opacity: 0.75` while awaiting translation.
-`EXPIRE_MS=4000` (4s on-screen after final).
+**Acceptance:** no flicker · no duplicate text · subtitles disappear naturally.
 
 ## M7 — Settings  ✅
 
-mode · ASR model path · translation model path · font size · max lines · overlay
-position · opacity · click-through · low-latency / high-quality. Persisted via
-`tauri-plugin-store`.
+Persisted to `{AppData}/com.bilingualsubtitle.app/settings.json` with
+`serde_json` and `std::fs` — no store plugin.
+
 **Acceptance:** settings survive restart · mode changeable while running.
 
-**Implemented:** `settings.rs` — `PersistSettings` + `OverlayRect` structs,
-JSON file stored at `{AppData}/com.bilingualsubtitle.app/settings.json` (no
-plugin dependency, uses `serde_json` + `std::fs`). `SettingsPath` managed state
-holds the resolved path.  `setup` in `lib.rs` loads settings at launch, applies
-window position/size via `set_position`/`set_size`, syncs AppState
-(mode/font_size/subtitle_opacity/openrouter_model). Commands: `get_settings`
-(returns current settings) and `update_settings(patch)` (partial update →
-AppState + file). `set_font_size` / `set_subtitle_mode` call `save_current_settings`
-after updating.  Frontend: `App.svelte` listens to `window.onMoved` /
-`window.onResized` (400ms debounce) → `updateSettings({overlay})`.  ControlBar
-adds opacity slider (◐ icon); the settings panel carries the OpenRouter key and
-model fields (the GPU/CPU toggle went away with ADR-0011 — there is no local
-model left to place). Subtitle background uses CSS `--subtitle-bg-opacity`
-custom property driven by `EngineStatus.subtitleOpacity`.
+**Worth keeping:** window geometry is saved from the frontend on `onMoved` /
+`onResized` with a 400 ms debounce, because the events fire continuously
+during a drag.
 
 ## M8 — Performance  ✅
 
-Targets: 1–3s end-to-end · low idle CPU · models stay loaded · no memory growth.
-Separate worker threads + bounded channels · drop stale chunks under back-pressure.
+Targets: 1–3 s end-to-end · low idle CPU · models stay loaded · no memory
+growth. Separate worker threads, bounded channels, stale chunks dropped under
+back-pressure.
 
-**Implemented:**
-- **Bounded channels** — VAD→ASR and ASR→Translation channels changed from
-  `mpsc::channel` (unbounded) to `mpsc::sync_channel(2)`. VAD and ASR use
-  `try_send`; if the consumer is busy and the queue is full, the chunk is dropped
-  with a WARN log instead of piling up in memory. Capture→VAD stays unbounded
-  (VAD is fast — pure RMS arithmetic).
-- **Whisper rolling prompt** — after each successful transcription, the last
-  ≤200 chars of text are passed as `initial_prompt` to the next request.
-  This improves continuity (names, punctuation, sentence context) across chunk
-  boundaries at zero latency cost.
-- **RMS log → debug** — audio meter was logging at INFO every 200 ms (5 lines/s).
-  Changed to DEBUG to keep the log readable during normal use.
-- **Fixed-chunk pipeline (replaces VAD)** — `pipeline/vad.rs` and
-  `audio/ring_buffer.rs` deleted in favour of `pipeline/chunker.rs` (ADR-0009).
-  Segmentation has changed twice since; ARCHITECTURE § Chunking is current.
-  A music mode added here was removed by ADR-0015.
-- **Zombie sidecar cleanup** — `kill_port()` helper in `commands.rs` runs
-  `netstat -ano` + `taskkill /F /PID` before each sidecar launch to evict
-  leftover processes from a previous session that didn't clean up (e.g. after
-  force-kill or crash).
-- **Log level tuning** — debug builds use `LevelFilter::Debug` for own crates
-  with `level_for()` suppressors on `ureq`, `wasapi`, `tauri`, `tao`, `wry`
-  (previously these flooded the log at DEBUG, making useful output unreadable).
-- **ASR channel capacity** — chunker→ASR `sync_channel` raised from 2 → 4 to
-  absorb bursts without dropping chunks during normal GPU inference latency.
-- **Per-process capture** — `audio/process_loopback.rs` uses Windows Process
-  Loopback API to capture a single PID. `list_audio_processes` / `set_capture_process`
-  commands. `audio/session_enum.rs` for audio session enumeration.
-  Bug fix: `IsSystemSoundsSession()` in windows-rs returns `Ok(())` for both
-  S_OK and S_FALSE, causing all sessions to be filtered out. Fixed by relying on
-  PID 0 check only.
-- **SubtitleMode redesign** — `zh-ko`/`zh-en` bilingual modes replaced by single-
-  target `none`/`zh`/`ko`/`en` (ADR-0007). `SourceHint` added for Whisper language lock.
-- **faster-whisper ASR** — switched from whisper.cpp binary to Python faster-whisper
-  sidecar for `no_speech_prob` access and easier model management (ADR-0006).
-  Default model upgraded to `Systran/faster-whisper-large-v3-turbo` (better
-  multilingual accuracy, similar VRAM to medium, same encoder as large-v3).
-- **Two-phase chunker** — partial flush after 1 s (beam=1, fast preview) + final
-  flush on silence/cap (beam=5, accurate). Subtitle appears ~1.5 s from speech
-  start instead of waiting for full sentence silence. Consecutive-repeat filter
-  exempts final chunks that complete a partial utterance (same utterance_id).
-- **Silence-triggered early flush** — video mode flushes on 400 ms of RMS below
-  −46 dBFS, enabling sentence-by-sentence subtitles instead of fixed 4 s batches.
-  Falls back to 4 s cap when background music prevents the threshold.
-- **Korean ASR/translation improvements** — `condition_on_previous_text=True` in
-  faster-whisper; beam_size=5 for final chunks; language-pair-aware translation
-  prompt for Korean source (English loanwords, phonetic names, register matching).
+Most of what landed here has been rewritten since; ARCHITECTURE is current for
+all of it. What is recorded below is the part that was *discovered* rather than
+designed, and would cost the same debugging to learn twice.
+
+- **`IsSystemSoundsSession()` returns `Ok(())` for both S_OK and S_FALSE** in
+  windows-rs, so treating it as a boolean filtered out every audio session and
+  the process picker came up empty. Fixed by checking PID 0 instead. Nothing
+  about the call site suggests this; it looks correct.
+- **Bounded channels, and where not to bound them.** VAD→ASR and
+  ASR→Translation are `sync_channel` with `try_send`, so a busy consumer drops
+  a chunk with a WARN rather than growing a queue. Capture→VAD stays unbounded
+  on purpose — it is pure RMS arithmetic and never the bottleneck. The
+  chunker→ASR capacity went 2 → 4 after normal GPU inference latency proved
+  enough to drop chunks at 2.
+- **The RMS meter logged at INFO every 200 ms** — five lines a second, which
+  buried everything else. At DEBUG now, along with `level_for()` suppressors on
+  `ureq`, `wasapi`, `tauri`, `tao` and `wry`; without those, a debug build's log
+  is unreadable exactly when it is needed.
+- **Sidecars outlive a crash.** `kill_port()` runs `netstat -ano` + `taskkill`
+  before each launch, because a force-killed session leaves a process holding
+  the port and the next start fails in a way that looks like a code bug.
+- **`condition_on_previous_text=True`** stayed on after being measured against
+  `False`: turning it off doubled final-chunk latency (376 ms → 739 ms median),
+  because an unanchored decode trips `compression_ratio_threshold` and
+  faster-whisper re-runs the whole thing at six temperatures.
 
 ## M9 — SenseVoice backend  ✅
 
-SenseVoice via `sherpa-onnx` as an alternative ASR backend (ADR-0010).
-Selected via `ASR_BACKEND=sensevoice` env var. Same downstream pipeline.
+SenseVoice via `sherpa-onnx` as an alternative ASR backend (ADR-0010), selected
+by `ASR_BACKEND=sensevoice`, sharing the whole downstream pipeline.
 
-**Implemented:** `asr_srv.py` unified server with two backends behind `/inference`.
-SenseVoice INT8 ONNX (~100 MB) auto-downloaded from HuggingFace on first use.
-`result.event` field used for noise gating (BGM / Applause / Laughter → suppressed).
-Language normalization handles full English names (`"Korean"` → `"ko"`).
-~70× faster than real-time on CPU — no GPU needed. Python 3.14 compatible (no venv).
+**Worth keeping:** ~70× faster than real-time on CPU, so no GPU budget at all.
+Its `result.event` field reports BGM / Applause / Laughter and is used for
+noise gating — the only music detector already present in this codebase.
+Language normalization has to handle full English names (`"Korean"` → `"ko"`),
+which the whisper backend never emits.

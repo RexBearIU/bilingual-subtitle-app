@@ -3,7 +3,7 @@
 Short, dated records of non-obvious choices and *why*. Append new ones; don't
 rewrite history — supersede instead.
 
-This file is ~33 KB and grows with every decision. **Use the index**: find the
+This file is ~35 KB and grows with every decision. **Use the index**: find the
 question you are actually asking, then read that one ADR — each is 10–50 lines.
 Reading the whole file is almost never the right move.
 

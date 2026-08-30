@@ -1,16 +1,16 @@
 # Docs index
 
 Start here, read one section of one file, stop. Nothing in `docs/` is meant to
-be read end to end — together they are ~85 KB, and almost every question is
+be read end to end — together they are ~80 KB, and almost every question is
 answered by a single section.
 
 | File | Size | Answers | Read it when |
 |------|------|---------|--------------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 14 KB | How the system works **now** | Changing behaviour, or checking what something currently does |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 15 KB | How the system works **now** | Changing behaviour, or checking what something currently does |
 | [IPC-CONTRACT.md](IPC-CONTRACT.md) | 10 KB | The exact Rust ↔ webview shapes | Adding a command, event, or settings field |
-| [DECISIONS.md](DECISIONS.md) | 33 KB | Why it is built this way | About to change something that looks wrong — it may already have been tried |
+| [DECISIONS.md](DECISIONS.md) | 35 KB | Why it is built this way | About to change something that looks wrong — it may already have been tried |
 | [SETUP.md](SETUP.md) | 10 KB | Getting it to run | First build, sidecar env, API keys, model downloads |
-| [MILESTONES.md](MILESTONES.md) | 14 KB | What was built when, and what was measured | Rarely — historical record, not current truth |
+| [MILESTONES.md](MILESTONES.md) | 8 KB | What was built when, and what was measured | Rarely — historical record, not current truth |
 
 **Where they disagree, ARCHITECTURE.md wins.** It describes the code as it
 stands; MILESTONES records what was true at the time and is not rewritten when
