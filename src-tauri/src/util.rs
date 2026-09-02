@@ -23,7 +23,17 @@ pub fn load_dotenv() -> Option<PathBuf> {
     None
 }
 
-/// Search order: explicit override → cwd → repo root (dev) → exe dir (bundled).
+/// Search order: explicit override → cwd → repo root (dev) → app data → exe dir.
+///
+/// The app data entry is the only one that is stable. Every other candidate is
+/// a function of where the binary happens to be launched from: a dev build run
+/// by `cargo tauri dev` finds the repo's `.env`, and an installed build looks
+/// beside itself in Program Files and finds nothing — so the same machine that
+/// has been translating all day has no providers at all after installing, and
+/// the whole list, not just the keys, comes from that file.
+///
+/// `%APPDATA%\com.bilingualsubtitle.app\.env` is next to `settings.json`,
+/// writable without elevation, and survives both reinstall and uninstall.
 fn dotenv_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(explicit) = std::env::var("BILINGSUBS_ENV_FILE") {
@@ -38,10 +48,26 @@ fn dotenv_candidates() -> Vec<PathBuf> {
             out.push(parent.join(".env"));
         }
     }
+    if let Some(dir) = app_data_dir() {
+        out.push(dir.join(".env"));
+    }
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         out.push(dir.join(".env"));
     }
     out
+}
+
+/// `%APPDATA%\com.bilingualsubtitle.app`, the directory `settings.json`
+/// already lives in.
+///
+/// Resolved from the environment rather than through Tauri's path API because
+/// this runs before the app handle exists — the environment has to be loaded
+/// before anything reads a provider out of it.
+fn app_data_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .map(PathBuf::from)?;
+    Some(base.join("com.bilingualsubtitle.app"))
 }
 
 fn apply_dotenv(contents: &str) {

@@ -46,13 +46,20 @@ Translation calls a hosted model, so it needs a key from
 Easiest: launch the app, open **Settings ⚙️**, paste the key, press 儲存. It is
 stored in `%APPDATA%\com.bilingualsubtitle.app\settings.json`.
 
-Or put it in a gitignored `.env` at the repo root — copy the template and fill
-in the blank:
+Or put it in a `.env`. The app looks in several places; **for an installed
+build use the app data directory**, which is the only one that does not depend
+on where the binary was launched from:
 
 ```powershell
-Copy-Item .env.example .env
-notepad .env
+Copy-Item .env.example "$env:APPDATA\com.bilingualsubtitle.app\.env"
+notepad "$env:APPDATA\com.bilingualsubtitle.app\.env"
 ```
+
+That path sits next to `settings.json`, needs no elevation, and survives
+reinstalling or uninstalling the app. A `.env` at the repo root also works and
+is what a `cargo tauri dev` build picks up — but an installed build cannot see
+it, and since `TRANSLATE_PROVIDERS` lives in the same file, a missing `.env`
+means no translation providers at all rather than merely a missing key.
 
 Or set it as a real environment variable, which takes priority over both `.env`
 and the stored key:
