@@ -109,14 +109,6 @@ fn summary_loop(
             continue;
         }
 
-        // A typed note is the user's own answer to this question, so there is
-        // nothing to derive. Checked here rather than at startup because it can
-        // be filled in mid-session.
-        if state::read_state(app, |s| !s.context.trim().is_empty()).unwrap_or(false) {
-            last = Some(Instant::now());
-            continue;
-        }
-
         let lines = transcript.recent();
         let Some((_, provider)) = translate::pick_provider(app, active) else {
             log::debug!("summary: no callable provider — skipped");

@@ -69,8 +69,6 @@ export const getSettings = () => invoke<PersistSettings>("get_settings");
 
 export interface SettingsPatch {
   subtitleOpacity?: number;
-  /** Trimmed and capped at 400 chars by the backend. */
-  context?: string;
   asrBackend?: string;
   whisperModel?: string;
   sensevoicePrecision?: string;

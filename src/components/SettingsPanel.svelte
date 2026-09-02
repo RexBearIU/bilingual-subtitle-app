@@ -17,15 +17,7 @@
   // Fetched once rather than carried on EngineStatus: that is re-broadcast on
   // every RMS update, and this is a few hundred characters that almost never
   // change.
-  const CONTEXT_MAX = 400;
-  let context = $state("");
-  let contextSaved = $state(true);
-  cmd.getSettings().then((s) => (context = s.context ?? "")).catch(() => {});
 
-  async function saveContext() {
-    await cmd.updateSettings({ context });
-    contextSaved = true;
-  }
 
   // Tabs rather than one long column: the panel lives inside the subtitle
   // overlay, which is only a couple hundred px tall. Fitting everything on
@@ -80,28 +72,12 @@
     <div class="ctx">
       <div class="ctx-head">
         <span class="ctx-label">這段在講什麼</span>
-        <span class="ctx-count" class:over={context.length > CONTEXT_MAX}>
-          {context.length}/{CONTEXT_MAX}
-        </span>
       </div>
-      <textarea
-        class="ctx-input"
-        rows="2"
-        spellcheck="false"
-        placeholder="例：LPL 英雄聯盟轉播，IG vs TES，選手 TheShy、Rookie、Keshi"
-        bind:value={context}
-        oninput={() => (contextSaved = false)}
-        onblur={saveContext}
-      ></textarea>
       <p class="ctx-hint">
-        {#if !contextSaved}
-          點一下外面就會儲存
-        {:else if context.trim()}
-          同時餵給辨識和翻譯。清空的話，開始播之後會自動從字幕內容推斷。
-        {:else if autoContext}
+        {#if autoContext}
           <span class="ctx-auto-tag">自動</span>{autoContext}
         {:else}
-          留空就好 —— 開始播之後會自動聽出這是什麼、有哪些人名，再拿來校準辨識和翻譯。
+          開始播之後會自動聽出這是什麼、有哪些人名，再拿來校準辨識和翻譯。
         {/if}
       </p>
     </div>
@@ -187,23 +163,6 @@
     margin-bottom: 4px;
   }
   .ctx-label { color: #9aa3ae; font-size: 11px; }
-  .ctx-count { color: #4e5a65; font-size: 10px; font-variant-numeric: tabular-nums; }
-  .ctx-count.over { color: #e08070; }
-  .ctx-input {
-    width: 100%;
-    box-sizing: border-box;
-    resize: vertical;
-    background: #16202c;
-    border: 1px solid #2c3a4a;
-    border-radius: 5px;
-    padding: 5px 7px;
-    color: #cfd8e3;
-    font-size: 11px;
-    font-family: inherit;
-    line-height: 1.5;
-  }
-  .ctx-input:focus { outline: none; border-color: #3a5591; }
-  .ctx-input::placeholder { color: #4e5a65; }
   /* Marks the hint as the machine's own words rather than instructions. */
   .ctx-auto-tag {
     display: inline-block;
@@ -283,10 +242,10 @@
     /* Every tab is the same height, so switching one does not resize the panel
        under the cursor. Sized to the tallest page; shorter pages leave space at
        the bottom rather than making the window jump.
-       Raised from 268 when the context note joined the translate tab and made
-       it the tallest — measured at 281 CSS px, so the others were snapping
-       13 px shorter on every switch. */
-    min-height: 288px;
+       Was 288 while a two-row context textarea made the translate tab the
+       tallest; that input is gone, so this is back to what the remaining
+       pages need. */
+    min-height: 268px;
     box-sizing: border-box;
   }
 

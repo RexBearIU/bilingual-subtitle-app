@@ -31,7 +31,8 @@ Reading the whole file is almost never the right move.
 | 0019 | An unusable provider is shown, not dropped | Why a keyless provider still appears in the list | |
 | 0020 | Rolling translation context expires | Why context is dropped after a silence or a mode change | |
 | 0021 | `initial_prompt` disarms the no_speech filter | Why the 0.7 gate is weaker than it looks | Read before touching hallucination filtering |
-| 0022 | Context note derived from transcript | Why nobody has to type what the audio is about | |
+| 0022 | Context note derived from transcript | Why nobody has to type what the audio is about | Hand-typed notes removed entirely by 0023 |
+| 0023 | The derived note is the only note | Why the context field is gone from Settings | |
 
 ---
 
@@ -661,3 +662,40 @@ It is shown in the Settings panel under the empty field. A note that silently
 primes both models while the user cannot see it is one they cannot correct
 when it is wrong — and it is built from ASR output, so sometimes it will be.
 
+---
+
+## ADR-0023 — The derived note is the only note
+
+**Date:** 2026-09-03 · **Status:** Accepted · **Supersedes:** ADR-0022 (the manual half)
+
+**Context.** ADR-0022 added a summariser that derives what the audio is about
+from the transcript, alongside the hand-typed note that already existed. The
+typed note won when both were set. Three problems, all found in one session:
+
+1. **It silently disabled the summariser.** The worker skipped its whole loop
+   while a typed note existed, so the feature was off for anyone who had ever
+   filled the box — and the Settings panel showed the typed note where the
+   derived one would have been, so there was nothing to suggest the summariser
+   was even running.
+2. **It leaked into the transcript.** The note is fed to whisper as
+   `initial_prompt`, and whisper emits its prompt as output when the audio
+   gives it nothing better. A leftover note appeared mid-transcript as a
+   subtitle nobody had said.
+3. **It asked the wrong question.** Typing what you are about to watch, before
+   you watch it, is the work the app exists to do.
+
+**Decision.** Remove the typed note. `effective_context` returns the derived
+one; the Settings field is gone; `context` is out of `PersistSettings`, the
+patch type and the IPC types.
+
+**Consequence.**
+- The summariser has no gate left and runs whenever its own thresholds are met
+  (8 lines, refreshed every 300 s).
+- Old `settings.json` files still carrying `context` deserialize fine — serde
+  ignores the key — and drop it on the next save.
+- Prompt echo is still possible, because the derived note is fed to whisper on
+  the same path. `echoes_context` in `asr/http_client.rs` suppresses output
+  that the note contains; that filter is now the only thing standing between a
+  summary and a subtitle reading "This is a League of Legends match".
+- Nothing replaces the note for a session the summariser reads wrongly. That is
+  accepted: a wrong summary costs one bad prompt, and the box cost the feature.

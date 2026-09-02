@@ -145,6 +145,15 @@ Calls OpenRouter's `/v1/chat/completions` (ADR-0011). The last **3
 continuity (names, loanwords, omitted Korean subjects). The system prompt covers
 ASR-error tolerance (no fragment completion) and multi-speaker dash separation.
 Korean source adds loanword/name/register rules.
+
+**Context note.** Both the ASR prompt and the translation system prompt carry a
+short note about what the audio is — derived from the transcript by
+`translate/summarize.rs` (8 lines minimum, refreshed every 300 s). It is
+derived only; the hand-typed field was removed by ADR-0023 because it switched
+the summariser off for the session and leaked into the transcript. The leak is
+inherent to feeding anything as `initial_prompt` — whisper emits its prompt as
+output when the audio gives it nothing better — so `echoes_context` drops any
+transcription the note contains.
 Requests set `reasoning.enabled = false`; `strip_think_tags` is kept as a
 safety net for models that emit a `<think>` block anyway.
 
