@@ -15,7 +15,29 @@ uv fetches its own Python, so there is nothing else to install first.
 
 ### 2 — Create the ASR sidecar environment
 
-From the repo root:
+The ASR sidecar is Python (ADR-0006) and needs its own environment. An
+installed build has no repo to find one in, so create it in the app data
+directory, which the app searches:
+
+```powershell
+cd $env:APPDATA\com.bilingualsubtitle.app
+uv sync --project <path-to-a-copy-of-pyproject.toml>
+```
+
+If you already have a `uv sync`-created `.venv` somewhere — a clone of this
+repo, say — point at it instead of building a second copy, in the same `.env`
+as the API keys:
+
+```
+PYTHON_BIN=E:/Projects/bilingual-subtitle-app/.venv/Scripts/python.exe
+```
+
+**Getting this wrong fails in the worst way.** With no venv found, the app
+falls back to `python` from PATH; that interpreter loads the model fine and
+then fails *every* inference with a 500, because `nvidia-cublas-cu12` lives
+inside the venv. It looks like a broken app, not a missing dependency.
+
+From a repo checkout, the original one-liner still applies:
 
 ```powershell
 uv sync

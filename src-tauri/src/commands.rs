@@ -116,7 +116,8 @@ fn exe_dir() -> Option<std::path::PathBuf> {
 /// Pick the interpreter that runs `asr_srv.py`.
 ///
 /// Priority: (1) `PYTHON_BIN` → (2) a `uv sync`-created `.venv` next to the
-/// script or the working directory → (3) `python` from PATH.
+/// script, the working directory, or the app data directory → (3) `python`
+/// from PATH.
 ///
 /// The `.venv` step matters: the sidecar's CUDA dependency (nvidia-cublas-cu12)
 /// is declared in pyproject.toml and lands inside that venv, so a system
@@ -145,6 +146,15 @@ fn resolve_python(script: &str) -> String {
             roots.push(parent.to_path_buf());
         }
         roots.push(cwd);
+    }
+    // The only root that does not depend on where the binary was launched
+    // from. Everything above finds the repo's venv in a dev build and nothing
+    // at all in an installed one, which then falls through to `python` on PATH
+    // — an interpreter that loads the model and fails every inference with a
+    // 500, because nvidia-cublas-cu12 lives inside the venv. Failing that way
+    // looks like a broken app rather than a missing dependency.
+    if let Some(dir) = crate::util::app_data_dir() {
+        roots.push(dir);
     }
 
     for root in roots {

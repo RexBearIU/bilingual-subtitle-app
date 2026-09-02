@@ -63,7 +63,7 @@ fn dotenv_candidates() -> Vec<PathBuf> {
 /// Resolved from the environment rather than through Tauri's path API because
 /// this runs before the app handle exists — the environment has to be loaded
 /// before anything reads a provider out of it.
-fn app_data_dir() -> Option<PathBuf> {
+pub fn app_data_dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)?;
