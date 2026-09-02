@@ -91,7 +91,19 @@ pub fn run() {
             // settings path, the .env location, the resolved provider list —
             // used to run before the logger existed and vanished silently,
             // which made "did it load my config?" unanswerable from the log.
-            if cfg!(debug_assertions) {
+            {
+                // Release logs too, at INFO. It used to be debug-only, which
+                // was fine while the only person running this had a terminal
+                // and the repo — and useless the moment someone else installed
+                // it and could say nothing more useful than "it does not
+                // work". The first two questions about any install ("did it
+                // find my .env?", "which interpreter did it pick?") are
+                // answered by two INFO lines that were being thrown away.
+                let level = if cfg!(debug_assertions) {
+                    log::LevelFilter::Debug
+                } else {
+                    log::LevelFilter::Info
+                };
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
                         // The default is a small file with KeepOne, which
@@ -103,8 +115,8 @@ pub fn run() {
                         // reproduced.
                         .max_file_size(5_000_000)
                         .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
-                        // Our own code: full debug
-                        .level(log::LevelFilter::Debug)
+                        // Our own code: debug in a dev build, info in a release one.
+                        .level(level)
                         // External crates: warn-only (suppress ureq/wasapi spam)
                         .level_for("ureq",   log::LevelFilter::Warn)
                         .level_for("wasapi", log::LevelFilter::Warn)
