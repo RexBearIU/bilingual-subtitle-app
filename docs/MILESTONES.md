@@ -166,10 +166,17 @@ designed, and would cost the same debugging to learn twice.
 - **Sidecars outlive a crash.** `kill_port()` runs `netstat -ano` + `taskkill`
   before each launch, because a force-killed session leaves a process holding
   the port and the next start fails in a way that looks like a code bug.
-- **`condition_on_previous_text=True`** stayed on after being measured against
-  `False`: turning it off doubled final-chunk latency (376 ms → 739 ms median),
-  because an unanchored decode trips `compression_ratio_threshold` and
-  faster-whisper re-runs the whole thing at six temperatures.
+- **`condition_on_previous_text=True`** stayed on, but not for the reason first
+  recorded here. A live A/B appeared to show that turning it off doubled
+  final-chunk latency (376 ms → 739 ms median); a controlled sweep over the
+  same audio (`bench/sweep.py`) found no latency difference at all — 391 ms
+  against baseline's 406 ms — and identical text. The live comparison had been
+  reading content differences as a parameter effect.
+
+  What the sweep did find: on music it raises run-to-run instability sharply
+  (0.106 → 0.322), so it is doing something, just not within a single short
+  chunk. It conditions on previous *segments inside one `transcribe()` call*,
+  and the app sends one utterance per call.
 
 ## M9 — SenseVoice backend  ✅
 
