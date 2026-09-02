@@ -45,6 +45,24 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # tauri.conf.json declares binaries/uv.exe as a bundled resource, and
+      # tauri-build fails hard when a declared resource is missing — not just
+      # for `tauri build` but for every cargo command, clippy and test
+      # included, because the build script runs first. The file is gitignored
+      # (46 MB does not belong in the history), so CI has to fetch it.
+      - name: Cache bundled uv
+        id: uv-cache
+        uses: actions/cache@v4
+        with:
+          path: src-tauri/binaries/uv.exe
+          # Keyed on the script, which is where the version is pinned.
+          key: uv-${{ hashFiles('scripts/fetch-uv.ps1') }}
+
+      - name: Fetch bundled uv
+        if: steps.uv-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./scripts/fetch-uv.ps1
+
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings
