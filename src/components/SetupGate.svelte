@@ -25,8 +25,16 @@
         const p = e.payload;
         if (p.done) {
           running = false;
-          if (p.ok) onReady();
-          else failed = p.message;
+          if (p.ok) {
+            // Both, and in this order. `onReady` tells App to show the
+            // captions; flipping our own `ready` is what makes this card stop
+            // rendering — and until it does, its `data-hit` rectangle keeps
+            // swallowing clicks over a card nobody can see any more.
+            setup = { ...setup!, ready: true };
+            onReady();
+          } else {
+            failed = p.message;
+          }
           return;
         }
         lines = [...lines, p.line].slice(-TAIL);

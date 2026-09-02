@@ -88,9 +88,11 @@
   // from 14 to 64 px, but a bar at 64/28 would eat the screen and one at 14/28
   // would have unclickable buttons.
   const BAR_BASE_PX = 28; // the caption size the bar's own numbers were drawn for
-  // Starts true so a ready machine never flashes a setup card on launch;
-  // SetupGate flips it only if it finds nothing and renders itself.
-  let setupReady = $state(true);
+  // Starts false and is flipped by SetupGate once it has asked the backend.
+  // The card itself does not flash on a ready machine — SetupGate draws
+  // nothing until it has an answer — and the captions it gates are empty at
+  // launch anyway, so the one tick of delay is invisible.
+  let setupReady = $state(false);
   let uiScale = $derived(
     Math.min(1.6, Math.max(0.8, (overlay.status?.fontSize ?? BAR_BASE_PX) / BAR_BASE_PX)),
   );
@@ -243,12 +245,15 @@
   style="--subtitle-bg-opacity: {opacity}; --ui-scale: {uiScale};"
   role="application"
 >
-  <!-- Before anything else: with no Python environment the sidecar falls back
-       to `python` on PATH, loads a model, and then fails every inference with
-       a 500. Offering Start in that state is offering a button that breaks. -->
-  {#if !setupReady}
-    <SetupGate onReady={() => (setupReady = true)} />
-  {/if}
+  <!-- Always mounted, never conditional: it is the thing that *asks* whether an
+       environment exists, so gating it on the answer means it never asks. It
+       renders nothing until it knows, and nothing at all when the answer is
+       yes. (It was conditional once. The card never appeared.)
+
+       Why it exists: with no Python environment the sidecar falls back to
+       `python` on PATH, loads a model, and then fails every inference with a
+       500. Offering Start in that state is offering a button that breaks. -->
+  <SetupGate onReady={() => (setupReady = true)} />
 
   {#if settingsOpen}
     <SettingsPanel status={overlay.status} onClose={closeSettings} />
