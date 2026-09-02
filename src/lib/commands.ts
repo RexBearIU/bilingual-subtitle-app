@@ -81,6 +81,31 @@ export interface SettingsPatch {
 export const updateSettings = (patch: SettingsPatch) =>
   invoke<void>("update_settings", { patch });
 
+// ── first-run setup ───────────────────────────────────────────────────────────
+
+export interface SetupState {
+  ready: boolean;
+  envRoot: string;
+  /** False in a build shipped without `uv.exe`; the manual route is all there is. */
+  canInstall: boolean;
+}
+
+export interface SetupProgress {
+  line: string;
+  done: boolean;
+  ok: boolean;
+  message: string;
+}
+
+/** Whether the ASR sidecar has a Python environment to run in. */
+export const getSetupState = () => invoke<SetupState>("get_setup_state");
+
+/**
+ * Build that environment. Returns as soon as the work is handed to a thread;
+ * watch the `setup_progress` event for what happens next.
+ */
+export const runAsrSetup = () => invoke<void>("run_asr_setup");
+
 // ── process capture ───────────────────────────────────────────────────────────
 
 /** Return all processes that currently have an active audio session. */

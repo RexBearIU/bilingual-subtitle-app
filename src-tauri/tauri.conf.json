@@ -45,7 +45,10 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../asr_srv.py": "asr_srv.py"
+      "../asr_srv.py": "asr_srv.py",
+      "../pyproject.toml": "pyproject.toml",
+      "../uv.lock": "uv.lock",
+      "binaries/uv.exe": "uv.exe"
     },
     "windows": {
       "nsis": {

@@ -6,6 +6,7 @@ mod commands;
 mod hittest;
 mod pipeline;
 mod settings;
+mod setup_env;
 mod state;
 mod translate;
 mod types;
@@ -82,6 +83,8 @@ pub fn run() {
             commands::list_audio_processes,
             commands::set_capture_process,
             commands::copy_to_clipboard,
+            commands::get_setup_state,
+            commands::run_asr_setup,
         ])
         .setup(move |app| {
             // First, so the rest of setup can log. Everything below — the

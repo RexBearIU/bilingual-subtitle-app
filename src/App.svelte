@@ -4,6 +4,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import ControlBar from "./components/ControlBar.svelte";
   import SettingsPanel from "./components/SettingsPanel.svelte";
+  import SetupGate from "./components/SetupGate.svelte";
   import SubtitleView from "./components/SubtitleView.svelte";
   import { overlay } from "./lib/subtitles.svelte";
   import { getStatus, setHitRegions, updateSettings } from "./lib/commands";
@@ -87,6 +88,9 @@
   // from 14 to 64 px, but a bar at 64/28 would eat the screen and one at 14/28
   // would have unclickable buttons.
   const BAR_BASE_PX = 28; // the caption size the bar's own numbers were drawn for
+  // Starts true so a ready machine never flashes a setup card on launch;
+  // SetupGate flips it only if it finds nothing and renders itself.
+  let setupReady = $state(true);
   let uiScale = $derived(
     Math.min(1.6, Math.max(0.8, (overlay.status?.fontSize ?? BAR_BASE_PX) / BAR_BASE_PX)),
   );
@@ -239,6 +243,13 @@
   style="--subtitle-bg-opacity: {opacity}; --ui-scale: {uiScale};"
   role="application"
 >
+  <!-- Before anything else: with no Python environment the sidecar falls back
+       to `python` on PATH, loads a model, and then fails every inference with
+       a 500. Offering Start in that state is offering a button that breaks. -->
+  {#if !setupReady}
+    <SetupGate onReady={() => (setupReady = true)} />
+  {/if}
+
   {#if settingsOpen}
     <SettingsPanel status={overlay.status} onClose={closeSettings} />
   {/if}
@@ -251,7 +262,9 @@
 
   <!-- subtitles sit ABOVE the control bar so the bar stays at the bottom edge -->
   <div class="stage" class:hidden={subsHidden}>
-    <SubtitleView segments={overlay.segments} {fontSize} />
+    {#if setupReady}
+      <SubtitleView segments={overlay.segments} {fontSize} />
+    {/if}
   </div>
 
   <!-- ControlBar always anchored at the very bottom; shows on hover -->

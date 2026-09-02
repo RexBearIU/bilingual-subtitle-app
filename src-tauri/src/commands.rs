@@ -128,14 +128,28 @@ fn resolve_python(script: &str) -> String {
             return v;
         }
     }
+    if let Some(p) = find_venv_python_for(Some(script)) {
+        return p;
+    }
+    "python".to_string()
+}
 
+/// The venv interpreter `resolve_python` would pick, if there is one.
+///
+/// Split out so first-run setup can ask "is there an environment?" without
+/// launching anything, and answer "did the one I just built appear?" after.
+pub fn find_venv_python() -> Option<String> {
+    find_venv_python_for(None)
+}
+
+fn find_venv_python_for(script: Option<&str>) -> Option<String> {
     #[cfg(target_os = "windows")]
     const VENV_PYTHON: &str = ".venv/Scripts/python.exe";
     #[cfg(not(target_os = "windows"))]
     const VENV_PYTHON: &str = ".venv/bin/python";
 
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(dir) = std::path::Path::new(script).parent() {
+    if let Some(dir) = script.and_then(|s| std::path::Path::new(s).parent()) {
         if !dir.as_os_str().is_empty() {
             roots.push(dir.to_path_buf());
         }
@@ -161,10 +175,27 @@ fn resolve_python(script: &str) -> String {
         let candidate = root.join(VENV_PYTHON);
         if candidate.exists() {
             log::info!("asr-srv: using venv interpreter {}", candidate.display());
-            return candidate.to_string_lossy().into_owned();
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    "python".to_string()
+    None
+}
+
+/// Locate a file shipped as a bundled resource, if this build has one.
+///
+/// Unlike `resolve_resource`, returns `None` rather than the bare name: a
+/// missing `uv.exe` is a broken build, not something to hand to `Command::new`
+/// and let PATH answer.
+pub fn resolve_resource_path(name: &str) -> Option<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = exe_dir() {
+        roots.push(dir);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("src-tauri").join("binaries")); // dev: uv.exe
+        roots.push(cwd);
+    }
+    roots.into_iter().map(|r| r.join(name)).find(|p| p.exists())
 }
 
 /// Resolve a resource file path (e.g. a Python script bundled alongside the exe).
@@ -416,6 +447,41 @@ pub fn set_click_through(mode: ClickThrough, state: Db, app: AppHandle) -> Resul
 /// Called by the frontend whenever its layout changes. In CSS pixels relative
 /// to the window's client area; the hit-test thread converts to screen
 /// coordinates, since it is the side that knows the position and DPI scale.
+/// Whether the ASR sidecar has a Python environment to run in.
+///
+/// The overlay asks on launch so it can show setup instead of a start button
+/// that would fail — badly, at that: with no venv the sidecar falls back to
+/// `python` on PATH, loads a model successfully, and then fails every
+/// inference with a 500.
+#[tauri::command]
+pub fn get_setup_state() -> SetupState {
+    SetupState {
+        ready: crate::setup_env::is_ready(),
+        env_root: crate::setup_env::env_root()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        can_install: resolve_resource_path("uv.exe").is_some(),
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupState {
+    pub ready: bool,
+    pub env_root: String,
+    /// False in a build that shipped without `uv.exe`, where the only route is
+    /// the manual one in SETUP.md. Saying so beats a button that cannot work.
+    pub can_install: bool,
+}
+
+/// Build the ASR environment. Returns immediately; progress arrives as
+/// `setup_progress` events and ends with one carrying `done: true`.
+#[tauri::command]
+pub fn run_asr_setup(app: AppHandle) {
+    std::thread::spawn(move || crate::setup_env::run(&app));
+}
+
+
 /// Put `text` on the system clipboard.
 ///
 /// The write happens here rather than through `navigator.clipboard` in the
