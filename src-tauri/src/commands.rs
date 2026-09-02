@@ -670,7 +670,6 @@ pub fn get_settings(state: Db, sp: SpDb) -> Result<PersistSettings, String> {
     Ok(PersistSettings {
         mode: s.mode,
         source_hint: s.source_hint,
-        context: s.context.clone(),
         font_size: s.font_size,
         subtitle_opacity: s.subtitle_opacity,
         overlay: saved.overlay,
@@ -719,15 +718,6 @@ pub fn update_settings(
             let clamped = op.clamp(0.0, 1.0);
             s.subtitle_opacity = clamped;
             saved.subtitle_opacity = clamped;
-        }
-        if let Some(ref ctx) = patch.context {
-            // Bounded on the way in, so neither prompt can be pushed out of
-            // shape by a paste: whisper's own prompt window is small, and the
-            // translation system prompt is re-sent on every subtitle.
-            let ctx = ctx.trim().chars().take(CONTEXT_MAX_CHARS).collect::<String>();
-            log::info!("context → {} chars", ctx.chars().count());
-            s.context = ctx.clone();
-            saved.context = ctx;
         }
         if let Some(ref backend) = patch.asr_backend {
             let backend = backend.trim().to_lowercase();
@@ -815,20 +805,12 @@ pub fn update_settings(
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub subtitle_opacity: Option<f64>,
-    pub context: Option<String>,
     pub asr_backend: Option<String>,
     pub whisper_model: Option<String>,
     pub sensevoice_precision: Option<String>,
     pub speech_threshold: Option<f32>,
     pub overlay: Option<crate::settings::OverlayRect>,
 }
-
-/// Ceiling on the user's context note.
-///
-/// Whisper's `initial_prompt` window is small and shared with the rolling
-/// transcript, and the translation system prompt goes out with every subtitle.
-/// Both stay predictable only if this cannot grow without limit.
-pub const CONTEXT_MAX_CHARS: usize = 400;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -844,7 +826,6 @@ pub fn save_current_settings(app: &AppHandle) {
     let mut cfg = PersistSettings::load(&sp.0);
     cfg.mode = s.mode;
     cfg.source_hint = s.source_hint;
-    cfg.context = s.context.clone();
     cfg.font_size = s.font_size;
     cfg.subtitle_opacity = s.subtitle_opacity;
     cfg.click_through = s.click_through;

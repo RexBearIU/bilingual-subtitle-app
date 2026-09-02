@@ -207,6 +207,17 @@ fn asr_loop(
                     continue;
                 }
 
+                // The context note read back at us. Before the blocklist because
+                // it is the same class of thing — text that was never spoken —
+                // but detectable exactly rather than by pattern.
+                if echoes_context(&text, &context) {
+                    log::info!(
+                        "ASR [u{}]: context note echoed back ({infer_ms}ms), suppressed: {text:?}",
+                        chunk.utterance_id,
+                    );
+                    continue;
+                }
+
                 // Secondary filter: keyword blocklist.
                 if is_hallucination(&text) {
                     log::info!(
@@ -805,6 +816,32 @@ fn longest_phrase_run(text: &str) -> usize {
 /// lyrics.
 const MAX_PHRASE_RUN: usize = 3;
 
+/// Whether `text` is the context note being read back rather than transcribed.
+///
+/// The note is fed to whisper as `initial_prompt`, and whisper is known to
+/// emit its prompt as output when the audio gives it nothing better — so a
+/// note reading "LPL 轉播" appears on screen as a subtitle nobody said. It was
+/// found with a leftover test note: `TEST-CONTEXT-MARKER` started showing up
+/// mid-transcript.
+///
+/// Matching is containment against the note only, never against the rolling
+/// transcript half of the prompt: repeating what was just said is what a
+/// speaker legitimately does, and the consecutive-repeat filter already judges
+/// that. The note is the part that is never speech.
+fn echoes_context(text: &str, context: &str) -> bool {
+    let note: String = context.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    if note.is_empty() {
+        return false;
+    }
+    let t: String = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    // Guard against a one-word note swallowing ordinary speech: a note of "LoL"
+    // would otherwise suppress every subtitle containing it.
+    if t.chars().count() < 4 {
+        return false;
+    }
+    note.contains(&t)
+}
+
 /// Return `true` if `text` looks like a Whisper hallucination that should be
 /// silently dropped.
 ///
@@ -1019,6 +1056,31 @@ mod tests {
         ] {
             assert!(is_hallucination(text), "{text} should be suppressed");
         }
+    }
+
+    #[test]
+    fn the_context_note_read_back_is_not_speech() {
+        // The case that found this: a leftover note appearing mid-transcript.
+        assert!(echoes_context("TEST-CONTEXT-MARKER", "TEST-CONTEXT-MARKER"));
+        // And the real-world shape — a note about the content, echoed whole or
+        // in part.
+        assert!(echoes_context("LPL 轉播", "LPL 轉播 T1 對 GEN"));
+        assert!(echoes_context("T1 對 GEN", "LPL 轉播 T1 對 GEN"));
+    }
+
+    #[test]
+    fn real_speech_that_merely_mentions_the_topic_survives() {
+        let note = "LPL 轉播 T1 對 GEN";
+        assert!(!echoes_context("T1 這波打得真好", note), "longer than the note");
+        assert!(!echoes_context("我覺得 GEN 會贏", note));
+        // No note at all cannot suppress anything.
+        assert!(!echoes_context("아무 말이나", ""));
+    }
+
+    #[test]
+    fn a_short_output_is_never_an_echo() {
+        // A one-word note must not swallow every subtitle containing that word.
+        assert!(!echoes_context("네", "네이버 뉴스"));
     }
 
     #[test]
