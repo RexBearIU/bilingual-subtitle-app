@@ -782,6 +782,29 @@ fn longest_token_run(text: &str) -> usize {
 /// was four ("으 으 으 으"), so there is a wide margin either side.
 const MAX_TOKEN_RUN: usize = 6;
 
+/// How many times the most-repeated sentence in `text` appears.
+///
+/// `longest_token_run` counts one *token* repeating, and misses the loop that
+/// actually dominates: a whole clause said over and over. Measured over 15
+/// chunks of Korean music, the most common output of any kind was
+/// "2부에서 계속됩니다." three times in one result — two tokens alternating, so
+/// the token run never exceeds 1 and it passed every filter this file had.
+fn longest_phrase_run(text: &str) -> usize {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for part in text.split(['.', '!', '?', '。', '！', '？']) {
+        let p = part.trim();
+        if !p.is_empty() {
+            *counts.entry(p).or_insert(0) += 1;
+        }
+    }
+    counts.into_values().max().unwrap_or(0)
+}
+
+/// The same sentence this many times over is a loop, not speech. Three rather
+/// than two: a real line repeated once for emphasis is ordinary, especially in
+/// lyrics.
+const MAX_PHRASE_RUN: usize = 3;
+
 /// Return `true` if `text` looks like a Whisper hallucination that should be
 /// silently dropped.
 ///
@@ -843,10 +866,12 @@ fn is_hallucination(text: &str) -> bool {
         return true;
     }
 
-    // 3. A decoder repetition loop. Unlike the list above this needs no
-    //    per-phrase knowledge — it recognises the shape of a broken decode,
-    //    whatever language it broke in.
-    longest_token_run(t) >= MAX_TOKEN_RUN
+    // 3. A decoder repetition loop. Unlike the list above these need no
+    //    per-phrase knowledge — they recognise the shape of a broken decode,
+    //    whatever language it broke in. One catches a repeated token, the
+    //    other a repeated sentence; the music that produced this filter set
+    //    hit only the second.
+    longest_token_run(t) >= MAX_TOKEN_RUN || longest_phrase_run(t) >= MAX_PHRASE_RUN
 }
 
 /// Detect the dominant script of `text` and map it to a language code.
@@ -1002,6 +1027,22 @@ mod tests {
         let loop_text = "너무 ".repeat(30);
         assert!(is_hallucination(&loop_text));
         assert_eq!(longest_token_run(&loop_text), 30);
+    }
+
+    #[test]
+    fn a_repeated_sentence_is_a_loop_too() {
+        // Verbatim from bench/out/music: the single most common output across
+        // 15 chunks of Korean music, and invisible to every filter until now.
+        let looped = "2부에서 계속됩니다. 2부에서 계속됩니다. 2부에서 계속됩니다.";
+        assert_eq!(longest_token_run(looped), 1, "no token repeats consecutively");
+        assert!(is_hallucination(looped), "but the sentence does");
+    }
+
+    #[test]
+    fn saying_something_twice_is_allowed() {
+        // Emphasis and lyrics repeat; only the third occurrence is the signal.
+        assert!(!is_hallucination("좋아요. 좋아요."));
+        assert!(!is_hallucination("사랑해. 사랑해."));
     }
 
     #[test]
@@ -1272,3 +1313,4 @@ mod tests {
         assert_eq!(last, -32_767);
     }
 }
+
