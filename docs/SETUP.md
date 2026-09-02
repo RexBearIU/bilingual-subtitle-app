@@ -1,105 +1,56 @@
 # Setup
 
-## Post-install setup (end users)
+## Install (end users)
 
-If you installed from the **release `.exe`**, skip the dev-build prerequisites below
-and follow these steps instead.
+Run **`Bilingual Subtitles_x64-setup.exe`** and launch it. On first run the app
+offers to build the speech-recognition environment itself — one button, a few
+minutes, no terminal. It bundles `uv` and installs into
+`%APPDATA%\com.bilingualsubtitle.app`, which survives reinstalling the app.
 
-### 1 — Install uv
-
-```powershell
-winget install astral-sh.uv
-```
-
-uv fetches its own Python, so there is nothing else to install first.
-
-### 2 — Create the ASR sidecar environment
-
-The ASR sidecar is Python (ADR-0006) and needs its own environment. An
-installed build has no repo to find one in, so create it in the app data
-directory, which the app searches:
-
-```powershell
-cd $env:APPDATA\com.bilingualsubtitle.app
-uv sync --project <path-to-a-copy-of-pyproject.toml>
-```
-
-If you already have a `uv sync`-created `.venv` somewhere — a clone of this
-repo, say — point at it instead of building a second copy, in the same `.env`
-as the API keys:
-
-```
-PYTHON_BIN=E:/Projects/bilingual-subtitle-app/.venv/Scripts/python.exe
-```
-
-**Getting this wrong fails in the worst way.** With no venv found, the app
-falls back to `python` from PATH; that interpreter loads the model fine and
-then fails *every* inference with a 500, because `nvidia-cublas-cu12` lives
-inside the venv. It looks like a broken app, not a missing dependency.
-
-From a repo checkout, the original one-liner still applies:
-
-```powershell
-uv sync
-```
-
-That builds `.venv` from `pyproject.toml` + `uv.lock`. The app finds this venv
-automatically — `resolve_python()` in `commands.rs` prefers it over any
-system interpreter, so you do not need to set `PYTHON_BIN`.
-
-Roughly 700 MB, most of it `nvidia-cublas-cu12`. That wheel is a hard
+Roughly 1.2 GB, most of it `nvidia-cublas-cu12`. That wheel is a hard
 dependency rather than an optional extra on purpose: `ctranslate2` ships
 `cudnn64_9.dll` but not cuBLAS, and without it faster-whisper loads on CUDA
 without complaint and then fails **every** inference with a 500.
 
-> On first launch, the Whisper large-v3-turbo model (~1.5 GB) downloads
-> automatically from HuggingFace. This takes a few minutes. The ASR status dot
-> will show **loading** until the download is complete.
+> On first captioning run the Whisper large-v3 model (~3 GB) downloads from
+> HuggingFace. The ASR status dot stays **loading** until it finishes.
 
-> **Do not loosen the `sherpa-onnx==1.13.2` pin without testing.** 1.13.6
-> resolves without its companion `sherpa-onnx-core` wheel and then hard-crashes
-> (0xC0000005) at model load with an ONNX Runtime API-version mismatch.
+### Translation needs an API key
 
-### 3 — Set an OpenRouter API key
-
-Translation calls a hosted model, so it needs a key from
-<https://openrouter.ai/keys>. There is no model to download.
-
-Easiest: launch the app, open **Settings ⚙️**, paste the key, press 儲存. It is
-stored in `%APPDATA%\com.bilingualsubtitle.app\settings.json`.
-
-Or put it in a `.env`. The app looks in several places; **for an installed
-build use the app data directory**, which is the only one that does not depend
-on where the binary was launched from:
+Translation calls a hosted model. Open **Settings ⚙️** and paste a key, or put
+one in a `.env` beside the app's settings:
 
 ```powershell
-Copy-Item .env.example "$env:APPDATA\com.bilingualsubtitle.app\.env"
 notepad "$env:APPDATA\com.bilingualsubtitle.app\.env"
 ```
 
-That path sits next to `settings.json`, needs no elevation, and survives
-reinstalling or uninstalling the app. A `.env` at the repo root also works and
-is what a `cargo tauri dev` build picks up — but an installed build cannot see
-it, and since `TRANSLATE_PROVIDERS` lives in the same file, a missing `.env`
-means no translation providers at all rather than merely a missing key.
+That path is the only `.env` location an installed build can rely on — the
+others are relative to where the binary was launched from, which for a dev
+build means the repo and for an installed build means nothing useful. It also
+carries `TRANSLATE_PROVIDERS`, so a missing file costs the whole provider list
+rather than just a key.
 
-Or set it as a real environment variable, which takes priority over both `.env`
-and the stored key:
-
-```powershell
-[System.Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "sk-or-v1-...", "User")
-```
-
-Resolution order is: real environment → `.env` → `settings.json`.
-
-Without a key the app still runs — ASR works and subtitles show the source text
+Without a key the app still runs: ASR works and subtitles show source text
 only, with the translation status dot red.
 
-### 4 — Launch
+### If setup could not run
 
-Find **Bilingual Subtitles** in the Start menu (or the install directory) and run it.
-The two status dots in the overlay should turn green within ~30 s on first run
-(longer on very first launch while the Whisper model downloads).
+A build without a bundled `uv.exe` says so instead of offering the button. Then
+it is the manual route:
+
+```powershell
+winget install astral-sh.uv
+cd $env:APPDATA\com.bilingualsubtitle.app
+# copy pyproject.toml and uv.lock here from the repo, then:
+uv sync --frozen
+```
+
+Or point `PYTHON_BIN` in that same `.env` at a `uv sync`-created `.venv` you
+already have:
+
+```
+PYTHON_BIN=E:/Projects/bilingual-subtitle-app/.venv/Scripts/python.exe
+```
 
 ---
 
@@ -138,9 +89,14 @@ cargo tauri --version    # Tauri v2
 ## First build (once scaffolded)
 
 ```powershell
-npm install              # frontend deps
-cargo tauri dev          # run the overlay in dev mode
+npm install                  # frontend deps
+.\scriptsetch-uv.ps1       # the uv the installer bundles (gitignored, 46 MB)
+cargo tauri dev              # run the overlay in dev mode
+npm run tauri build          # installer at src-tauri/target/release/bundle/nsis/
 ```
+
+`fetch-uv.ps1` matters only for `tauri build`: without it the bundle ships no
+`uv.exe`, and first-run setup degrades to telling the user to install one.
 
 ## Sidecar binaries & models (M4 onward)
 
