@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -75,7 +76,7 @@ if sys.platform == "win32":
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 try:
-    from fastapi import FastAPI, Form, UploadFile
+    from fastapi import FastAPI, Form, HTTPException, UploadFile
     import uvicorn
 except ImportError as e:
     sys.exit(
@@ -144,27 +145,85 @@ def _load_whisper(model_id: str, compute_type_override: str | None = None) -> No
 # retry is what recovers a bad decode.
 
 
+# Decode settings the benchmark is allowed to override. Everything here keeps
+# its production value unless a request explicitly says otherwise, so a sweep
+# cannot change what the app does — it can only measure what a change would do.
+#
+# Whitelisted rather than passed through: `transcribe()` takes arguments that
+# would break the response contract this server promises (word timestamps,
+# segment splitting), and a typo'd key should be a 400, not a silently ignored
+# option that makes a benchmark row a lie.
+_TUNABLE = {
+    "vad_filter": bool,
+    "repetition_penalty": float,
+    "no_repeat_ngram_size": int,
+    "condition_on_previous_text": bool,
+    "compression_ratio_threshold": float,
+    "log_prob_threshold": float,
+    "no_speech_threshold": float,
+    "hallucination_silence_threshold": float,
+    "patience": float,
+    "length_penalty": float,
+    "temperature": list,
+    "hotwords": str,
+}
+
+
+def _coerce_tunables(raw: dict) -> dict:
+    out = {}
+    for k, v in raw.items():
+        if k not in _TUNABLE:
+            raise ValueError(f"unknown decode option {k!r}")
+        if v is None:
+            out[k] = None
+            continue
+        want = _TUNABLE[k]
+        out[k] = [float(x) for x in v] if want is list else want(v)
+    return out
+
+
 def _infer_whisper(
     tmp_path: str,
     language: str | None,
     prompt: str | None,
     beam_size: int,
     fast: bool = False,
+    tunables: dict | None = None,
 ) -> tuple[str, str, float]:
     lang = language if language and language not in ("auto", "") else None
-    segments_iter, info = _whisper_model.transcribe(
-        tmp_path,
+    opts = dict(
         language=lang,
         initial_prompt=prompt or None,
         beam_size=beam_size,
         condition_on_previous_text=True,
-        vad_filter=False,
+        # Silero VAD, on. Measured over 17 Korean speech chunks and 15 chunks of
+        # Korean music (bench/sweep.py, bench/out/{speech,music}):
+        #
+        #   speech   drift 0.401 → 0.197 against a full-context decode,
+        #            the one hallucinated line ("수고하셨습니다." over a near-silent
+        #            chunk) gone, median latency unchanged at ~406 ms
+        #   music    canned-phrase rate 87% → 53%, median 469 → 266 ms
+        #
+        # It is not free: one chunk lost a real trailing clause ("인기 많다
+        # 체크합니다" → "인기 많다"). Kept because dropping a clause costs a few
+        # words while a hallucinated line costs the reader's trust in all of
+        # them — and on music it is the only setting that reduces invention.
+        vad_filter=True,
+        # Loops are cheaper to prevent than to detect: a repetitive result trips
+        # compression_ratio_threshold, and faster-whisper then re-runs the whole
+        # decode at six fallback temperatures — measured at 2727 ms against a
+        # ~380 ms median. The Rust-side decoder-loop filter still catches what
+        # gets through; this stops most of it being generated.
+        repetition_penalty=1.15,
         # A single temperature means no fallback retries.
         temperature=0.0 if fast else [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
         # Timestamps are discarded by the caller; skipping timestamp tokens is
         # faster and removes a hallucination source on short chunks.
         without_timestamps=True,
     )
+    if tunables:
+        opts.update(tunables)
+    segments_iter, info = _whisper_model.transcribe(tmp_path, **opts)
     segs = list(segments_iter)
     text = "".join(s.text for s in segs)
     no_speech_prob = sum(s.no_speech_prob for s in segs) / len(segs) if segs else 0.0
@@ -361,8 +420,13 @@ async def inference(
     language: str | None = Form(None),
     beam_size: int = Form(1),
     fast: bool = Form(False),
+    decode_opts: str = Form("{}"),
 ):
     audio_data = await file.read()
+    try:
+        tunables = _coerce_tunables(json.loads(decode_opts or "{}"))
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"bad decode_opts: {e}") from e
 
     if _zipformer_recognizer is not None:
         # Korean Zipformer backend — language/prompt/beam_size are not used
@@ -377,7 +441,7 @@ async def inference(
             os.write(fd, audio_data)
             os.close(fd)
             text, lang, no_speech_prob = _infer_whisper(
-                tmp_path, language, initial_prompt, beam_size, fast
+                tmp_path, language, initial_prompt, beam_size, fast, tunables
             )
         finally:
             try:
